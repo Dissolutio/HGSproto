@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "src-tauri",
+    "src-tauri/crates/hex_game_core",
+    "src-tauri/crates/hex_game_network",
+    "src-tauri/crates/hex_game_daemon"
+]
+
+[profile.release]
+panic = "abort" # Drastically reduces compiled binary size
+codegen-units = 1 # Maximizes optimization parameters across crates
+lto = true # Enables Link-Time Optimization for high performance
+opt-level = 3 # Enforces strict speed optimizations
+strip = true # Removes debug symbols to shrink mobile/desktop builds

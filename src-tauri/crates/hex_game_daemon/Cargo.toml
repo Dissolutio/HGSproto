@@ -1,0 +1,18 @@
+[package]
+name = "hex_game_daemon"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hex_game_daemon"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] } # Robust, async local socket runtime
+tokio-tungstenite = "0.21" # High-performance local WebSocket loopback server
+
+# Re-consume the identical math and networking crates from the monorepo workspace
+hex_game_core = { path = "../hex_game_core" }
+hex_game_network = { path = "../hex_game_network" }
