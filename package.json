@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev:desktop": "npm --prefix client run tauri -- dev",
-    "dev:android": "npm --prefix client run tauri -- android dev --host",
+    "dev:android": "npm --prefix client run tauri android dev -- --host",
     "web:dev": "npm --prefix client run dev --"
   }
 }
