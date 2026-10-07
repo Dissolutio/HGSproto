@@ -16,17 +16,22 @@ export default defineConfig(() => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
+    host: true, // 🛠️ Add this line to force Vite to accept local network connections!
     hmr: host
       ? {
-          protocol: "ws",
-          host,
-          port: 1421,
-        }
+        protocol: "ws",
+        host,
+        port: 1421,
+      }
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
   },
+  build: {
+    // 🛠️ Force Vite to transpile code down to a highly compatible layer (ES2020) 
+    // instead of assuming a cutting-edge 2026 browser engine!
+    target: 'es2020'
+  }
 }));
