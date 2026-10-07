@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.hexsim.app",
   "build": {
-    "beforeDevCommand": "npm --prefix ../client run dev",
+    "beforeDevCommand": "npm --prefix client run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm --prefix ../client run build",
+    "beforeBuildCommand": "npm --prefix client run build",
     "frontendDist": "../client/dist"
   },
   "app": {

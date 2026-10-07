@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev:desktop": "npm --prefix client run tauri dev",
-    "dev:android": "npm --prefix client run tauri android dev -- --host",
-    "web:dev": "npm --prefix client run dev"
+    "dev:desktop": "npm --prefix client run tauri -- dev",
+    "dev:android": "npm --prefix client run tauri -- android dev --host",
+    "web:dev": "npm --prefix client run dev --"
   }
 }
