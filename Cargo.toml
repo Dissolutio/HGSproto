@@ -3,8 +3,7 @@ resolver = "2"
 members = [
     "src-tauri",
     "src-tauri/crates/hex_game_core",
-    "src-tauri/crates/hex_game_network",
-    "src-tauri/crates/hex_game_daemon"
+    "src-tauri/crates/hex_game_network"
 ]
 
 [profile.release]
