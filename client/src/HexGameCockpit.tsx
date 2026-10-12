@@ -1,10 +1,16 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import init, {
+  wasm_get_current_state,
+  wasm_initialize_match,
+  wasm_process_token_for_match,
+} from "./wasm/hex_game_core";
 
 type Position = { q: number; r: number; z: number };
 type EngineComponent = {
   type?: string;
   data?: { inventory_id?: string; labels?: string[] };
   Terrain?: { inventory_id?: string };
+  TerrainType?: { terrain?: string };
   Tags?: { labels?: string[] };
 };
 type EngineEntity = {
@@ -17,10 +23,26 @@ type EngineState = {
   entities?: Record<string, EngineEntity> | EngineEntity[];
 };
 type RenderEntity = EngineEntity & { id: string; spatial: Position };
+type Mode = "network" | "wasm";
+type ConnectionState = "connecting" | "connected" | "offline" | "ready";
 
 const SOCKET_URL = "ws://127.0.0.1:8080";
+const WASM_MATCH_ID = "wasm_sandbox";
 const HEX_SIZE = 30;
 const EDGE = 46;
+
+const MOCK_MAP_JSON = JSON.stringify({
+  hexMap: { name: "Local WASM Sandbox" },
+  boardPieces: [
+    {
+      uid: "sandbox-g7",
+      inventoryID: "g7",
+      altitude: 0,
+      rotation: 0,
+      pieceCoords: { q: 0, r: 0, s: 0 },
+    },
+  ],
+});
 
 function componentList(entity: EngineEntity): EngineComponent[] {
   return Array.isArray(entity.components)
@@ -67,43 +89,91 @@ function hexPoints(cx: number, cy: number, size: number): string {
   }).join(" ");
 }
 
+function parseState(serializedState: string): EngineState {
+  const parsed = JSON.parse(serializedState) as EngineState | { error?: string };
+  if ("error" in parsed && parsed.error) {
+    throw new Error(parsed.error);
+  }
+  return parsed as EngineState;
+}
+
 export default function HexGameCockpit() {
+  const [mode, setMode] = useState<Mode>("network");
   const [gameState, setGameState] = useState<EngineState | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
-  const [connection, setConnection] = useState<"connecting" | "connected" | "offline">("connecting");
+  const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [notice, setNotice] = useState("Opening local engine stream");
   const [socket, setSocket] = useState<WebSocket | null>(null);
 
   useEffect(() => {
-    const ws = new WebSocket(SOCKET_URL);
+    let cancelled = false;
+    let ws: WebSocket | null = null;
+
+    if (mode === "wasm") {
+      setSocket(null);
+      setConnection("connecting");
+      setNotice("Loading local WebAssembly engine");
+      void (async () => {
+        try {
+          await init();
+          if (cancelled) return;
+          wasm_initialize_match(WASM_MATCH_ID, MOCK_MAP_JSON);
+          const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
+          if (cancelled) return;
+          setGameState(state);
+          setConnection("ready");
+          setNotice("Autonomous WASM sandbox ready");
+        } catch (error) {
+          if (cancelled) return;
+          setConnection("offline");
+          setNotice(`WASM initialization failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setConnection("connecting");
+    setNotice("Opening local engine stream");
+    ws = new WebSocket(SOCKET_URL);
     setSocket(ws);
     ws.onopen = () => {
+      if (cancelled) return;
       setConnection("connected");
       setNotice("Live engine stream connected");
     };
     ws.onmessage = (event) => {
+      if (cancelled) return;
       const message = String(event.data);
       if (message.startsWith("E:")) {
         setNotice(message.slice(2));
         return;
       }
       try {
-        setGameState(JSON.parse(message) as EngineState);
+        setGameState(parseState(message));
         setNotice("State synchronized");
-      } catch {
-        setNotice(`Unrecognized engine response: ${message.slice(0, 100)}`);
+      } catch (error) {
+        setNotice(`Invalid engine response: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
-    ws.onerror = () => setNotice("WebSocket error; check the local orchestrator");
+    ws.onerror = () => {
+      if (!cancelled) setNotice("WebSocket error; check the local orchestrator");
+    };
     ws.onclose = () => {
+      if (cancelled) return;
       setConnection("offline");
       setSocket(null);
       setNotice("Engine stream disconnected");
     };
+
     return () => {
-      ws.close();
+      cancelled = true;
+      ws?.close();
+      setSocket((activeSocket) => activeSocket === ws ? null : activeSocket);
     };
-  }, []);
+  }, [mode]);
 
   const entities = useMemo(() => entitiesFromState(gameState), [gameState]);
   const terrain = useMemo(
@@ -129,7 +199,12 @@ export default function HexGameCockpit() {
       point: axialToPixel(cell.spatial.q, cell.spatial.r, HEX_SIZE),
     }));
     if (centers.length === 0) {
-      return { centers, width: 640, height: 420, pointFor: (_position: Position) => ({ x: 320, y: 210 }) };
+      return {
+        centers,
+        width: 640,
+        height: 420,
+        pointFor: (_position: Position) => ({ x: 320, y: 210 }),
+      };
     }
     const minX = Math.min(...centers.map(({ point }) => point.x - HEX_SIZE));
     const maxX = Math.max(...centers.map(({ point }) => point.x + HEX_SIZE));
@@ -160,33 +235,94 @@ export default function HexGameCockpit() {
       setNotice("Move rejected locally: that hex is occupied");
       return;
     }
+
+    const token = `M:${selectedUnitId}:Q${cell.spatial.q}R${cell.spatial.r}Z${cell.spatial.z}`;
+    if (mode === "wasm") {
+      try {
+        const result = wasm_process_token_for_match(WASM_MATCH_ID, token);
+        if (!result.startsWith("VALID_STEP:")) {
+          setNotice(result.startsWith("E:") ? result.slice(2) : result);
+          return;
+        }
+        setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
+        setNotice(`Applied locally: ${token}`);
+        setSelectedUnitId(null);
+      } catch (error) {
+        setNotice(`WASM move failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       setNotice("Move not sent: engine stream is offline");
       return;
     }
-    const token = `M:${selectedUnitId}:Q${cell.spatial.q}R${cell.spatial.r}Z${cell.spatial.z}`;
-    socket.send(token);
-    setNotice(`Sent ${token}`);
+    try {
+      socket.send(token);
+      setNotice(`Sent ${token}`);
+      setSelectedUnitId(null);
+    } catch (error) {
+      setNotice(`Move could not be sent: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const chooseMode = (nextMode: Mode) => {
+    if (nextMode === mode) return;
     setSelectedUnitId(null);
+    setGameState(null);
+    setMode(nextMode);
   };
 
   return (
     <main style={styles.page}>
+      <nav style={styles.modeBar} aria-label="Simulation mode">
+        <button
+          type="button"
+          aria-pressed={mode === "network"}
+          onClick={() => chooseMode("network")}
+          style={{ ...styles.modeButton, ...(mode === "network" ? styles.modeButtonActive : {}) }}
+        >
+          Live Network Mode (WebSocket)
+        </button>
+        <button
+          type="button"
+          aria-pressed={mode === "wasm"}
+          onClick={() => chooseMode("wasm")}
+          style={{ ...styles.modeButton, ...(mode === "wasm" ? styles.modeButtonActive : {}) }}
+        >
+          Autonomous Sandbox Mode (WASM)
+        </button>
+      </nav>
+
       <header style={styles.header}>
         <div>
-          <p style={styles.kicker}>HEXGAMESIM / LIVE SESSION</p>
+          <p style={styles.kicker}>HEXGAMESIM / {mode === "network" ? "LIVE SESSION" : "LOCAL SIMULATION"}</p>
           <h1 style={styles.title}>Tactical board</h1>
         </div>
         <div style={styles.connection}>
-          <span style={{ ...styles.statusDot, background: connection === "connected" ? "#70d6a4" : connection === "connecting" ? "#edbd62" : "#ef7777" }} />
+          <span
+            style={{
+              ...styles.statusDot,
+              background:
+                connection === "connected" || connection === "ready"
+                  ? "#70d6a4"
+                  : connection === "connecting"
+                    ? "#edbd62"
+                    : "#ef7777",
+            }}
+          />
           <span>{connection}</span>
-          <span style={styles.matchId}>{gameState?.context?.match_id ?? "waiting for state"}</span>
+          <span style={styles.matchId}>
+            {gameState?.context?.match_id ?? (mode === "wasm" ? WASM_MATCH_ID : "waiting for state")}
+          </span>
         </div>
       </header>
 
       <section style={styles.toolbar} aria-live="polite">
         <span style={styles.notice}>{notice}</span>
-        <span style={styles.counts}>{terrainCells.length} hexes <i /> {units.length} units</span>
+        <span style={styles.counts}>
+          {terrainCells.length} hexes <i /> {units.length} units
+        </span>
       </section>
 
       <section style={styles.boardFrame}>
@@ -207,17 +343,32 @@ export default function HexGameCockpit() {
             const { x, y } = layout.pointFor(cell.spatial);
             const selected = selectedUnitId !== null;
             const blocked = units.some(
-              (unit) => unit.id !== selectedUnitId && unit.spatial.q === cell.spatial.q && unit.spatial.r === cell.spatial.r && unit.spatial.z === cell.spatial.z,
+              (unit) =>
+                unit.id !== selectedUnitId &&
+                unit.spatial.q === cell.spatial.q &&
+                unit.spatial.r === cell.spatial.r &&
+                unit.spatial.z === cell.spatial.z,
             );
             return (
-              <g key={cell.id} onClick={() => moveSelectedUnit(cell)} style={{ cursor: selected && !blocked ? "pointer" : "default" }}>
+              <g
+                key={cell.id}
+                onClick={() => moveSelectedUnit(cell)}
+                style={{ cursor: selected && !blocked ? "pointer" : "default" }}
+              >
                 <polygon
                   points={hexPoints(x, y, HEX_SIZE)}
                   fill={selected && !blocked ? "#23443e" : "#1d3432"}
                   stroke={selected && !blocked ? "#72b99b" : "#526e66"}
                   strokeWidth="1.5"
                 />
-                <text x={x} y={y + 4} textAnchor="middle" fill="#9ab1a7" fontSize="9" fontFamily="ui-monospace, monospace">
+                <text
+                  x={x}
+                  y={y + 4}
+                  textAnchor="middle"
+                  fill="#9ab1a7"
+                  fontSize="9"
+                  fontFamily="ui-monospace, monospace"
+                >
                   {cell.spatial.q},{cell.spatial.r}
                 </text>
               </g>
@@ -252,7 +403,14 @@ export default function HexGameCockpit() {
               >
                 {isSelected && <circle r="17" fill="none" stroke="#f0d47a" strokeWidth="2" />}
                 <circle r="10" fill={color} stroke="#e8eee6" strokeWidth="1.5" />
-                <text x="0" y="25" textAnchor="middle" fill="#e6ece5" fontSize="10" fontFamily="ui-monospace, monospace">
+                <text
+                  x="0"
+                  y="25"
+                  textAnchor="middle"
+                  fill="#e6ece5"
+                  fontSize="10"
+                  fontFamily="ui-monospace, monospace"
+                >
                   {unit.id.replace("UNIT_", "")}
                 </text>
               </g>
@@ -264,7 +422,11 @@ export default function HexGameCockpit() {
       <footer style={styles.footer}>
         <span><b style={{ color: "#58a9e8" }}>P1</b> Player 1</span>
         <span><b style={{ color: "#f07868" }}>P2</b> Player 2</span>
-        <span style={styles.hint}>{selectedUnitId ? `Selected: ${selectedUnitId} · click an open hex to move` : "Select a unit to issue a move"}</span>
+        <span style={styles.hint}>
+          {selectedUnitId
+            ? `Selected: ${selectedUnitId} · click an open hex to move`
+            : "Select a unit to issue a move"}
+        </span>
       </footer>
     </main>
   );
@@ -273,11 +435,40 @@ export default function HexGameCockpit() {
 const styles: Record<string, CSSProperties> = {
   page: {
     minHeight: "100vh",
-    padding: "28px clamp(16px, 4vw, 56px)",
+    padding: "20px clamp(16px, 4vw, 56px) 28px",
     background: "#e9eee8",
     color: "#18302d",
     fontFamily: "'Avenir Next', Avenir, 'Segoe UI', sans-serif",
     boxSizing: "border-box",
+  },
+  modeBar: {
+    display: "flex",
+    justifyContent: "center",
+    gap: 4,
+    width: "fit-content",
+    maxWidth: "100%",
+    margin: "0 auto 24px",
+    padding: 4,
+    border: "1px solid #c4d0c7",
+    background: "#dfe7df",
+    flexWrap: "wrap",
+  },
+  modeButton: {
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "transparent",
+    background: "transparent",
+    color: "#49635a",
+    padding: "10px 14px",
+    font: "inherit",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  modeButtonActive: {
+    background: "#183b35",
+    color: "#f1f4ed",
+    borderColor: "#183b35",
   },
   header: {
     display: "flex",
