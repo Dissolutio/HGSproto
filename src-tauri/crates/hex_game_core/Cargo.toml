@@ -11,3 +11,5 @@ serde_json = "1.0" # FOR TRANSIT PARSING
 [lib]
 name = "hex_game_core"
 crate-type = ["cdylib", "rlib"] # Generates .dll on Windows, .dylib on macOS, .so on Linux
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-bulk-memory"]
