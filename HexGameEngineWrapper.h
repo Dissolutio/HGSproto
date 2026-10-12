@@ -18,4 +18,10 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "HexGameSim")
 	static FString ProcessTokenForMatch(FString MatchID, FString Token);
+
+	UFUNCTION(BlueprintCallable, Category = "HexGameSim")
+	static FString HostMatch(FString MatchID);
+
+	UFUNCTION(BlueprintCallable, Category = "HexGameSim")
+	static bool JoinMatch(FString MatchID, FString HostNodeID);
 };

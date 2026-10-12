@@ -1,3 +1,5 @@
+pub mod ffi;
+
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::LazyLock;
