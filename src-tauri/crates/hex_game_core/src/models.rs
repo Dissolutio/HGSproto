@@ -5,10 +5,21 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum Component {
-    Terrain { inventory_id: String },
-    TerrainType { terrain: String },
-    LifePoints { current: i32, max: i32 },
-    Tags { labels: Vec<String> },
+    Terrain {
+        inventory_id: String,
+        face_texture: String,
+        side_texture: String,
+    },
+    TerrainType {
+        terrain: String,
+    },
+    LifePoints {
+        current: i32,
+        max: i32,
+    },
+    Tags {
+        labels: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

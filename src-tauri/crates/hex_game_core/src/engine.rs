@@ -151,6 +151,7 @@ pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
         let base_q = piece.piece_coords.q;
         let base_r = piece.piece_coords.r;
         let base_z = piece.altitude;
+        let (face_texture, side_texture) = terrain_textures(&piece.inventory_id);
         let offsets = get_hex_footprint_offsets(&piece.inventory_id, piece.rotation);
 
         for (index, (rotated_q, rotated_r)) in offsets.into_iter().enumerate() {
@@ -168,6 +169,8 @@ pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
                     "terrain".to_string(),
                     Component::Terrain {
                         inventory_id: piece.inventory_id.clone(),
+                        face_texture: face_texture.to_string(),
+                        side_texture: side_texture.to_string(),
                     },
                 )]),
             };
@@ -231,6 +234,16 @@ pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
     }
 
     store_match(match_id, game_state);
+}
+
+fn terrain_textures(inventory_id: &str) -> (&'static str, &'static str) {
+    match inventory_id.chars().next() {
+        Some('g') => ("grass_face", "earth_side"),
+        Some('r') => ("rock_face", "rock_side"),
+        Some('s') => ("sand_face", "earth_side"),
+        Some('w') => ("water_face", "water_side"),
+        _ => ("default_face", "default_side"),
+    }
 }
 
 pub fn rebind_player_session(match_id: &str, player_tag: &str) -> Result<(), String> {
@@ -440,13 +453,25 @@ mod tests {
             entity
                 .components
                 .values()
-                .any(|component| matches!(component, Component::Terrain { inventory_id } if inventory_id == "g7"))
+                .any(|component| matches!(component, Component::Terrain { inventory_id, face_texture, side_texture } if inventory_id == "g7" && face_texture == "grass_face" && side_texture == "earth_side"))
         }));
         let positions: std::collections::HashSet<_> = terrain_entities
             .iter()
             .map(|entity| (entity.spatial.q, entity.spatial.r, entity.spatial.z))
             .collect();
         assert_eq!(positions.len(), 7);
+    }
+
+    #[test]
+    fn terrain_inventory_prefix_selects_procedural_textures() {
+        assert_eq!(terrain_textures("g7"), ("grass_face", "earth_side"));
+        assert_eq!(terrain_textures("rock_wall"), ("rock_face", "rock_side"));
+        assert_eq!(terrain_textures("w2"), ("water_face", "water_side"));
+        assert_eq!(terrain_textures("sand_3"), ("sand_face", "earth_side"));
+        assert_eq!(
+            terrain_textures("unknown"),
+            ("default_face", "default_side")
+        );
     }
 
     #[test]
