@@ -66,7 +66,7 @@ mod tests {
         wasm_initialize_match(match_id.clone(), map_json.to_string()).unwrap();
         let state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
-        assert_eq!(state["entities"].as_object().unwrap().len(), 11);
+        assert_eq!(state["entities"].as_object().unwrap().len(), 13);
 
         assert_eq!(
             wasm_process_token_for_match(match_id.clone(), "M:UNIT_P1_1:Q0R2Z0".to_string()),

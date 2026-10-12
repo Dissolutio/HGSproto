@@ -1,5 +1,6 @@
 use crate::models::{
     Component, Entity, GameState, HexoscapeMapFile, MatchContext, SpatialPosition,
+    StarterUnitDefinition,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -37,97 +38,15 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         );
     }
 
-    // 2. Drop 2 Units for Player 1 (Starting on the left side)
-    entities.insert(
-        "UNIT_P1_1".to_string(),
-        Entity {
-            id: "UNIT_P1_1".to_string(),
-            spatial: SpatialPosition { q: -1, r: 0, z: 0 },
-            components: HashMap::from([
-                (
-                    "tags".to_string(),
-                    Component::Tags {
-                        labels: vec!["Unit".to_string(), "P1".to_string()],
-                    },
-                ),
-                (
-                    "destructible".to_string(),
-                    Component::Destructible {
-                        current_life: 4,
-                        max_life: 4,
-                    },
-                ),
-            ]),
-        },
-    );
-    entities.insert(
-        "UNIT_P1_2".to_string(),
-        Entity {
-            id: "UNIT_P1_2".to_string(),
-            spatial: SpatialPosition { q: -1, r: 1, z: 0 },
-            components: HashMap::from([
-                (
-                    "tags".to_string(),
-                    Component::Tags {
-                        labels: vec!["Unit".to_string(), "P1".to_string()],
-                    },
-                ),
-                (
-                    "destructible".to_string(),
-                    Component::Destructible {
-                        current_life: 4,
-                        max_life: 4,
-                    },
-                ),
-            ]),
-        },
-    );
-
-    // 3. Drop 2 Units for Player 2 (Starting on the right side)
-    entities.insert(
-        "UNIT_P2_1".to_string(),
-        Entity {
-            id: "UNIT_P2_1".to_string(),
-            spatial: SpatialPosition { q: 1, r: 0, z: 0 },
-            components: HashMap::from([
-                (
-                    "tags".to_string(),
-                    Component::Tags {
-                        labels: vec!["Unit".to_string(), "P2".to_string()],
-                    },
-                ),
-                (
-                    "destructible".to_string(),
-                    Component::Destructible {
-                        current_life: 4,
-                        max_life: 4,
-                    },
-                ),
-            ]),
-        },
-    );
-    entities.insert(
-        "UNIT_P2_2".to_string(),
-        Entity {
-            id: "UNIT_P2_2".to_string(),
-            spatial: SpatialPosition { q: 1, r: -1, z: 0 },
-            components: HashMap::from([
-                (
-                    "tags".to_string(),
-                    Component::Tags {
-                        labels: vec!["Unit".to_string(), "P2".to_string()],
-                    },
-                ),
-                (
-                    "destructible".to_string(),
-                    Component::Destructible {
-                        current_life: 4,
-                        max_life: 4,
-                    },
-                ),
-            ]),
-        },
-    );
+    let sandbox_positions = [(-1, 0), (-1, 1), (1, 0), (1, -1), (0, 1), (0, -1)];
+    for (unit, (q, r)) in default_starter_units().into_iter().zip(sandbox_positions) {
+        let entity = Entity {
+            id: unit.id.clone(),
+            spatial: SpatialPosition { q, r, z: 0 },
+            components: unit.components,
+        };
+        entities.insert(entity.id.clone(), entity);
+    }
 
     GameState {
         context: MatchContext {
@@ -137,6 +56,38 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         },
         entities,
     }
+}
+
+fn default_starter_units() -> Vec<StarterUnitDefinition> {
+    [
+        ("UNIT_P1_1", "P1", 4, false),
+        ("UNIT_P1_2", "P1", 4, false),
+        ("UNIT_P2_1", "P2", 4, false),
+        ("UNIT_P2_2", "P2", 4, false),
+        ("HERO_P1", "P1", 8, true),
+        ("HERO_P2", "P2", 8, true),
+    ]
+    .into_iter()
+    .map(|(id, player, max_life, is_hero)| {
+        let mut labels = vec!["Unit".to_string(), player.to_string()];
+        if is_hero {
+            labels.push("Hero".to_string());
+        }
+        StarterUnitDefinition {
+            id: id.to_string(),
+            components: HashMap::from([
+                ("tags".to_string(), Component::Tags { labels }),
+                (
+                    "destructible".to_string(),
+                    Component::Destructible {
+                        current_life: max_life,
+                        max_life,
+                    },
+                ),
+            ]),
+        }
+    })
+    .collect()
 }
 
 /// Inserts a live match snapshot into system memory registry
@@ -231,45 +182,41 @@ pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
     spawn_positions
         .dedup_by(|left, right| left.q == right.q && left.r == right.r && left.z == right.z);
 
-    let selected_spawns: Vec<SpatialPosition> = if spawn_positions.len() >= 4 {
+    let mut starter_units = map_file.starter_units;
+    if starter_units.is_empty() {
+        starter_units = default_starter_units();
+    }
+    let unit_count = starter_units.len();
+    let selected_spawns: Vec<SpatialPosition> = if spawn_positions.len() >= unit_count {
         let count = spawn_positions.len();
-        vec![
-            spawn_positions[0].clone(),
-            spawn_positions[1].clone(),
-            spawn_positions[count - 2].clone(),
-            spawn_positions[count - 1].clone(),
-        ]
+        let mut spawn_indices = Vec::with_capacity(unit_count);
+        let front_count = unit_count.min(2);
+        spawn_indices.extend(0..front_count);
+        let back_count = (unit_count - front_count).min(2);
+        spawn_indices.extend((0..back_count).map(|index| count - back_count + index));
+        for index in 0..count {
+            if spawn_indices.len() == unit_count {
+                break;
+            }
+            if !spawn_indices.contains(&index) {
+                spawn_indices.push(index);
+            }
+        }
+        spawn_indices
+            .into_iter()
+            .map(|index| spawn_positions[index].clone())
+            .collect()
     } else {
         spawn_positions
     };
 
-    let units = [
-        ("UNIT_P1_1", "P1"),
-        ("UNIT_P1_2", "P1"),
-        ("UNIT_P2_1", "P2"),
-        ("UNIT_P2_2", "P2"),
-    ];
-    for ((unit_id, player_tag), spatial) in units.into_iter().zip(selected_spawns) {
+    for (unit, spatial) in starter_units.drain(..).zip(selected_spawns) {
         let entity = Entity {
-            id: unit_id.to_string(),
+            id: unit.id.clone(),
             spatial,
-            components: HashMap::from([
-                (
-                    "tags".to_string(),
-                    Component::Tags {
-                        labels: vec!["Unit".to_string(), player_tag.to_string()],
-                    },
-                ),
-                (
-                    "destructible".to_string(),
-                    Component::Destructible {
-                        current_life: 4,
-                        max_life: 4,
-                    },
-                ),
-            ]),
+            components: unit.components,
         };
-        game_state.entities.insert(unit_id.to_string(), entity);
+        game_state.entities.insert(entity.id.clone(), entity);
     }
 
     store_match(match_id, game_state);
@@ -490,7 +437,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_sandbox_contains_seven_hexes_and_four_units() {
+    fn test_sandbox_contains_seven_hexes_and_six_units() {
         let state = generate_test_sandbox("test".to_string());
         let hex_count = state
             .entities
@@ -509,7 +456,7 @@ mod tests {
             .count();
 
         assert_eq!(hex_count, 7);
-        assert_eq!(unit_count, 4);
+        assert_eq!(unit_count, 6);
     }
 
     #[test]
@@ -526,6 +473,7 @@ mod tests {
                 rotation: 0,
                 piece_coords: crate::models::PieceCoords { q: 0, r: 0, s: 0 },
             }],
+            starter_units: Vec::new(),
         };
 
         initialize_from_hexoscape(match_id.clone(), map_file);
@@ -542,7 +490,7 @@ mod tests {
                     .any(|component| matches!(component, Component::Terrain { .. }))
             })
             .collect();
-        assert_eq!(state.entities.len(), 11);
+        assert_eq!(state.entities.len(), 13);
         assert_eq!(terrain_entities.len(), 7);
         assert!(terrain_entities.iter().all(|entity| {
             entity
@@ -583,6 +531,7 @@ mod tests {
                 rotation: 0,
                 piece_coords: crate::models::PieceCoords { q: 0, r: 0, s: 0 },
             }],
+            starter_units: Vec::new(),
         };
 
         initialize_from_hexoscape(match_id.clone(), map_file);
@@ -601,23 +550,34 @@ mod tests {
                 })
             })
             .count();
-        let unit_ids = ["UNIT_P1_1", "UNIT_P1_2", "UNIT_P2_1", "UNIT_P2_2"];
+        let unit_ids = [
+            "UNIT_P1_1",
+            "UNIT_P1_2",
+            "UNIT_P2_1",
+            "UNIT_P2_2",
+            "HERO_P1",
+            "HERO_P2",
+        ];
 
         assert_eq!(terrain_count, 7);
-        assert_eq!(state.entities.len(), 11);
-        for (unit_id, player_tag) in unit_ids.into_iter().zip(["P1", "P1", "P2", "P2"]) {
+        assert_eq!(state.entities.len(), 13);
+        for (unit_id, player_tag) in unit_ids
+            .into_iter()
+            .zip(["P1", "P1", "P2", "P2", "P1", "P2"])
+        {
             let unit = &state.entities[unit_id];
             assert_eq!(unit.id, unit_id);
             assert!(unit.components.values().any(|component| {
-                matches!(component, Component::Tags { labels } if labels == &["Unit", player_tag])
+                matches!(component, Component::Tags { labels } if labels.iter().any(|label| label == "Unit") && labels.iter().any(|label| label == player_tag))
             }));
+            let expected_life = if unit_id.starts_with("HERO_") { 8 } else { 4 };
             assert!(unit.components.values().any(|component| {
                 matches!(
                     component,
                     Component::Destructible {
-                        current_life: 4,
-                        max_life: 4
-                    }
+                        current_life,
+                        max_life
+                    } if *current_life == expected_life && *max_life == expected_life
                 )
             }));
         }
@@ -629,7 +589,7 @@ mod tests {
                 (position.q, position.r, position.z)
             })
             .collect();
-        assert_eq!(unit_positions.len(), 4);
+        assert_eq!(unit_positions.len(), 6);
 
         let first_unit_position = state.entities["UNIT_P1_1"].spatial.clone();
         let occupied_unit_position = state.entities["UNIT_P1_2"].spatial.clone();
@@ -707,6 +667,7 @@ mod tests {
                 rotation: 0,
                 piece_coords: crate::models::PieceCoords { q: 0, r: 0, s: 0 },
             }],
+            starter_units: Vec::new(),
         };
         initialize_from_hexoscape(match_id.clone(), map_file.clone());
         rebind_player_session(&match_id, "Player_2").unwrap();

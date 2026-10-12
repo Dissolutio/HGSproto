@@ -49,7 +49,7 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
         .expect("host rejected client authentication");
 
     let initial_state = current_state(MATCH_ID);
-    assert_eq!(initial_state["entities"].as_object().unwrap().len(), 11);
+    assert_eq!(initial_state["entities"].as_object().unwrap().len(), 13);
     assert!(initial_state["entities"].get("UNIT_P1_1").is_some());
     assert!(initial_state["entities"].get("UNIT_P2_1").is_some());
 
@@ -86,8 +86,8 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
     release_player_session(MATCH_ID, "Player_2");
 
     assert_eq!(
-        process_token(MATCH_ID, "M:UNIT_P1_1:Q0R1Z0"),
-        "VALID_STEP:M:UNIT_P1_1:Q0R1Z0"
+        process_token(MATCH_ID, "M:UNIT_P1_1:Q0R0Z0"),
+        "VALID_STEP:M:UNIT_P1_1:Q0R0Z0"
     );
     let host_mid_dropout_state = current_state(MATCH_ID);
     assert_eq!(
@@ -96,7 +96,7 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
     );
     assert_eq!(
         host_mid_dropout_state["entities"]["UNIT_P1_1"]["spatial"]["r"],
-        1
+        0
     );
     assert_eq!(
         host_mid_dropout_state["entities"]["UNIT_P1_1"]["spatial"]["z"],
@@ -126,11 +126,11 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
 
     let restored_state: serde_json::Value = serde_json::from_str(&restored_snapshot).unwrap();
     assert_eq!(restored_state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
-    assert_eq!(restored_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 1);
+    assert_eq!(restored_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
     assert_eq!(restored_state["entities"]["UNIT_P1_1"]["spatial"]["z"], 0);
     let client_state = current_state(MATCH_ID);
     assert_eq!(client_state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
-    assert_eq!(client_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 1);
+    assert_eq!(client_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
     assert_eq!(client_state["entities"]["UNIT_P1_1"]["spatial"]["z"], 0);
 
     reconnected_client.mark_disconnected().await;

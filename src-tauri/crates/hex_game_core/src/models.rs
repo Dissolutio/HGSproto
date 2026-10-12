@@ -59,6 +59,14 @@ pub struct HexoscapeMapFile {
     pub hex_map: HexMapInfo,
     #[serde(rename = "boardPieces", default)]
     pub board_pieces: Vec<BoardPiece>,
+    #[serde(rename = "starterUnits", default)]
+    pub starter_units: Vec<StarterUnitDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StarterUnitDefinition {
+    pub id: String,
+    pub components: HashMap<String, Component>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +95,7 @@ pub struct PieceCoords {
 
 #[cfg(test)]
 mod tests {
-    use super::HexoscapeMapFile;
+    use super::{Component, HexoscapeMapFile};
 
     #[test]
     fn hexoscape_map_file_round_trips_serialized_layout_keys() {
@@ -116,5 +124,30 @@ mod tests {
         assert!(encoded.get("boardPieces").is_some());
         assert!(encoded["boardPieces"][0].get("inventoryID").is_some());
         assert!(encoded["boardPieces"][0].get("pieceCoords").is_some());
+    }
+
+    #[test]
+    fn hexoscape_map_file_deserializes_starter_unit_components() {
+        let json = r#"{
+            "hexMap": {},
+            "starterUnits": [{
+                "id": "UNIT_P1_1",
+                "components": {
+                    "destructible": {
+                        "type": "Destructible",
+                        "data": {"current_life": 4, "max_life": 4}
+                    }
+                }
+            }]
+        }"#;
+
+        let map: HexoscapeMapFile = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            map.starter_units[0].components.get("destructible"),
+            Some(Component::Destructible {
+                current_life: 4,
+                max_life: 4
+            })
+        ));
     }
 }

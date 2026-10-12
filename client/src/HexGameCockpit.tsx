@@ -51,6 +51,19 @@ const WASM_MATCH_ID = "wasm_sandbox";
 const HEX_RADIUS = 1;
 const PILLAR_HEIGHT = 0.42;
 
+function mockStarterUnit(id: string, labels: string[], life: number) {
+  return {
+    id,
+    components: {
+      tags: { type: "Tags", data: { labels } },
+      destructible: {
+        type: "Destructible",
+        data: { current_life: life, max_life: life },
+      },
+    },
+  };
+}
+
 const MOCK_MAP_JSON = JSON.stringify({
   hexMap: { name: "Local WASM Sandbox" },
   boardPieces: [
@@ -61,6 +74,14 @@ const MOCK_MAP_JSON = JSON.stringify({
       rotation: 0,
       pieceCoords: { q: 0, r: 0, s: 0 },
     },
+  ],
+  starterUnits: [
+    mockStarterUnit("UNIT_P1_1", ["Unit", "P1"], 4),
+    mockStarterUnit("UNIT_P1_2", ["Unit", "P1"], 4),
+    mockStarterUnit("UNIT_P2_1", ["Unit", "P2"], 4),
+    mockStarterUnit("UNIT_P2_2", ["Unit", "P2"], 4),
+    mockStarterUnit("HERO_P1", ["Unit", "P1", "Hero"], 8),
+    mockStarterUnit("HERO_P2", ["Unit", "P2", "Hero"], 8),
   ],
 });
 
@@ -282,10 +303,11 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
   const worldZ = sizeY * entity.spatial.r;
   const worldY = entity.spatial.z * 0.5 + PILLAR_HEIGHT + 0.08;
   const health = unitHealth(entity);
+  const hero = entity.id.includes("HERO");
 
   return (
     <group position={[worldX, worldY, worldZ]} onClick={onSelect}>
-      <Html center distanceFactor={6} position={[0, 0.8, 0]}>
+      <Html center distanceFactor={6} position={[0, hero ? 1.1 : 0.8, 0]}>
         <div
           style={{
             background: "rgba(0, 0, 0, 0.75)",
@@ -308,10 +330,23 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
           <meshBasicMaterial color="#f0d47a" />
         </mesh>
       )}
-      <mesh castShadow>
-        <sphereGeometry args={[0.23, 20, 14]} />
-        <meshStandardMaterial color={playerOne ? "#58a9e8" : "#f07868"} roughness={0.45} />
-      </mesh>
+      {hero ? (
+        <group position={[0, 0.3, 0]}>
+          <mesh castShadow>
+            <sphereGeometry args={[0.3, 16, 16]} />
+            <meshStandardMaterial color={playerOne ? "#1e3a8a" : "#991b1b"} />
+          </mesh>
+          <mesh position={[0, 0.4, 0]} castShadow>
+            <sphereGeometry args={[0.2, 16, 16]} />
+            <meshStandardMaterial color={playerOne ? "#3b82f6" : "#ef4444"} />
+          </mesh>
+        </group>
+      ) : (
+        <mesh castShadow>
+          <sphereGeometry args={[0.23, 20, 14]} />
+          <meshStandardMaterial color={playerOne ? "#58a9e8" : "#f07868"} roughness={0.45} />
+        </mesh>
+      )}
     </group>
   );
 }
@@ -321,7 +356,7 @@ type SceneProps = {
   units: RenderEntity[];
   selectedUnitId: string | null;
   onSelectUnit: (entity: RenderEntity, event: ThreeEvent<MouseEvent>) => void;
-  onHexClick: (q: number, r: number, z: number) => void;
+  onHexClick: (entity: TerrainData) => void;
 };
 
 function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onHexClick }: SceneProps) {
@@ -356,7 +391,7 @@ function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onHexClick }: 
             hexRadius={HEX_RADIUS}
             onClick={(event) => {
               event.stopPropagation();
-              onHexClick(cell.spatial.q, cell.spatial.r, cell.spatial.z);
+              onHexClick(cell);
             }}
           />
         ))}
@@ -376,11 +411,12 @@ function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onHexClick }: 
 }
 
 export default function HexGameCockpit() {
-  const [mode, setMode] = useState<Mode>("network");
+  const [mode, setMode] = useState<Mode>("wasm");
   const [gameState, setGameState] = useState<EngineState | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
+  const [inspectedEntity, setInspectedEntity] = useState<RenderEntity | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
-  const [notice, setNotice] = useState("Opening local engine stream");
+  const [notice, setNotice] = useState("Loading local WebAssembly engine");
   const [socket, setSocket] = useState<WebSocket | null>(null);
 
   useEffect(() => {
@@ -480,7 +516,9 @@ export default function HexGameCockpit() {
     setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
   };
 
-  const handleHexClick = (q: number, r: number, z: number) => {
+  const handleHexClick = (cell: TerrainData) => {
+    setInspectedEntity(entities.find((entity) => entity.id === cell.id) ?? cell);
+    const { q, r, z } = cell.spatial;
     if (!selectedUnitId) {
       const occupant = findEntityAtCoordinate(q, r, z);
       if (occupant) {
@@ -534,6 +572,7 @@ export default function HexGameCockpit() {
 
   const selectUnit = (unit: RenderEntity, event: ThreeEvent<MouseEvent>) => {
     event.stopPropagation();
+    setInspectedEntity(unit);
     const nextId = selectedUnitId === unit.id ? null : unit.id;
     setSelectedUnitId(nextId);
     setNotice(nextId ? `${unit.id} selected` : "Selection cleared");
@@ -542,6 +581,7 @@ export default function HexGameCockpit() {
   const chooseMode = (nextMode: Mode) => {
     if (nextMode === mode) return;
     setSelectedUnitId(null);
+    setInspectedEntity(null);
     setGameState(null);
     setMode(nextMode);
   };
@@ -561,7 +601,10 @@ export default function HexGameCockpit() {
           onClick={() => chooseMode("network")}
           style={{ ...styles.modeButton, ...(mode === "network" ? styles.modeButtonActive : {}) }}
         >
-          Live Network Mode (WebSocket)
+          Live Network Mode (WebSocket){" "}
+          <span style={styles.modeNote}>
+            (Multiplayer Portal — Active Native Server Required)
+          </span>
         </button>
         <button
           type="button"
@@ -619,6 +662,18 @@ export default function HexGameCockpit() {
             onHexClick={handleHexClick}
           />
         </Canvas>
+        <aside style={styles.inspector} aria-label="Entity component inspector">
+          <h2 style={styles.inspectorTitle}>📊 HGS Real-Time Component Inspector</h2>
+          {inspectedEntity ? (
+            <pre style={styles.inspectorContent}>
+              {JSON.stringify(inspectedEntity, null, 2)}
+            </pre>
+          ) : (
+            <p style={styles.inspectorEmpty}>
+              Click a unit or hex pillar to inspect its components.
+            </p>
+          )}
+        </aside>
       </section>
 
       <footer style={styles.footer}>
@@ -667,6 +722,7 @@ const styles: Record<string, CSSProperties> = {
     fontWeight: 600,
     cursor: "pointer",
   },
+  modeNote: { color: "#78847d", fontSize: 10, fontWeight: 400 },
   modeButtonActive: {
     background: "#183b35",
     color: "#f1f4ed",
@@ -691,6 +747,7 @@ const styles: Record<string, CSSProperties> = {
   notice: { color: "#416158", fontSize: 13, overflowWrap: "anywhere" },
   counts: { color: "#587168", fontSize: 12, whiteSpace: "nowrap" },
   boardFrame: {
+    position: "relative",
     maxWidth: 1240,
     height: "min(70vh, 760px)",
     minHeight: 400,
@@ -700,6 +757,37 @@ const styles: Record<string, CSSProperties> = {
     boxShadow: "0 16px 38px #18302d20",
     overflow: "hidden",
   },
+  inspector: {
+    position: "absolute",
+    zIndex: 2,
+    top: 12,
+    right: 12,
+    width: "min(340px, calc(100% - 24px))",
+    maxHeight: "calc(100% - 24px)",
+    overflowY: "auto",
+    boxSizing: "border-box",
+    padding: 14,
+    border: "1px solid #4d6860",
+    background: "rgba(8, 20, 18, 0.86)",
+    color: "#e5efe8",
+    boxShadow: "0 8px 24px #0006",
+    backdropFilter: "blur(6px)",
+  },
+  inspectorTitle: {
+    margin: "0 0 10px",
+    fontSize: 13,
+    fontWeight: 650,
+    lineHeight: 1.4,
+  },
+  inspectorContent: {
+    margin: 0,
+    fontSize: 11,
+    fontFamily: "monospace",
+    color: "#10b981",
+    whiteSpace: "pre-wrap",
+    overflowWrap: "anywhere",
+  },
+  inspectorEmpty: { margin: 0, color: "#9aac9e", fontSize: 12, lineHeight: 1.5 },
   canvas: { width: "100%", height: "100%", display: "block" },
   footer: { maxWidth: 1240, margin: "0 auto", display: "flex", alignItems: "center", gap: 22, paddingTop: 16, color: "#49635a", fontSize: 12 },
   hint: { marginLeft: "auto", textAlign: "right", color: "#688077" },

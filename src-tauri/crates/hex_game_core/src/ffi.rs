@@ -212,11 +212,13 @@ mod tests {
 
         assert_eq!(state["context"]["match_id"], "test_match_123");
         assert_eq!(state["context"]["active_player"], "Player_1");
-        assert_eq!(state["entities"].as_object().unwrap().len(), 11);
+        assert_eq!(state["entities"].as_object().unwrap().len(), 13);
         assert!(state["entities"].get("UNIT_P1_1").is_some());
         assert!(state["entities"].get("UNIT_P1_2").is_some());
         assert!(state["entities"].get("UNIT_P2_1").is_some());
         assert!(state["entities"].get("UNIT_P2_2").is_some());
+        assert!(state["entities"].get("HERO_P1").is_some());
+        assert!(state["entities"].get("HERO_P2").is_some());
         assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["q"], 2);
         assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["r"], -1);
         assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["z"], 3);
@@ -247,7 +249,7 @@ mod tests {
         let json = unsafe { CStr::from_ptr(state_ptr) }.to_str().unwrap();
         let state: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(state["context"]["match_id"], "ffi_seeded_sandbox_move");
-        assert_eq!(state["entities"].as_object().unwrap().len(), 11);
+        assert_eq!(state["entities"].as_object().unwrap().len(), 13);
         assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
         assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
         assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["z"], 0);
