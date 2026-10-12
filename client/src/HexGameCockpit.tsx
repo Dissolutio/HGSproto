@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Canvas, type ThreeEvent } from "@react-three/fiber";
-import { OrbitControls, Stats } from "@react-three/drei";
+import { Html, OrbitControls, Stats } from "@react-three/drei";
 import * as THREE from "three";
 import init, {
   wasm_get_current_state,
@@ -16,6 +16,8 @@ type EngineComponent = {
     face_texture?: string;
     side_texture?: string;
     labels?: string[];
+    current_life?: number;
+    max_life?: number;
   };
   Terrain?: {
     inventory_id?: string;
@@ -24,6 +26,8 @@ type EngineComponent = {
   };
   TerrainType?: { terrain?: string };
   Tags?: { labels?: string[] };
+  Destructible?: { current_life?: number; max_life?: number };
+  destructible?: { current_life?: number; max_life?: number };
 };
 type EngineEntity = {
   id?: string;
@@ -85,6 +89,27 @@ function terrainTextures(entity: EngineEntity) {
 function unitLabels(entity: EngineEntity): string[] {
   const tagged = findComponent(entity, "Tags");
   return tagged?.data?.labels ?? tagged?.Tags?.labels ?? [];
+}
+
+function unitHealth(entity: EngineEntity): { currentLife: number; maxLife: number } | null {
+  const destructible = findComponent(entity, "Destructible");
+  const currentLife =
+    destructible?.data?.current_life ??
+    destructible?.Destructible?.current_life ??
+    destructible?.destructible?.current_life;
+  const maxLife =
+    destructible?.data?.max_life ??
+    destructible?.Destructible?.max_life ??
+    destructible?.destructible?.max_life;
+  if (
+    typeof currentLife !== "number" ||
+    !Number.isFinite(currentLife) ||
+    typeof maxLife !== "number" ||
+    !Number.isFinite(maxLife)
+  ) {
+    return null;
+  }
+  return { currentLife, maxLife };
 }
 
 function entitiesFromState(state: EngineState | null): RenderEntity[] {
@@ -256,9 +281,27 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
   const worldX = sizeX * (entity.spatial.q + entity.spatial.r * 0.5);
   const worldZ = sizeY * entity.spatial.r;
   const worldY = entity.spatial.z * 0.5 + PILLAR_HEIGHT + 0.08;
+  const health = unitHealth(entity);
 
   return (
     <group position={[worldX, worldY, worldZ]} onClick={onSelect}>
+      <Html center distanceFactor={6} position={[0, 0.8, 0]}>
+        <div
+          style={{
+            background: "rgba(0, 0, 0, 0.75)",
+            padding: "2px 6px",
+            borderRadius: 4,
+            border: "1px solid #555",
+            color: "#fff",
+            fontSize: 10,
+            fontFamily: "monospace",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {health ? `${health.currentLife} / ${health.maxLife} HP` : "HP unavailable"}
+        </div>
+      </Html>
       {selected && (
         <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.005, 0]}>
           <ringGeometry args={[0.3, 0.38, 32]} />
