@@ -169,6 +169,61 @@ pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
         }
     }
 
+    let mut spawn_positions: Vec<SpatialPosition> = game_state
+        .entities
+        .values()
+        .filter(|entity| {
+            entity.components.values().any(|component| {
+                matches!(
+                    component,
+                    Component::Terrain { .. } | Component::TerrainType { .. }
+                )
+            })
+        })
+        .map(|entity| entity.spatial.clone())
+        .collect();
+    spawn_positions.sort_by_key(|position| (position.q, position.r, position.z));
+    spawn_positions
+        .dedup_by(|left, right| left.q == right.q && left.r == right.r && left.z == right.z);
+
+    let selected_spawns: Vec<SpatialPosition> = if spawn_positions.len() >= 4 {
+        let count = spawn_positions.len();
+        vec![
+            spawn_positions[0].clone(),
+            spawn_positions[1].clone(),
+            spawn_positions[count - 2].clone(),
+            spawn_positions[count - 1].clone(),
+        ]
+    } else {
+        spawn_positions
+    };
+
+    let units = [
+        ("UNIT_P1_1", "P1"),
+        ("UNIT_P1_2", "P1"),
+        ("UNIT_P2_1", "P2"),
+        ("UNIT_P2_2", "P2"),
+    ];
+    for ((unit_id, player_tag), spatial) in units.into_iter().zip(selected_spawns) {
+        let entity = Entity {
+            id: unit_id.to_string(),
+            spatial,
+            components: HashMap::from([
+                (
+                    "tags".to_string(),
+                    Component::Tags {
+                        labels: vec!["Unit".to_string(), player_tag.to_string()],
+                    },
+                ),
+                (
+                    "life_points".to_string(),
+                    Component::LifePoints { current: 4, max: 4 },
+                ),
+            ]),
+        };
+        game_state.entities.insert(unit_id.to_string(), entity);
+    }
+
     store_match(match_id, game_state);
 }
 
@@ -324,19 +379,147 @@ mod tests {
 
         let matches = ACTIVE_MATCHES.lock().unwrap();
         let state = matches.get(&match_id).unwrap();
-        assert_eq!(state.entities.len(), 7);
-        assert!(state.entities.values().all(|entity| {
+        let terrain_entities: Vec<_> = state
+            .entities
+            .values()
+            .filter(|entity| {
+                entity
+                    .components
+                    .values()
+                    .any(|component| matches!(component, Component::Terrain { .. }))
+            })
+            .collect();
+        assert_eq!(state.entities.len(), 11);
+        assert_eq!(terrain_entities.len(), 7);
+        assert!(terrain_entities.iter().all(|entity| {
             entity
                 .components
                 .values()
                 .any(|component| matches!(component, Component::Terrain { inventory_id } if inventory_id == "g7"))
         }));
-        let positions: std::collections::HashSet<_> = state
-            .entities
-            .values()
+        let positions: std::collections::HashSet<_> = terrain_entities
+            .iter()
             .map(|entity| (entity.spatial.q, entity.spatial.r, entity.spatial.z))
             .collect();
         assert_eq!(positions.len(), 7);
+    }
+
+    #[test]
+    fn test_map_initialization_spawns_combat_units() {
+        let match_id = "hexoscape_combat_unit_spawn_test".to_string();
+        let map_file = HexoscapeMapFile {
+            hex_map: crate::models::HexMapInfo {
+                properties: HashMap::new(),
+            },
+            board_pieces: vec![crate::models::BoardPiece {
+                uid: "g7-spawn-test".to_string(),
+                inventory_id: "g7".to_string(),
+                altitude: 0,
+                rotation: 0,
+                piece_coords: crate::models::PieceCoords { q: 0, r: 0, s: 0 },
+            }],
+        };
+
+        initialize_from_hexoscape(match_id.clone(), map_file);
+
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        let state = matches.get(&match_id).unwrap();
+        let terrain_count = state
+            .entities
+            .values()
+            .filter(|entity| {
+                entity.components.values().any(|component| {
+                    matches!(
+                        component,
+                        Component::Terrain { .. } | Component::TerrainType { .. }
+                    )
+                })
+            })
+            .count();
+        let unit_ids = ["UNIT_P1_1", "UNIT_P1_2", "UNIT_P2_1", "UNIT_P2_2"];
+
+        assert_eq!(terrain_count, 7);
+        assert_eq!(state.entities.len(), 11);
+        for (unit_id, player_tag) in unit_ids.into_iter().zip(["P1", "P1", "P2", "P2"]) {
+            let unit = &state.entities[unit_id];
+            assert_eq!(unit.id, unit_id);
+            assert!(unit.components.values().any(|component| {
+                matches!(component, Component::Tags { labels } if labels == &["Unit", player_tag])
+            }));
+            assert!(unit.components.values().any(|component| {
+                matches!(component, Component::LifePoints { current: 4, max: 4 })
+            }));
+        }
+
+        let unit_positions: std::collections::HashSet<_> = unit_ids
+            .iter()
+            .map(|unit_id| {
+                let position = &state.entities[*unit_id].spatial;
+                (position.q, position.r, position.z)
+            })
+            .collect();
+        assert_eq!(unit_positions.len(), 4);
+
+        let first_unit_position = state.entities["UNIT_P1_1"].spatial.clone();
+        let occupied_unit_position = state.entities["UNIT_P1_2"].spatial.clone();
+        let token = format!(
+            "M:UNIT_P1_1:Q{}R{}Z{}",
+            occupied_unit_position.q, occupied_unit_position.r, occupied_unit_position.z
+        );
+        let mut state_for_move = state.clone();
+        assert!(apply_action(&mut state_for_move, &token).is_err());
+        assert_eq!(
+            (
+                state_for_move.entities["UNIT_P1_1"].spatial.q,
+                state_for_move.entities["UNIT_P1_1"].spatial.r,
+                state_for_move.entities["UNIT_P1_1"].spatial.z,
+            ),
+            (
+                first_unit_position.q,
+                first_unit_position.r,
+                first_unit_position.z,
+            )
+        );
+
+        let free_terrain_position = state
+            .entities
+            .values()
+            .filter(|entity| {
+                entity.components.values().any(|component| {
+                    matches!(
+                        component,
+                        Component::Terrain { .. } | Component::TerrainType { .. }
+                    )
+                })
+            })
+            .map(|entity| entity.spatial.clone())
+            .find(|position| {
+                !state.entities.values().any(|entity| {
+                    is_unit(entity)
+                        && entity.spatial.q == position.q
+                        && entity.spatial.r == position.r
+                        && entity.spatial.z == position.z
+                })
+            })
+            .unwrap();
+        let legal_move = format!(
+            "M:UNIT_P1_1:Q{}R{}Z{}",
+            free_terrain_position.q, free_terrain_position.r, free_terrain_position.z
+        );
+        let mut state_for_legal_move = state.clone();
+        apply_action(&mut state_for_legal_move, &legal_move).unwrap();
+        assert_eq!(
+            (
+                state_for_legal_move.entities["UNIT_P1_1"].spatial.q,
+                state_for_legal_move.entities["UNIT_P1_1"].spatial.r,
+                state_for_legal_move.entities["UNIT_P1_1"].spatial.z,
+            ),
+            (
+                free_terrain_position.q,
+                free_terrain_position.r,
+                free_terrain_position.z,
+            )
+        );
     }
 
     #[test]

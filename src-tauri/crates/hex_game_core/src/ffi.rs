@@ -184,7 +184,7 @@ mod tests {
             "hexMap": {"name": "test"},
             "boardPieces": [{
                 "uid": "U1",
-                "inventoryID": "1",
+                "inventoryID": "g7",
                 "altitude": 3,
                 "rotation": 0,
                 "pieceCoords": {"q": 2, "r": -1, "s": -1}
@@ -208,7 +208,11 @@ mod tests {
 
         assert_eq!(state["context"]["match_id"], "test_match_123");
         assert_eq!(state["context"]["active_player"], "Player_1");
-        assert_eq!(state["entities"].as_object().unwrap().len(), 1);
+        assert_eq!(state["entities"].as_object().unwrap().len(), 11);
+        assert!(state["entities"].get("UNIT_P1_1").is_some());
+        assert!(state["entities"].get("UNIT_P1_2").is_some());
+        assert!(state["entities"].get("UNIT_P2_1").is_some());
+        assert!(state["entities"].get("UNIT_P2_2").is_some());
         assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["q"], 2);
         assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["r"], -1);
         assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["z"], 3);
