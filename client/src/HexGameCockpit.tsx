@@ -278,10 +278,10 @@ type SceneProps = {
   units: RenderEntity[];
   selectedUnitId: string | null;
   onSelectUnit: (entity: RenderEntity, event: ThreeEvent<MouseEvent>) => void;
-  onSelectTerrain: (entity: TerrainData) => void;
+  onHexClick: (q: number, r: number, z: number) => void;
 };
 
-function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onSelectTerrain }: SceneProps) {
+function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onHexClick }: SceneProps) {
   const target = useMemo(() => {
     if (terrain.length === 0) return new THREE.Vector3(0, 0, 0);
     const sum = terrain.reduce(
@@ -313,7 +313,7 @@ function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onSelectTerrai
             hexRadius={HEX_RADIUS}
             onClick={(event) => {
               event.stopPropagation();
-              onSelectTerrain(cell);
+              onHexClick(cell.spatial.q, cell.spatial.r, cell.spatial.z);
             }}
           />
         ))}
@@ -425,30 +425,52 @@ export default function HexGameCockpit() {
     [entities],
   );
 
-  const moveSelectedUnit = (cell: TerrainData) => {
-    if (!selectedUnitId) return;
+  const findEntityAtCoordinate = (q: number, r: number, z: number) =>
+    units.find(
+      (unit) =>
+        unit.spatial.q === q &&
+        unit.spatial.r === r &&
+        unit.spatial.z === z,
+    );
+
+  const sync3DCanvasWithWasmState = () => {
+    setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
+  };
+
+  const handleHexClick = (q: number, r: number, z: number) => {
+    if (!selectedUnitId) {
+      const occupant = findEntityAtCoordinate(q, r, z);
+      if (occupant) {
+        setSelectedUnitId(occupant.id);
+        setNotice(`${occupant.id} selected`);
+      }
+      return;
+    }
+
     const occupied = units.some(
       (unit) =>
         unit.id !== selectedUnitId &&
-        unit.spatial.q === cell.spatial.q &&
-        unit.spatial.r === cell.spatial.r &&
-        unit.spatial.z === cell.spatial.z,
+        unit.spatial.q === q &&
+        unit.spatial.r === r &&
+        unit.spatial.z === z,
     );
     if (occupied) {
       setNotice("Move rejected locally: that hex is occupied");
       return;
     }
-    const token = `M:${selectedUnitId}:Q${cell.spatial.q}R${cell.spatial.r}Z${cell.spatial.z}`;
+
+    const token = `M:${selectedUnitId}:Q${q}R${r}Z${z}`;
     if (mode === "wasm") {
       try {
-        const result = wasm_process_token_for_match(WASM_MATCH_ID, token);
-        if (!result.startsWith("VALID_STEP:")) {
-          setNotice(result.startsWith("E:") ? result.slice(2) : result);
+        const presentationEcho = wasm_process_token_for_match(WASM_MATCH_ID, token);
+        if (presentationEcho.startsWith("E:")) {
+          console.error("Referee Rejected Action:", presentationEcho);
+          setNotice(presentationEcho.slice(2));
           return;
         }
-        setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
-        setNotice(`Applied locally: ${token}`);
         setSelectedUnitId(null);
+        sync3DCanvasWithWasmState();
+        setNotice(`Applied locally: ${token}`);
       } catch (error) {
         setNotice(`WASM move failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -551,7 +573,7 @@ export default function HexGameCockpit() {
             units={units}
             selectedUnitId={selectedUnitId}
             onSelectUnit={selectUnit}
-            onSelectTerrain={moveSelectedUnit}
+            onHexClick={handleHexClick}
           />
         </Canvas>
       </section>
