@@ -1,4 +1,6 @@
-use crate::models::{Component, Entity, GameState, MatchContext, SpatialPosition};
+use crate::models::{
+    Component, Entity, GameState, HexoscapeMapFile, MatchContext, SpatialPosition,
+};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
@@ -106,6 +108,70 @@ pub fn store_match(match_id: String, state: GameState) {
     }
 }
 
+pub fn get_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Vec<(i32, i32)> {
+    let templates_list = crate::templates::get_template_offsets(inventory_id);
+    templates_list
+        .iter()
+        .map(|offset| {
+            let mut current_q = offset.q;
+            let mut current_r = offset.r;
+            let mut current_s = -offset.q - offset.r;
+            let normalized_steps = rotation.rem_euclid(6);
+
+            for _ in 0..normalized_steps {
+                let next_q = -current_r;
+                let next_r = -current_s;
+                let next_s = -next_q - next_r;
+                current_q = next_q;
+                current_r = next_r;
+                current_s = next_s;
+            }
+            (current_q, current_r)
+        })
+        .collect()
+}
+
+pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
+    let mut game_state = GameState {
+        context: MatchContext {
+            match_id: match_id.clone(),
+            active_player: "Player_1".to_string(),
+            turn_phase: "Action".to_string(),
+        },
+        entities: HashMap::new(),
+    };
+
+    for piece in map_file.board_pieces {
+        let base_q = piece.piece_coords.q;
+        let base_r = piece.piece_coords.r;
+        let base_z = piece.altitude;
+        let offsets = get_hex_footprint_offsets(&piece.inventory_id, piece.rotation);
+
+        for (index, (rotated_q, rotated_r)) in offsets.into_iter().enumerate() {
+            let final_q = base_q + rotated_q;
+            let final_r = base_r + rotated_r;
+            let entity_id = format!("TILE_{}_{}", piece.uid, index);
+            let entity = Entity {
+                id: entity_id.clone(),
+                spatial: SpatialPosition {
+                    q: final_q,
+                    r: final_r,
+                    z: base_z,
+                },
+                components: HashMap::from([(
+                    "terrain".to_string(),
+                    Component::Terrain {
+                        inventory_id: piece.inventory_id.clone(),
+                    },
+                )]),
+            };
+            game_state.entities.insert(entity_id, entity);
+        }
+    }
+
+    store_match(match_id, game_state);
+}
+
 /// Helper function to view if a match is actively running
 pub fn match_exists(match_id: &str) -> bool {
     if let Ok(matches) = ACTIVE_MATCHES.lock() {
@@ -138,10 +204,12 @@ pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
         entity.spatial.q == position.q
             && entity.spatial.r == position.r
             && entity.spatial.z == position.z
-            && entity
-                .components
-                .values()
-                .any(|component| matches!(component, Component::TerrainType { .. }))
+            && entity.components.values().any(|component| {
+                matches!(
+                    component,
+                    Component::Terrain { .. } | Component::TerrainType { .. }
+                )
+            })
     });
     if !is_board_hex {
         return Err("Destination is not a board hex".into());
@@ -234,6 +302,41 @@ mod tests {
 
         assert_eq!(hex_count, 7);
         assert_eq!(unit_count, 4);
+    }
+
+    #[test]
+    fn test_hexoscape_map_conversion_blooms_footprints() {
+        let match_id = "hexoscape_g7_footprint_test".to_string();
+        let map_file = HexoscapeMapFile {
+            hex_map: crate::models::HexMapInfo {
+                properties: HashMap::new(),
+            },
+            board_pieces: vec![crate::models::BoardPiece {
+                uid: "g7-piece".to_string(),
+                inventory_id: "g7".to_string(),
+                altitude: 0,
+                rotation: 0,
+                piece_coords: crate::models::PieceCoords { q: 0, r: 0, s: 0 },
+            }],
+        };
+
+        initialize_from_hexoscape(match_id.clone(), map_file);
+
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        let state = matches.get(&match_id).unwrap();
+        assert_eq!(state.entities.len(), 7);
+        assert!(state.entities.values().all(|entity| {
+            entity
+                .components
+                .values()
+                .any(|component| matches!(component, Component::Terrain { inventory_id } if inventory_id == "g7"))
+        }));
+        let positions: std::collections::HashSet<_> = state
+            .entities
+            .values()
+            .map(|entity| (entity.spatial.q, entity.spatial.r, entity.spatial.z))
+            .collect();
+        assert_eq!(positions.len(), 7);
     }
 
     #[test]

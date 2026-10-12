@@ -1,5 +1,5 @@
 use crate::engine;
-use crate::models::GameState;
+use crate::models::HexoscapeMapFile;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -21,9 +21,8 @@ pub unsafe extern "C" fn hgs_initialize_match(
     let json_manifest_bytes = unsafe { CStr::from_ptr(c_json_manifest) }.to_bytes();
 
     // 1. Safely deserialize the JSON layout into your Rust model structures
-    if let Ok(game_state) = serde_json::from_slice::<GameState>(json_manifest_bytes) {
-        // 2. Pin the live state into the global memory room!
-        engine::store_match(match_id_str, game_state);
+    if let Ok(map_file) = serde_json::from_slice::<HexoscapeMapFile>(json_manifest_bytes) {
+        engine::initialize_from_hexoscape(match_id_str, map_file);
     }
 }
 
@@ -182,18 +181,14 @@ mod tests {
         let raw_match_id = CString::new("test_match_123").unwrap();
         let sample_json_layout = CString::new(
             r#"{
-            "context": {
-                "match_id": "test_match_123",
-                "active_player": "Player_1",
-                "turn_phase": "Action"
-            },
-            "entities": {
-                "U1": {
-                    "id": "U1",
-                    "spatial": { "q": 2, "r": -1, "z": 3 },
-                    "components": {}
-                }
-            }
+            "hexMap": {"name": "test"},
+            "boardPieces": [{
+                "uid": "U1",
+                "inventoryID": "1",
+                "altitude": 3,
+                "rotation": 0,
+                "pieceCoords": {"q": 2, "r": -1, "s": -1}
+            }]
         }"#,
         )
         .unwrap();
@@ -213,9 +208,10 @@ mod tests {
 
         assert_eq!(state["context"]["match_id"], "test_match_123");
         assert_eq!(state["context"]["active_player"], "Player_1");
-        assert_eq!(state["entities"]["U1"]["spatial"]["q"], 2);
-        assert_eq!(state["entities"]["U1"]["spatial"]["r"], -1);
-        assert_eq!(state["entities"]["U1"]["spatial"]["z"], 3);
+        assert_eq!(state["entities"].as_object().unwrap().len(), 1);
+        assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["q"], 2);
+        assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["r"], -1);
+        assert_eq!(state["entities"]["TILE_U1_0"]["spatial"]["z"], 3);
 
         unsafe { hgs_free_string(raw_state_ptr) };
 

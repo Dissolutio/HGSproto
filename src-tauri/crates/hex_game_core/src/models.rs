@@ -5,6 +5,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum Component {
+    Terrain { inventory_id: String },
     TerrainType { terrain: String },
     LifePoints { current: i32, max: i32 },
     Tags { labels: Vec<String> },
@@ -56,10 +57,17 @@ pub struct BoardPiece {
     pub uid: String,
     #[serde(rename = "inventoryID")]
     pub inventory_id: String,
-    pub altitude: f32,
-    pub rotation: f32,
+    pub altitude: i32,
+    pub rotation: i32,
     #[serde(rename = "pieceCoords")]
-    pub piece_coords: serde_json::Value,
+    pub piece_coords: PieceCoords,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PieceCoords {
+    pub q: i32,
+    pub r: i32,
+    pub s: i32,
 }
 
 #[cfg(test)]
@@ -74,8 +82,8 @@ mod tests {
                 "uid": "piece-1",
                 "inventoryID": "unit-scout",
                 "altitude": 2,
-                "rotation": 90,
-                "pieceCoords": {"q": 1, "r": -1}
+                "rotation": 1,
+                "pieceCoords": {"q": 1, "r": -1, "s": 0}
             }]
         }"#;
 
@@ -84,9 +92,9 @@ mod tests {
         assert_eq!(map.board_pieces.len(), 1);
         assert_eq!(map.board_pieces[0].uid, "piece-1");
         assert_eq!(map.board_pieces[0].inventory_id, "unit-scout");
-        assert_eq!(map.board_pieces[0].altitude, 2.0);
-        assert_eq!(map.board_pieces[0].rotation, 90.0);
-        assert_eq!(map.board_pieces[0].piece_coords["q"], 1);
+        assert_eq!(map.board_pieces[0].altitude, 2);
+        assert_eq!(map.board_pieces[0].rotation, 1);
+        assert_eq!(map.board_pieces[0].piece_coords.q, 1);
 
         let encoded = serde_json::to_value(map).unwrap();
         assert!(encoded.get("hexMap").is_some());
