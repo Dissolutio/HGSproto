@@ -79,6 +79,24 @@ pub unsafe extern "C" fn hgs_process_token(c_token: *const c_char) -> *mut c_cha
     CString::new(response_token).unwrap().into_raw()
 }
 
+/// Spawns a pre-loaded testing sandbox match directly in memory.
+/// # Safety
+/// Unreal must pass a valid, null-terminated C-string for c_match_id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_initialize_test_match(c_match_id: *const c_char) {
+    if c_match_id.is_null() {
+        return;
+    }
+
+    let match_id_str = unsafe { CStr::from_ptr(c_match_id) }
+        .to_string_lossy()
+        .into_owned();
+
+    // Generate our 7-hex, 4-unit sandbox map and wire it straight into global memory
+    let sandbox_state = engine::generate_test_sandbox(match_id_str.clone());
+    engine::store_match(match_id_str, sandbox_state);
+}
+
 /// Processes an action token against a specific initialized match.
 /// # Safety
 /// Both arguments must be valid, null-terminated C-strings.
@@ -203,5 +221,31 @@ mod tests {
         let unknown_match = CString::new("unknown_match").unwrap();
         let missing_state_ptr = unsafe { hgs_get_current_state(unknown_match.as_ptr()) };
         assert!(missing_state_ptr.is_null());
+    }
+
+    #[test]
+    fn test_seeded_sandbox_move_round_trip() {
+        let match_id = CString::new("ffi_seeded_sandbox_move").unwrap();
+        let token = CString::new("M:U1_P1:Q0R0Z0").unwrap();
+
+        unsafe { hgs_initialize_test_match(match_id.as_ptr()) };
+
+        let response_ptr =
+            unsafe { hgs_process_token_for_match(match_id.as_ptr(), token.as_ptr()) };
+        assert!(!response_ptr.is_null());
+        let response = unsafe { CStr::from_ptr(response_ptr) }.to_str().unwrap();
+        assert_eq!(response, "VALID_STEP:M:U1_P1:Q0R0Z0");
+        unsafe { hgs_free_string(response_ptr) };
+
+        let state_ptr = unsafe { hgs_get_current_state(match_id.as_ptr()) };
+        assert!(!state_ptr.is_null());
+        let json = unsafe { CStr::from_ptr(state_ptr) }.to_str().unwrap();
+        let state: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(state["context"]["match_id"], "ffi_seeded_sandbox_move");
+        assert_eq!(state["entities"].as_object().unwrap().len(), 11);
+        assert_eq!(state["entities"]["U1_P1"]["spatial"]["q"], 0);
+        assert_eq!(state["entities"]["U1_P1"]["spatial"]["r"], 0);
+        assert_eq!(state["entities"]["U1_P1"]["spatial"]["z"], 0);
+        unsafe { hgs_free_string(state_ptr) };
     }
 }

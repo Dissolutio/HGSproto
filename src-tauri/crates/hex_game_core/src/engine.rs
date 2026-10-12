@@ -1,4 +1,4 @@
-use crate::models::{GameState, SpatialPosition};
+use crate::models::{Component, Entity, GameState, MatchContext, SpatialPosition};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
@@ -6,6 +6,98 @@ use std::sync::{LazyLock, Mutex};
 // LazyLock guarantees this maps initializes safely in memory the exact millisecond it is first pinged.
 pub static ACTIVE_MATCHES: LazyLock<Mutex<HashMap<String, GameState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Generates a hardcoded test sandbox with a small board and 2 units per player.
+pub fn generate_test_sandbox(match_id: String) -> GameState {
+    let mut entities = HashMap::new();
+
+    // 1. Sprout a simple 7-hex layout ring at altitude Z=0
+    let hex_coordinates = vec![(0, 0), (0, 1), (1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1)];
+    for (i, (q, r)) in hex_coordinates.iter().enumerate() {
+        let hex_id = format!("HEX_{}", i);
+        let mut components = HashMap::new();
+        components.insert(
+            "terrain".to_string(),
+            Component::TerrainType {
+                terrain: "Grass".to_string(),
+            },
+        );
+
+        entities.insert(
+            hex_id.clone(),
+            Entity {
+                id: hex_id,
+                spatial: SpatialPosition { q: *q, r: *r, z: 0 },
+                components,
+            },
+        );
+    }
+
+    // 2. Drop 2 Units for Player 1 (Starting on the left side)
+    entities.insert(
+        "U1_P1".to_string(),
+        Entity {
+            id: "U1_P1".to_string(),
+            spatial: SpatialPosition { q: -1, r: 0, z: 0 },
+            components: HashMap::from([(
+                "tags".to_string(),
+                Component::Tags {
+                    labels: vec!["Unit".to_string(), "P1".to_string()],
+                },
+            )]),
+        },
+    );
+    entities.insert(
+        "U2_P1".to_string(),
+        Entity {
+            id: "U2_P1".to_string(),
+            spatial: SpatialPosition { q: -1, r: 1, z: 0 },
+            components: HashMap::from([(
+                "tags".to_string(),
+                Component::Tags {
+                    labels: vec!["Unit".to_string(), "P1".to_string()],
+                },
+            )]),
+        },
+    );
+
+    // 3. Drop 2 Units for Player 2 (Starting on the right side)
+    entities.insert(
+        "U1_P2".to_string(),
+        Entity {
+            id: "U1_P2".to_string(),
+            spatial: SpatialPosition { q: 1, r: 0, z: 0 },
+            components: HashMap::from([(
+                "tags".to_string(),
+                Component::Tags {
+                    labels: vec!["Unit".to_string(), "P2".to_string()],
+                },
+            )]),
+        },
+    );
+    entities.insert(
+        "U2_P2".to_string(),
+        Entity {
+            id: "U2_P2".to_string(),
+            spatial: SpatialPosition { q: 1, r: -1, z: 0 },
+            components: HashMap::from([(
+                "tags".to_string(),
+                Component::Tags {
+                    labels: vec!["Unit".to_string(), "P2".to_string()],
+                },
+            )]),
+        },
+    );
+
+    GameState {
+        context: MatchContext {
+            match_id,
+            active_player: "Player_1".to_string(),
+            turn_phase: "Action".to_string(),
+        },
+        entities,
+    }
+}
 
 /// Inserts a live match snapshot into system memory registry
 pub fn store_match(match_id: String, state: GameState) {
@@ -37,6 +129,39 @@ pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
     let entity_id = entity_id.ok_or_else(|| "Missing entity ID".to_string())?;
     let destination = destination.ok_or_else(|| "Missing move destination".to_string())?;
     let position = parse_spatial_position(destination)?;
+
+    let entity = state
+        .entities
+        .get(entity_id)
+        .ok_or_else(|| format!("Unknown entity: {entity_id}"))?;
+    if !is_unit(entity) {
+        return Err(format!("Entity is not a movable unit: {entity_id}"));
+    }
+
+    let is_board_hex = state.entities.values().any(|entity| {
+        entity.spatial.q == position.q
+            && entity.spatial.r == position.r
+            && entity.spatial.z == position.z
+            && entity
+                .components
+                .values()
+                .any(|component| matches!(component, Component::TerrainType { .. }))
+    });
+    if !is_board_hex {
+        return Err("Destination is not a board hex".into());
+    }
+
+    let is_occupied = state.entities.iter().any(|(id, entity)| {
+        id != entity_id
+            && is_unit(entity)
+            && entity.spatial.q == position.q
+            && entity.spatial.r == position.r
+            && entity.spatial.z == position.z
+    });
+    if is_occupied {
+        return Err("Destination tile is already occupied by a unit".into());
+    }
+
     let entity = state
         .entities
         .get_mut(entity_id)
@@ -44,6 +169,12 @@ pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
 
     entity.spatial = position;
     Ok(())
+}
+
+fn is_unit(entity: &Entity) -> bool {
+    entity.components.values().any(|component| {
+        matches!(component, Component::Tags { labels } if labels.iter().any(|label| label == "Unit"))
+    })
 }
 
 /// Applies an action to a registered match.
@@ -83,33 +214,64 @@ fn parse_spatial_position(value: &str) -> Result<SpatialPosition, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Entity, MatchContext};
+    use crate::models::MatchContext;
     use std::collections::HashMap;
 
     #[test]
-    fn move_action_updates_entity_spatial_position() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "U1".to_string(),
-            Entity {
-                id: "U1".to_string(),
-                spatial: SpatialPosition { q: 0, r: 0, z: 0 },
-                components: HashMap::new(),
-            },
-        );
-        let mut state = GameState {
-            context: MatchContext {
-                match_id: "test".to_string(),
-                active_player: "P1".to_string(),
-                turn_phase: "movement".to_string(),
-            },
-            entities,
-        };
+    fn test_sandbox_contains_seven_hexes_and_four_units() {
+        let state = generate_test_sandbox("test".to_string());
+        let hex_count = state
+            .entities
+            .values()
+            .filter(|entity| {
+                entity
+                    .components
+                    .values()
+                    .any(|component| matches!(component, Component::TerrainType { .. }))
+            })
+            .count();
+        let unit_count = state
+            .entities
+            .values()
+            .filter(|entity| is_unit(entity))
+            .count();
 
-        apply_action(&mut state, "M:U1:Q0R2Z1").unwrap();
+        assert_eq!(hex_count, 7);
+        assert_eq!(unit_count, 4);
+    }
 
-        let position = &state.entities["U1"].spatial;
-        assert_eq!((position.q, position.r, position.z), (0, 2, 1));
+    #[test]
+    fn move_action_updates_unit_position_on_board() {
+        let mut state = generate_test_sandbox("test".to_string());
+        apply_action(&mut state, "M:U1_P1:Q0R0Z0").unwrap();
+
+        let position = &state.entities["U1_P1"].spatial;
+        assert_eq!((position.q, position.r, position.z), (0, 0, 0));
+    }
+
+    #[test]
+    fn move_action_allows_unit_to_remain_on_its_current_hex() {
+        let mut state = generate_test_sandbox("test".to_string());
+        apply_action(&mut state, "M:U1_P1:Q-1R0Z0").unwrap();
+    }
+
+    #[test]
+    fn move_action_rejects_occupied_or_off_board_destinations() {
+        let mut state = generate_test_sandbox("test".to_string());
+
+        assert!(apply_action(&mut state, "M:U1_P1:Q-1R1Z0").is_err());
+        assert!(apply_action(&mut state, "M:U1_P1:Q9R9Z0").is_err());
+        assert_eq!(state.entities["U1_P1"].spatial.q, -1);
+        assert_eq!(state.entities["U1_P1"].spatial.r, 0);
+    }
+
+    #[test]
+    fn move_action_rejects_non_unit_entities() {
+        let mut state = generate_test_sandbox("test".to_string());
+
+        assert!(apply_action(&mut state, "M:HEX_0:Q0R0Z0").is_err());
+        assert_eq!(state.entities["HEX_0"].spatial.q, 0);
+        assert_eq!(state.entities["HEX_0"].spatial.r, 0);
     }
 
     #[test]
