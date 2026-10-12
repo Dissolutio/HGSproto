@@ -2240,10 +2240,12 @@ dependencies = [
 name = "hex_game_network"
 version = "0.1.0"
 dependencies = [
+ "hex_game_core",
  "iroh",
  "js-sys",
  "serde",
  "serde_json",
+ "tokio",
  "wasm-bindgen",
  "web-sys",
 ]

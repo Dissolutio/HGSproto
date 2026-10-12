@@ -1,12 +1,14 @@
 use crate::models::{
     Component, Entity, GameState, HexoscapeMapFile, MatchContext, SpatialPosition,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 // A thread-safe, globally accessible map of active matches, locked behind a Mutex.
 // LazyLock guarantees this maps initializes safely in memory the exact millisecond it is first pinged.
 pub static ACTIVE_MATCHES: LazyLock<Mutex<HashMap<String, GameState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_PLAYER_SESSIONS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Generates a hardcoded test sandbox with a small board and 2 units per player.
@@ -132,6 +134,10 @@ pub fn get_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Vec<(i32,
 }
 
 pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
+    if match_exists(&match_id) {
+        return;
+    }
+
     let mut game_state = GameState {
         context: MatchContext {
             match_id: match_id.clone(),
@@ -225,6 +231,45 @@ pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
     }
 
     store_match(match_id, game_state);
+}
+
+pub fn rebind_player_session(match_id: &str, player_tag: &str) -> Result<(), String> {
+    if !matches!(player_tag, "Player_1" | "Player_2") {
+        return Err(format!("Unknown player seat: {player_tag}"));
+    }
+    if !match_exists(match_id) {
+        return Err(format!("Unknown match: {match_id}"));
+    }
+
+    let mut sessions = ACTIVE_PLAYER_SESSIONS
+        .lock()
+        .map_err(|_| "Player session registry is unavailable".to_string())?;
+    let active_players = sessions.entry(match_id.to_string()).or_default();
+    if !active_players.insert(player_tag.to_string()) {
+        return Err(format!("Player seat is already active: {player_tag}"));
+    }
+    Ok(())
+}
+
+pub fn release_player_session(match_id: &str, player_tag: &str) {
+    if let Ok(mut sessions) = ACTIVE_PLAYER_SESSIONS.lock() {
+        if let Some(active_players) = sessions.get_mut(match_id) {
+            active_players.remove(player_tag);
+            if active_players.is_empty() {
+                sessions.remove(match_id);
+            }
+        }
+    }
+}
+
+pub fn restore_match_snapshot(match_id: &str, snapshot: &str) -> Result<(), String> {
+    let state: GameState = serde_json::from_str(snapshot)
+        .map_err(|error| format!("Invalid match snapshot: {error}"))?;
+    if state.context.match_id != match_id {
+        return Err("Snapshot match ID does not match the requested match".into());
+    }
+    store_match(match_id.to_string(), state);
+    Ok(())
 }
 
 /// Helper function to view if a match is actively running
@@ -520,6 +565,41 @@ mod tests {
                 free_terrain_position.z,
             )
         );
+    }
+
+    #[test]
+    fn reinitializing_existing_match_preserves_live_state_and_seat_bindings() {
+        let match_id = "hexoscape_recovery_state_test".to_string();
+        let map_file = HexoscapeMapFile {
+            hex_map: crate::models::HexMapInfo {
+                properties: HashMap::new(),
+            },
+            board_pieces: vec![crate::models::BoardPiece {
+                uid: "recovery-tile".to_string(),
+                inventory_id: "g7".to_string(),
+                altitude: 0,
+                rotation: 0,
+                piece_coords: crate::models::PieceCoords { q: 0, r: 0, s: 0 },
+            }],
+        };
+        initialize_from_hexoscape(match_id.clone(), map_file.clone());
+        rebind_player_session(&match_id, "Player_2").unwrap();
+
+        {
+            let mut matches = ACTIVE_MATCHES.lock().unwrap();
+            let state = matches.get_mut(&match_id).unwrap();
+            state.entities.get_mut("UNIT_P2_1").unwrap().spatial.q = 99;
+        }
+        initialize_from_hexoscape(match_id.clone(), map_file);
+
+        assert!(rebind_player_session(&match_id, "Player_2").is_err());
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        assert_eq!(matches[&match_id].entities["UNIT_P2_1"].spatial.q, 99);
+        drop(matches);
+
+        release_player_session(&match_id, "Player_2");
+        rebind_player_session(&match_id, "Player_2").unwrap();
+        release_player_session(&match_id, "Player_2");
     }
 
     #[test]

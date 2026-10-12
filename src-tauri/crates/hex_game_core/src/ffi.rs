@@ -91,6 +91,10 @@ pub unsafe extern "C" fn hgs_initialize_test_match(c_match_id: *const c_char) {
         .to_string_lossy()
         .into_owned();
 
+    if engine::match_exists(&match_id_str) {
+        return;
+    }
+
     // Generate our 7-hex, 4-unit sandbox map and wire it straight into global memory
     let sandbox_state = engine::generate_test_sandbox(match_id_str.clone());
     engine::store_match(match_id_str, sandbox_state);

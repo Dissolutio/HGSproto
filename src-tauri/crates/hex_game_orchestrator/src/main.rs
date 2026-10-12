@@ -3,6 +3,7 @@ use std::ffi::{CStr, CString};
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use hex_game_core::engine::{match_exists, rebind_player_session};
 use hex_game_core::ffi::{
     hgs_free_string, hgs_get_current_state, hgs_initialize_test_match, hgs_process_token_for_match,
 };
@@ -23,7 +24,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let role = prompt_line(&mut input, "Select role (1 or 2): ").await?;
     let session = match role.trim() {
         "1" => {
-            let mut session = MatchSession::host_match().await?;
+            initialize_if_missing(MATCH_ID)?;
+            rebind_player_session(MATCH_ID, "Player_1")?;
+            let session = MatchSession::host_match().await?;
             println!("Host endpoint ready.");
             println!("Share this Node ID with the joining player:");
             println!("{}", session.local_node_id);
@@ -33,14 +36,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         "2" => {
             let target_id = prompt_line(&mut input, "Paste the host Node ID: ").await?;
-            MatchSession::join_match(target_id.trim()).await?
+            initialize_if_missing(MATCH_ID)?;
+            let session = MatchSession::join_match(target_id.trim()).await?;
+            let snapshot = session.authenticate_player(MATCH_ID, "Player_2").await?;
+            println!("Authenticated and restored match snapshot: {snapshot}");
+            session
         }
         _ => return Err("Invalid selection. Choose 1 to host or 2 to join.".into()),
     };
 
-    println!("Peer connected. Initializing local sandbox match...");
-    initialize_test_match(MATCH_ID)?;
-    println!("Local match initialized: {MATCH_ID}");
+    println!("Peer connected. Local match is ready: {MATCH_ID}");
 
     let session = Arc::new(session);
     let incoming_session = Arc::clone(&session);
@@ -62,7 +67,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Err(error) => {
                     eprintln!("Incoming network stream ended: {error}");
-                    break;
+                    incoming_session.mark_disconnected().await;
+                    if incoming_session.is_host {
+                        eprintln!("Waiting for an authenticated reconnection...");
+                        if let Err(error) = incoming_session.accept_peer().await {
+                            eprintln!("Could not accept reconnection: {error}");
+                            break;
+                        }
+                        println!("Peer reconnected; live match state retained.");
+                    } else {
+                        eprintln!("Reconnect with /reconnect <host-node-id>.");
+                        incoming_session.wait_for_connection().await;
+                    }
                 }
             }
         }
@@ -79,6 +95,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if token.is_empty() {
             print!("Move token (or /quit): ");
             io::stdout().flush()?;
+            continue;
+        }
+
+        if let Some(target_id) = token.strip_prefix("/reconnect ") {
+            match session
+                .reconnect_match(target_id.trim(), MATCH_ID, "Player_2")
+                .await
+            {
+                Ok(snapshot) => {
+                    println!("Reconnected; authoritative snapshot restored: {snapshot}")
+                }
+                Err(error) => eprintln!("Could not reconnect: {error}"),
+            }
+            print!("Move token (or /quit): ");
+            io::stdout().flush()?;
+            line.clear();
             continue;
         }
 
@@ -113,7 +145,10 @@ where
     Ok(line)
 }
 
-fn initialize_test_match(match_id: &str) -> Result<(), Box<dyn Error>> {
+fn initialize_if_missing(match_id: &str) -> Result<(), Box<dyn Error>> {
+    if match_exists(match_id) {
+        return Ok(());
+    }
     let match_id = CString::new(match_id)?;
     unsafe { hgs_initialize_test_match(match_id.as_ptr()) };
     Ok(())
