@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use std::{error::Error, fmt};
 
@@ -6,10 +8,12 @@ use hex_game_core::{
     engine,
     ffi::{hgs_free_string, hgs_get_current_state},
 };
-use iroh::{Endpoint, NodeId, endpoint::Connection};
+use iroh::{Endpoint, NodeAddr, NodeId, endpoint::Connection};
 use tokio::sync::{Notify, RwLock};
 
 const MATCH_ALPN: &[u8] = b"hexgamesim/match/0";
+static LOCAL_NODE_ADDRS: LazyLock<Mutex<HashMap<String, NodeAddr>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub struct NetworkError(String);
@@ -46,9 +50,15 @@ impl MatchSession {
             .bind()
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
+        let local_node_id = endpoint.node_id().to_string();
+        if let Ok(node_addr) = endpoint.node_addr().await {
+            if let Ok(mut local_addrs) = LOCAL_NODE_ADDRS.lock() {
+                local_addrs.insert(local_node_id.clone(), node_addr);
+            }
+        }
 
         Ok(Self {
-            local_node_id: endpoint.node_id().to_string(),
+            local_node_id,
             is_host: true,
             endpoint,
             connection: Arc::new(RwLock::new(None)),
@@ -68,8 +78,13 @@ impl MatchSession {
             .bind()
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
+        let target_addr = LOCAL_NODE_ADDRS
+            .lock()
+            .ok()
+            .and_then(|local_addrs| local_addrs.get(target_host_id).cloned())
+            .unwrap_or_else(|| NodeAddr::from(host_node_id));
         let connection = endpoint
-            .connect(host_node_id, MATCH_ALPN)
+            .connect(target_addr, MATCH_ALPN)
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
 
@@ -177,7 +192,14 @@ impl MatchSession {
             .map_err(|error| NetworkError(format!("Invalid host node ID: {error}")))?;
         let connection = self
             .endpoint
-            .connect(host_node_id, MATCH_ALPN)
+            .connect(
+                LOCAL_NODE_ADDRS
+                    .lock()
+                    .ok()
+                    .and_then(|local_addrs| local_addrs.get(target_host_id).cloned())
+                    .unwrap_or_else(|| NodeAddr::from(host_node_id)),
+                MATCH_ALPN,
+            )
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
         let snapshot = authenticate_connection(&connection, match_id, player_tag).await?;
@@ -264,6 +286,16 @@ impl MatchSession {
     }
 }
 
+impl Drop for MatchSession {
+    fn drop(&mut self) {
+        if self.is_host {
+            if let Ok(mut local_addrs) = LOCAL_NODE_ADDRS.lock() {
+                local_addrs.remove(&self.local_node_id);
+            }
+        }
+    }
+}
+
 fn parse_auth_token(token: &str) -> Result<(String, String), NetworkError> {
     let payload = token
         .strip_prefix("AUTH:")
@@ -312,27 +344,20 @@ async fn authenticate_connection(
     match_id: &str,
     player_tag: &str,
 ) -> Result<String, NetworkError> {
-    engine::rebind_player_session(match_id, player_tag).map_err(NetworkError)?;
     let auth = format!("AUTH:{match_id}:{player_tag}");
     if let Err(error) = send_packet(connection, &auth).await {
-        engine::release_player_session(match_id, player_tag);
         return Err(error);
     }
     let snapshot = match receive_packet(connection, 1_048_576).await {
         Ok(snapshot) if !snapshot.starts_with("E:") => snapshot,
         Ok(error_packet) => {
-            engine::release_player_session(match_id, player_tag);
             return Err(NetworkError(format!(
                 "Host rejected authentication: {error_packet}"
             )));
         }
-        Err(error) => {
-            engine::release_player_session(match_id, player_tag);
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     if let Err(error) = engine::restore_match_snapshot(match_id, &snapshot) {
-        engine::release_player_session(match_id, player_tag);
         return Err(NetworkError(error));
     }
     Ok(snapshot)

@@ -11,3 +11,7 @@ path = "src/main.rs"
 hex_game_core = { path = "../hex_game_core" }
 hex_game_network = { path = "../hex_game_network" }
 tokio = { version = "1.0", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["time"] }

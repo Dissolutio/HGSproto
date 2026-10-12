@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn test_seeded_sandbox_move_round_trip() {
         let match_id = CString::new("ffi_seeded_sandbox_move").unwrap();
-        let token = CString::new("M:U1_P1:Q0R0Z0").unwrap();
+        let token = CString::new("M:UNIT_P1_1:Q0R0Z0").unwrap();
 
         unsafe { hgs_initialize_test_match(match_id.as_ptr()) };
 
@@ -239,7 +239,7 @@ mod tests {
             unsafe { hgs_process_token_for_match(match_id.as_ptr(), token.as_ptr()) };
         assert!(!response_ptr.is_null());
         let response = unsafe { CStr::from_ptr(response_ptr) }.to_str().unwrap();
-        assert_eq!(response, "VALID_STEP:M:U1_P1:Q0R0Z0");
+        assert_eq!(response, "VALID_STEP:M:UNIT_P1_1:Q0R0Z0");
         unsafe { hgs_free_string(response_ptr) };
 
         let state_ptr = unsafe { hgs_get_current_state(match_id.as_ptr()) };
@@ -248,9 +248,9 @@ mod tests {
         let state: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(state["context"]["match_id"], "ffi_seeded_sandbox_move");
         assert_eq!(state["entities"].as_object().unwrap().len(), 11);
-        assert_eq!(state["entities"]["U1_P1"]["spatial"]["q"], 0);
-        assert_eq!(state["entities"]["U1_P1"]["spatial"]["r"], 0);
-        assert_eq!(state["entities"]["U1_P1"]["spatial"]["z"], 0);
+        assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
+        assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
+        assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["z"], 0);
         unsafe { hgs_free_string(state_ptr) };
     }
 }

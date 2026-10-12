@@ -39,9 +39,9 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
 
     // 2. Drop 2 Units for Player 1 (Starting on the left side)
     entities.insert(
-        "U1_P1".to_string(),
+        "UNIT_P1_1".to_string(),
         Entity {
-            id: "U1_P1".to_string(),
+            id: "UNIT_P1_1".to_string(),
             spatial: SpatialPosition { q: -1, r: 0, z: 0 },
             components: HashMap::from([(
                 "tags".to_string(),
@@ -52,9 +52,9 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         },
     );
     entities.insert(
-        "U2_P1".to_string(),
+        "UNIT_P1_2".to_string(),
         Entity {
-            id: "U2_P1".to_string(),
+            id: "UNIT_P1_2".to_string(),
             spatial: SpatialPosition { q: -1, r: 1, z: 0 },
             components: HashMap::from([(
                 "tags".to_string(),
@@ -67,9 +67,9 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
 
     // 3. Drop 2 Units for Player 2 (Starting on the right side)
     entities.insert(
-        "U1_P2".to_string(),
+        "UNIT_P2_1".to_string(),
         Entity {
-            id: "U1_P2".to_string(),
+            id: "UNIT_P2_1".to_string(),
             spatial: SpatialPosition { q: 1, r: 0, z: 0 },
             components: HashMap::from([(
                 "tags".to_string(),
@@ -80,9 +80,9 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         },
     );
     entities.insert(
-        "U2_P2".to_string(),
+        "UNIT_P2_2".to_string(),
         Entity {
-            id: "U2_P2".to_string(),
+            id: "UNIT_P2_2".to_string(),
             spatial: SpatialPosition { q: 1, r: -1, z: 0 },
             components: HashMap::from([(
                 "tags".to_string(),
@@ -605,38 +605,38 @@ mod tests {
     #[test]
     fn move_action_updates_unit_position_on_board() {
         let mut state = generate_test_sandbox("test".to_string());
-        apply_action(&mut state, "M:U1_P1:Q0R0Z0").unwrap();
+        apply_action(&mut state, "M:UNIT_P1_1:Q0R0Z0").unwrap();
 
-        let position = &state.entities["U1_P1"].spatial;
+        let position = &state.entities["UNIT_P1_1"].spatial;
         assert_eq!((position.q, position.r, position.z), (0, 0, 0));
     }
 
     #[test]
     fn move_action_allows_unit_to_remain_on_its_current_hex() {
         let mut state = generate_test_sandbox("test".to_string());
-        apply_action(&mut state, "M:U1_P1:Q-1R0Z0").unwrap();
+        apply_action(&mut state, "M:UNIT_P1_1:Q-1R0Z0").unwrap();
     }
 
     #[test]
     fn move_action_rejects_occupied_or_off_board_destinations() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_action(&mut state, "M:U1_P1:Q-1R1Z0").is_err());
-        assert!(apply_action(&mut state, "M:U1_P1:Q9R9Z0").is_err());
-        assert_eq!(state.entities["U1_P1"].spatial.q, -1);
-        assert_eq!(state.entities["U1_P1"].spatial.r, 0);
-        assert_eq!(state.entities["U1_P1"].spatial.z, 0);
+        assert!(apply_action(&mut state, "M:UNIT_P1_1:Q-1R1Z0").is_err());
+        assert!(apply_action(&mut state, "M:UNIT_P1_1:Q9R9Z0").is_err());
+        assert_eq!(state.entities["UNIT_P1_1"].spatial.q, -1);
+        assert_eq!(state.entities["UNIT_P1_1"].spatial.r, 0);
+        assert_eq!(state.entities["UNIT_P1_1"].spatial.z, 0);
     }
 
     #[test]
     fn move_action_rejects_malformed_extra_token_segments_without_mutation() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_action(&mut state, "M:U1_P1:Q0R0Z0:extra").is_err());
+        assert!(apply_action(&mut state, "M:UNIT_P1_1:Q0R0Z0:extra").is_err());
         assert!(apply_action(&mut state, "M::Q0R0Z0").is_err());
-        assert_eq!(state.entities["U1_P1"].spatial.q, -1);
-        assert_eq!(state.entities["U1_P1"].spatial.r, 0);
-        assert_eq!(state.entities["U1_P1"].spatial.z, 0);
+        assert_eq!(state.entities["UNIT_P1_1"].spatial.q, -1);
+        assert_eq!(state.entities["UNIT_P1_1"].spatial.r, 0);
+        assert_eq!(state.entities["UNIT_P1_1"].spatial.z, 0);
     }
 
     #[test]

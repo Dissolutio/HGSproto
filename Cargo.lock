@@ -2256,6 +2256,7 @@ version = "0.1.0"
 dependencies = [
  "hex_game_core",
  "hex_game_network",
+ "serde_json",
  "tokio",
 ]
 
