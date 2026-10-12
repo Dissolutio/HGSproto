@@ -66,6 +66,11 @@ pub struct HexoscapeMapFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StarterUnitDefinition {
     pub id: String,
+    #[serde(default)]
+    pub mod_id: Option<String>,
+    #[serde(default, alias = "player", alias = "owner")]
+    pub seat: Option<String>,
+    #[serde(default)]
     pub components: HashMap<String, Component>,
 }
 
