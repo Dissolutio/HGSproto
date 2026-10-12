@@ -1,0 +1,13 @@
+[package]
+name = "hex_game_orchestrator"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hex_game_orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+hex_game_core = { path = "../hex_game_core" }
+hex_game_network = { path = "../hex_game_network" }
+tokio = { version = "1.0", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
