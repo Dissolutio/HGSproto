@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { Canvas, type ThreeEvent } from "@react-three/fiber";
+import { OrbitControls, Stats } from "@react-three/drei";
+import * as THREE from "three";
 import init, {
   wasm_get_current_state,
   wasm_initialize_match,
@@ -8,8 +11,17 @@ import init, {
 type Position = { q: number; r: number; z: number };
 type EngineComponent = {
   type?: string;
-  data?: { inventory_id?: string; labels?: string[] };
-  Terrain?: { inventory_id?: string };
+  data?: {
+    inventory_id?: string;
+    face_texture?: string;
+    side_texture?: string;
+    labels?: string[];
+  };
+  Terrain?: {
+    inventory_id?: string;
+    face_texture?: string;
+    side_texture?: string;
+  };
   TerrainType?: { terrain?: string };
   Tags?: { labels?: string[] };
 };
@@ -23,13 +35,17 @@ type EngineState = {
   entities?: Record<string, EngineEntity> | EngineEntity[];
 };
 type RenderEntity = EngineEntity & { id: string; spatial: Position };
+type TerrainData = RenderEntity & {
+  faceTextureUrl: string;
+  sideTextureUrl: string;
+};
 type Mode = "network" | "wasm";
 type ConnectionState = "connecting" | "connected" | "offline" | "ready";
 
 const SOCKET_URL = "ws://127.0.0.1:8080";
 const WASM_MATCH_ID = "wasm_sandbox";
-const HEX_SIZE = 30;
-const EDGE = 46;
+const HEX_RADIUS = 1;
+const PILLAR_HEIGHT = 0.42;
 
 const MOCK_MAP_JSON = JSON.stringify({
   hexMap: { name: "Local WASM Sandbox" },
@@ -50,16 +66,24 @@ function componentList(entity: EngineEntity): EngineComponent[] {
     : Object.values(entity.components ?? {});
 }
 
-function hasComponent(entity: EngineEntity, name: string): boolean {
-  return componentList(entity).some(
+function findComponent(entity: EngineEntity, name: string): EngineComponent | undefined {
+  return componentList(entity).find(
     (component) => component.type === name || name in component,
   );
 }
 
+function terrainTextures(entity: EngineEntity) {
+  const terrain = findComponent(entity, "Terrain");
+  return {
+    faceTextureUrl:
+      terrain?.data?.face_texture ?? terrain?.Terrain?.face_texture ?? "grass_face",
+    sideTextureUrl:
+      terrain?.data?.side_texture ?? terrain?.Terrain?.side_texture ?? "earth_side",
+  };
+}
+
 function unitLabels(entity: EngineEntity): string[] {
-  const tagged = componentList(entity).find(
-    (component) => component.type === "Tags" || "Tags" in component,
-  );
+  const tagged = findComponent(entity, "Tags");
   return tagged?.data?.labels ?? tagged?.Tags?.labels ?? [];
 }
 
@@ -75,26 +99,237 @@ function entitiesFromState(state: EngineState | null): RenderEntity[] {
   });
 }
 
-function axialToPixel(q: number, r: number, size: number) {
-  return {
-    x: size * (Math.sqrt(3) * q + (Math.sqrt(3) / 2) * r),
-    y: size * (1.5 * r),
-  };
-}
-
-function hexPoints(cx: number, cy: number, size: number): string {
-  return Array.from({ length: 6 }, (_, index) => {
-    const angle = (Math.PI / 3) * index;
-    return `${cx + size * Math.cos(angle)},${cy + size * Math.sin(angle)}`;
-  }).join(" ");
-}
-
 function parseState(serializedState: string): EngineState {
   const parsed = JSON.parse(serializedState) as EngineState | { error?: string };
-  if ("error" in parsed && parsed.error) {
-    throw new Error(parsed.error);
-  }
+  if ("error" in parsed && parsed.error) throw new Error(parsed.error);
   return parsed as EngineState;
+}
+
+function makeProceduralTexture(textureKey: string, isSide: boolean): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 128;
+  canvas.height = 128;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas 2D context is unavailable");
+
+  const colorSets: Record<string, [string, string, string]> = {
+    grass: ["#71834c", "#87965a", "#56683d"],
+    earth: ["#66513e", "#806447", "#4d4033"],
+    rock: ["#777d79", "#969b94", "#555c5a"],
+    water: ["#487e89", "#64a1a4", "#315c6a"],
+    sand: ["#c5aa70", "#ddc48a", "#998354"],
+    default: ["#718079", "#8b9990", "#58665e"],
+  };
+  const paletteKey = textureKey.toLowerCase().split(/[_.-]/)[0];
+  const palette = colorSets[paletteKey] ?? colorSets.default;
+  context.fillStyle = palette[0];
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (isSide) {
+    context.fillStyle = palette[2];
+    context.fillRect(0, 0, canvas.width, 12);
+    context.globalAlpha = 0.3;
+    for (let y = 22; y < canvas.height; y += 28) {
+      context.fillStyle = y % 2 === 0 ? palette[1] : palette[2];
+      context.fillRect(0, y, canvas.width, 3);
+    }
+    context.globalAlpha = 1;
+  }
+
+  let seed = 0;
+  for (const character of textureKey) seed = (seed * 31 + character.charCodeAt(0)) >>> 0;
+  for (let index = 0; index < 100; index += 1) {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    const x = seed % canvas.width;
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    const y = seed % canvas.height;
+    const radius = 0.6 + ((seed >>> 8) % 18) / 10;
+    context.globalAlpha = 0.12 + ((seed >>> 16) % 24) / 100;
+    context.fillStyle = seed & 1 ? palette[1] : palette[2];
+    context.beginPath();
+    context.arc(x, y, radius, 0, Math.PI * 2);
+    context.fill();
+  }
+  context.globalAlpha = 1;
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.anisotropy = 4;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+type ProceduralHexPillarProps = {
+  q: number;
+  r: number;
+  z: number;
+  faceTextureUrl: string;
+  sideTextureUrl: string;
+  hexRadius: number;
+  onClick?: (event: ThreeEvent<MouseEvent>) => void;
+};
+
+function ProceduralHexPillar({
+  q,
+  r,
+  z,
+  faceTextureUrl,
+  sideTextureUrl,
+  hexRadius,
+  onClick,
+}: ProceduralHexPillarProps) {
+  const sizeX = hexRadius * Math.sqrt(3);
+  const sizeY = hexRadius * 1.5;
+  const worldX = sizeX * (q + r * 0.5);
+  const worldZ = sizeY * r;
+  const worldY = z * 0.5;
+
+  const geometry = useMemo(() => {
+    const cylinder = new THREE.CylinderGeometry(
+      hexRadius,
+      hexRadius,
+      PILLAR_HEIGHT,
+      6,
+      1,
+      false,
+    );
+    // CylinderGeometry groups: sides=0, top=1, bottom=2. Use one cap material for both caps.
+    for (const group of cylinder.groups) {
+      if (group.materialIndex === 2) group.materialIndex = 1;
+    }
+    return cylinder;
+  }, [hexRadius]);
+
+  const sideTexture = useMemo(
+    () => makeProceduralTexture(sideTextureUrl, true),
+    [sideTextureUrl],
+  );
+  const faceTexture = useMemo(
+    () => makeProceduralTexture(faceTextureUrl, false),
+    [faceTextureUrl],
+  );
+
+  useEffect(() => () => {
+    geometry.dispose();
+    sideTexture.dispose();
+    faceTexture.dispose();
+  }, [geometry, sideTexture, faceTexture]);
+
+  const sideMaterial = useMemo(
+    () => new THREE.MeshStandardMaterial({ map: sideTexture, roughness: 0.94 }),
+    [sideTexture],
+  );
+  const faceMaterial = useMemo(
+    () => new THREE.MeshStandardMaterial({ map: faceTexture, roughness: 0.88 }),
+    [faceTexture],
+  );
+  useEffect(() => () => {
+    sideMaterial.dispose();
+    faceMaterial.dispose();
+  }, [sideMaterial, faceMaterial]);
+
+  return (
+    <mesh
+      geometry={geometry}
+      material={[sideMaterial, faceMaterial]}
+      position={[worldX, worldY + PILLAR_HEIGHT / 2, worldZ]}
+      castShadow
+      receiveShadow
+      onClick={onClick}
+    />
+  );
+}
+
+type UnitMarkerProps = {
+  entity: RenderEntity;
+  selected: boolean;
+  onSelect: (event: ThreeEvent<MouseEvent>) => void;
+};
+
+function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
+  const labels = unitLabels(entity);
+  const playerOne = labels.includes("P1") || labels.includes("Player_1");
+  const sizeX = HEX_RADIUS * Math.sqrt(3);
+  const sizeY = HEX_RADIUS * 1.5;
+  const worldX = sizeX * (entity.spatial.q + entity.spatial.r * 0.5);
+  const worldZ = sizeY * entity.spatial.r;
+  const worldY = entity.spatial.z * 0.5 + PILLAR_HEIGHT + 0.08;
+
+  return (
+    <group position={[worldX, worldY, worldZ]} onClick={onSelect}>
+      {selected && (
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.005, 0]}>
+          <ringGeometry args={[0.3, 0.38, 32]} />
+          <meshBasicMaterial color="#f0d47a" />
+        </mesh>
+      )}
+      <mesh castShadow>
+        <sphereGeometry args={[0.23, 20, 14]} />
+        <meshStandardMaterial color={playerOne ? "#58a9e8" : "#f07868"} roughness={0.45} />
+      </mesh>
+    </group>
+  );
+}
+
+type SceneProps = {
+  terrain: TerrainData[];
+  units: RenderEntity[];
+  selectedUnitId: string | null;
+  onSelectUnit: (entity: RenderEntity, event: ThreeEvent<MouseEvent>) => void;
+  onSelectTerrain: (entity: TerrainData) => void;
+};
+
+function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onSelectTerrain }: SceneProps) {
+  const target = useMemo(() => {
+    if (terrain.length === 0) return new THREE.Vector3(0, 0, 0);
+    const sum = terrain.reduce(
+      (accumulator, cell) => {
+        accumulator.x += HEX_RADIUS * Math.sqrt(3) * (cell.spatial.q + cell.spatial.r * 0.5);
+        accumulator.y += cell.spatial.z * 0.5;
+        accumulator.z += HEX_RADIUS * 1.5 * cell.spatial.r;
+        return accumulator;
+      },
+      new THREE.Vector3(),
+    );
+    return sum.multiplyScalar(1 / terrain.length);
+  }, [terrain]);
+
+  return (
+    <>
+      <color attach="background" args={["#101c1d"]} />
+      <ambientLight intensity={0.6} />
+      <directionalLight position={[10, 20, 10]} intensity={1.2} castShadow />
+      <group position={[-target.x, -target.y, -target.z]}>
+        {terrain.map((cell) => (
+          <ProceduralHexPillar
+            key={cell.id}
+            q={cell.spatial.q}
+            r={cell.spatial.r}
+            z={cell.spatial.z}
+            faceTextureUrl={cell.faceTextureUrl}
+            sideTextureUrl={cell.sideTextureUrl}
+            hexRadius={HEX_RADIUS}
+            onClick={(event) => {
+              event.stopPropagation();
+              onSelectTerrain(cell);
+            }}
+          />
+        ))}
+        {units.map((unit) => (
+          <UnitMarker
+            key={unit.id}
+            entity={unit}
+            selected={selectedUnitId === unit.id}
+            onSelect={(event) => onSelectUnit(unit, event)}
+          />
+        ))}
+      </group>
+      <OrbitControls makeDefault target={[0, 0, 0]} enableDamping dampingFactor={0.08} />
+      <Stats />
+    </>
+  );
 }
 
 export default function HexGameCockpit() {
@@ -129,7 +364,6 @@ export default function HexGameCockpit() {
           setNotice(`WASM initialization failed: ${error instanceof Error ? error.message : String(error)}`);
         }
       })();
-
       return () => {
         cancelled = true;
       };
@@ -140,9 +374,10 @@ export default function HexGameCockpit() {
     ws = new WebSocket(SOCKET_URL);
     setSocket(ws);
     ws.onopen = () => {
-      if (cancelled) return;
-      setConnection("connected");
-      setNotice("Live engine stream connected");
+      if (!cancelled) {
+        setConnection("connected");
+        setNotice("Live engine stream connected");
+      }
     };
     ws.onmessage = (event) => {
       if (cancelled) return;
@@ -162,12 +397,12 @@ export default function HexGameCockpit() {
       if (!cancelled) setNotice("WebSocket error; check the local orchestrator");
     };
     ws.onclose = () => {
-      if (cancelled) return;
-      setConnection("offline");
-      setSocket(null);
-      setNotice("Engine stream disconnected");
+      if (!cancelled) {
+        setConnection("offline");
+        setSocket(null);
+        setNotice("Engine stream disconnected");
+      }
     };
-
     return () => {
       cancelled = true;
       ws?.close();
@@ -177,7 +412,12 @@ export default function HexGameCockpit() {
 
   const entities = useMemo(() => entitiesFromState(gameState), [gameState]);
   const terrain = useMemo(
-    () => entities.filter((entity) => hasComponent(entity, "Terrain") || hasComponent(entity, "TerrainType")),
+    () => entities.flatMap((entity): TerrainData[] => {
+      const terrainComponent = findComponent(entity, "Terrain");
+      if (!terrainComponent) return [];
+      const textures = terrainTextures(entity);
+      return [{ ...entity, ...textures }];
+    }),
     [entities],
   );
   const units = useMemo(
@@ -185,44 +425,7 @@ export default function HexGameCockpit() {
     [entities],
   );
 
-  const terrainCells = useMemo(() => {
-    const unique = new Map<string, RenderEntity>();
-    for (const cell of terrain) {
-      unique.set(`${cell.spatial.q}:${cell.spatial.r}:${cell.spatial.z}`, cell);
-    }
-    return [...unique.values()];
-  }, [terrain]);
-
-  const layout = useMemo(() => {
-    const centers = terrainCells.map((cell) => ({
-      cell,
-      point: axialToPixel(cell.spatial.q, cell.spatial.r, HEX_SIZE),
-    }));
-    if (centers.length === 0) {
-      return {
-        centers,
-        width: 640,
-        height: 420,
-        pointFor: (_position: Position) => ({ x: 320, y: 210 }),
-      };
-    }
-    const minX = Math.min(...centers.map(({ point }) => point.x - HEX_SIZE));
-    const maxX = Math.max(...centers.map(({ point }) => point.x + HEX_SIZE));
-    const minY = Math.min(...centers.map(({ point }) => point.y - HEX_SIZE));
-    const maxY = Math.max(...centers.map(({ point }) => point.y + HEX_SIZE));
-    const pointFor = (position: Position) => {
-      const point = axialToPixel(position.q, position.r, HEX_SIZE);
-      return { x: point.x - minX + EDGE, y: point.y - minY + EDGE };
-    };
-    return {
-      centers,
-      width: maxX - minX + EDGE * 2,
-      height: maxY - minY + EDGE * 2,
-      pointFor,
-    };
-  }, [terrainCells]);
-
-  const moveSelectedUnit = (cell: RenderEntity) => {
+  const moveSelectedUnit = (cell: TerrainData) => {
     if (!selectedUnitId) return;
     const occupied = units.some(
       (unit) =>
@@ -235,7 +438,6 @@ export default function HexGameCockpit() {
       setNotice("Move rejected locally: that hex is occupied");
       return;
     }
-
     const token = `M:${selectedUnitId}:Q${cell.spatial.q}R${cell.spatial.r}Z${cell.spatial.z}`;
     if (mode === "wasm") {
       try {
@@ -252,7 +454,6 @@ export default function HexGameCockpit() {
       }
       return;
     }
-
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       setNotice("Move not sent: engine stream is offline");
       return;
@@ -266,12 +467,25 @@ export default function HexGameCockpit() {
     }
   };
 
+  const selectUnit = (unit: RenderEntity, event: ThreeEvent<MouseEvent>) => {
+    event.stopPropagation();
+    const nextId = selectedUnitId === unit.id ? null : unit.id;
+    setSelectedUnitId(nextId);
+    setNotice(nextId ? `${unit.id} selected` : "Selection cleared");
+  };
+
   const chooseMode = (nextMode: Mode) => {
     if (nextMode === mode) return;
     setSelectedUnitId(null);
     setGameState(null);
     setMode(nextMode);
   };
+
+  const playerOneCount = units.filter((unit) => {
+    const labels = unitLabels(unit);
+    return labels.includes("P1") || labels.includes("Player_1");
+  }).length;
+  const playerTwoCount = units.length - playerOneCount;
 
   return (
     <main style={styles.page}>
@@ -320,111 +534,34 @@ export default function HexGameCockpit() {
 
       <section style={styles.toolbar} aria-live="polite">
         <span style={styles.notice}>{notice}</span>
-        <span style={styles.counts}>
-          {terrainCells.length} hexes <i /> {units.length} units
-        </span>
+        <span style={styles.counts}>{terrain.length} hexes <i /> {units.length} units</span>
       </section>
 
-      <section style={styles.boardFrame}>
-        <svg
-          viewBox={`0 0 ${layout.width} ${layout.height}`}
-          role="img"
-          aria-label="Live tactical hex board"
-          style={styles.board}
+      <section style={styles.boardFrame} aria-label="3D tactical board">
+        <Canvas
+          camera={{ position: [8, 9, 11], fov: 42, near: 0.1, far: 500 }}
+          shadows="percentage"
+          frameloop="demand"
+          dpr={[1, 1.75]}
+          gl={{ antialias: true, powerPreference: "high-performance" }}
+          style={styles.canvas}
         >
-          <defs>
-            <pattern id="cockpit-grid" width="24" height="24" patternUnits="userSpaceOnUse">
-              <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#263b3b" strokeWidth="0.7" opacity="0.45" />
-            </pattern>
-          </defs>
-          <rect width={layout.width} height={layout.height} fill="#101c1d" />
-          <rect width={layout.width} height={layout.height} fill="url(#cockpit-grid)" />
-          {layout.centers.map(({ cell }) => {
-            const { x, y } = layout.pointFor(cell.spatial);
-            const selected = selectedUnitId !== null;
-            const blocked = units.some(
-              (unit) =>
-                unit.id !== selectedUnitId &&
-                unit.spatial.q === cell.spatial.q &&
-                unit.spatial.r === cell.spatial.r &&
-                unit.spatial.z === cell.spatial.z,
-            );
-            return (
-              <g
-                key={cell.id}
-                onClick={() => moveSelectedUnit(cell)}
-                style={{ cursor: selected && !blocked ? "pointer" : "default" }}
-              >
-                <polygon
-                  points={hexPoints(x, y, HEX_SIZE)}
-                  fill={selected && !blocked ? "#23443e" : "#1d3432"}
-                  stroke={selected && !blocked ? "#72b99b" : "#526e66"}
-                  strokeWidth="1.5"
-                />
-                <text
-                  x={x}
-                  y={y + 4}
-                  textAnchor="middle"
-                  fill="#9ab1a7"
-                  fontSize="9"
-                  fontFamily="ui-monospace, monospace"
-                >
-                  {cell.spatial.q},{cell.spatial.r}
-                </text>
-              </g>
-            );
-          })}
-          {units.map((unit) => {
-            const { x, y } = layout.pointFor(unit.spatial);
-            const labels = unitLabels(unit);
-            const playerOne = labels.includes("P1") || labels.includes("Player_1");
-            const color = playerOne ? "#58a9e8" : "#f07868";
-            const isSelected = selectedUnitId === unit.id;
-            return (
-              <g
-                key={unit.id}
-                transform={`translate(${x} ${y})`}
-                role="button"
-                tabIndex={0}
-                aria-label={`Select ${unit.id}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  setSelectedUnitId(isSelected ? null : unit.id);
-                  setNotice(isSelected ? "Selection cleared" : `${unit.id} selected`);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    setSelectedUnitId(isSelected ? null : unit.id);
-                  }
-                }}
-                style={{ cursor: "pointer", outline: "none" }}
-              >
-                {isSelected && <circle r="17" fill="none" stroke="#f0d47a" strokeWidth="2" />}
-                <circle r="10" fill={color} stroke="#e8eee6" strokeWidth="1.5" />
-                <text
-                  x="0"
-                  y="25"
-                  textAnchor="middle"
-                  fill="#e6ece5"
-                  fontSize="10"
-                  fontFamily="ui-monospace, monospace"
-                >
-                  {unit.id.replace("UNIT_", "")}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
+          <HexScene
+            terrain={terrain}
+            units={units}
+            selectedUnitId={selectedUnitId}
+            onSelectUnit={selectUnit}
+            onSelectTerrain={moveSelectedUnit}
+          />
+        </Canvas>
       </section>
 
       <footer style={styles.footer}>
-        <span><b style={{ color: "#58a9e8" }}>P1</b> Player 1</span>
-        <span><b style={{ color: "#f07868" }}>P2</b> Player 2</span>
+        <span><b style={{ color: "#58a9e8" }}>P1</b> Player 1 · {playerOneCount}</span>
+        <span><b style={{ color: "#f07868" }}>P2</b> Player 2 · {playerTwoCount}</span>
         <span style={styles.hint}>
           {selectedUnitId
-            ? `Selected: ${selectedUnitId} · click an open hex to move`
+            ? `Selected: ${selectedUnitId} · click an open pillar to move`
             : "Select a unit to issue a move"}
         </span>
       </footer>
@@ -488,8 +625,17 @@ const styles: Record<string, CSSProperties> = {
   toolbar: { maxWidth: 1240, margin: "0 auto", minHeight: 52, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 },
   notice: { color: "#416158", fontSize: 13, overflowWrap: "anywhere" },
   counts: { color: "#587168", fontSize: 12, whiteSpace: "nowrap" },
-  boardFrame: { maxWidth: 1240, margin: "0 auto", border: "1px solid #344d47", background: "#101c1d", boxShadow: "0 16px 38px #18302d20", overflow: "auto" },
-  board: { display: "block", width: "100%", minWidth: 360, maxHeight: "72vh", margin: "0 auto" },
+  boardFrame: {
+    maxWidth: 1240,
+    height: "min(70vh, 760px)",
+    minHeight: 400,
+    margin: "0 auto",
+    border: "1px solid #344d47",
+    background: "#101c1d",
+    boxShadow: "0 16px 38px #18302d20",
+    overflow: "hidden",
+  },
+  canvas: { width: "100%", height: "100%", display: "block" },
   footer: { maxWidth: 1240, margin: "0 auto", display: "flex", alignItems: "center", gap: 22, paddingTop: 16, color: "#49635a", fontSize: 12 },
   hint: { marginLeft: "auto", textAlign: "right", color: "#688077" },
 };
