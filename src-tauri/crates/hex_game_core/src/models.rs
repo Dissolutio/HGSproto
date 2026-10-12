@@ -36,3 +36,62 @@ pub struct GameState {
     pub context: MatchContext,
     pub entities: HashMap<String, Entity>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HexoscapeMapFile {
+    #[serde(rename = "hexMap")]
+    pub hex_map: HexMapInfo,
+    #[serde(rename = "boardPieces", default)]
+    pub board_pieces: Vec<BoardPiece>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HexMapInfo {
+    #[serde(flatten)]
+    pub properties: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardPiece {
+    pub uid: String,
+    #[serde(rename = "inventoryID")]
+    pub inventory_id: String,
+    pub altitude: f32,
+    pub rotation: f32,
+    #[serde(rename = "pieceCoords")]
+    pub piece_coords: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HexoscapeMapFile;
+
+    #[test]
+    fn hexoscape_map_file_round_trips_serialized_layout_keys() {
+        let json = r#"{
+            "hexMap": {"name": "arena", "hexes": [{"q": 1, "r": -1}]},
+            "boardPieces": [{
+                "uid": "piece-1",
+                "inventoryID": "unit-scout",
+                "altitude": 2,
+                "rotation": 90,
+                "pieceCoords": {"q": 1, "r": -1}
+            }]
+        }"#;
+
+        let map: HexoscapeMapFile = serde_json::from_str(json).unwrap();
+        assert_eq!(map.hex_map.properties["name"], "arena");
+        assert_eq!(map.board_pieces.len(), 1);
+        assert_eq!(map.board_pieces[0].uid, "piece-1");
+        assert_eq!(map.board_pieces[0].inventory_id, "unit-scout");
+        assert_eq!(map.board_pieces[0].altitude, 2.0);
+        assert_eq!(map.board_pieces[0].rotation, 90.0);
+        assert_eq!(map.board_pieces[0].piece_coords["q"], 1);
+
+        let encoded = serde_json::to_value(map).unwrap();
+        assert!(encoded.get("hexMap").is_some());
+        assert!(encoded.get("boardPieces").is_some());
+        assert!(encoded["boardPieces"][0].get("inventoryID").is_some());
+        assert!(encoded["boardPieces"][0].get("pieceCoords").is_some());
+    }
+}

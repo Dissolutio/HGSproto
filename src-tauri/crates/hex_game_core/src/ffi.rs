@@ -125,7 +125,8 @@ pub unsafe extern "C" fn hgs_process_token_for_match(
 
 /// Frees memory allocated by Rust back to the system.
 /// # Safety
-/// Must only be called on pointers originally returned by hgs_process_token or hgs_get_current_state.
+/// Must only be called on pointers returned by a Rust function that allocates a C string,
+/// including hgs_process_token, hgs_process_token_for_match, and hgs_get_current_state.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hgs_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {

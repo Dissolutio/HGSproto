@@ -117,17 +117,13 @@ pub fn match_exists(match_id: &str) -> bool {
 
 /// Applies a move token (`M:<entity_id>:Q<q>R<r>Z<z>`) to a match snapshot.
 pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
-    let mut parts = action.split(':');
-    let action_type = parts.next();
-    let entity_id = parts.next();
-    let destination = parts.next();
-
-    if action_type != Some("M") || parts.next().is_some() {
+    let (entity_id, destination) = action
+        .strip_prefix("M:")
+        .and_then(|payload| payload.split_once(':'))
+        .ok_or_else(|| "Invalid action token".to_string())?;
+    if entity_id.is_empty() || destination.is_empty() || destination.contains(':') {
         return Err("Invalid action token".into());
     }
-
-    let entity_id = entity_id.ok_or_else(|| "Missing entity ID".to_string())?;
-    let destination = destination.ok_or_else(|| "Missing move destination".to_string())?;
     let position = parse_spatial_position(destination)?;
 
     let entity = state
@@ -263,6 +259,18 @@ mod tests {
         assert!(apply_action(&mut state, "M:U1_P1:Q9R9Z0").is_err());
         assert_eq!(state.entities["U1_P1"].spatial.q, -1);
         assert_eq!(state.entities["U1_P1"].spatial.r, 0);
+        assert_eq!(state.entities["U1_P1"].spatial.z, 0);
+    }
+
+    #[test]
+    fn move_action_rejects_malformed_extra_token_segments_without_mutation() {
+        let mut state = generate_test_sandbox("test".to_string());
+
+        assert!(apply_action(&mut state, "M:U1_P1:Q0R0Z0:extra").is_err());
+        assert!(apply_action(&mut state, "M::Q0R0Z0").is_err());
+        assert_eq!(state.entities["U1_P1"].spatial.q, -1);
+        assert_eq!(state.entities["U1_P1"].spatial.r, 0);
+        assert_eq!(state.entities["U1_P1"].spatial.z, 0);
     }
 
     #[test]
