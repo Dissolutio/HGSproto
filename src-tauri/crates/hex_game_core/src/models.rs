@@ -17,6 +17,10 @@ pub enum Component {
         current: i32,
         max: i32,
     },
+    Destructible {
+        current_life: i32,
+        max_life: i32,
+    },
     Tags {
         labels: Vec<String>,
     },

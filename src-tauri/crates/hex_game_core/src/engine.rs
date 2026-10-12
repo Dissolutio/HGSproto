@@ -43,12 +43,21 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         Entity {
             id: "UNIT_P1_1".to_string(),
             spatial: SpatialPosition { q: -1, r: 0, z: 0 },
-            components: HashMap::from([(
-                "tags".to_string(),
-                Component::Tags {
-                    labels: vec!["Unit".to_string(), "P1".to_string()],
-                },
-            )]),
+            components: HashMap::from([
+                (
+                    "tags".to_string(),
+                    Component::Tags {
+                        labels: vec!["Unit".to_string(), "P1".to_string()],
+                    },
+                ),
+                (
+                    "destructible".to_string(),
+                    Component::Destructible {
+                        current_life: 4,
+                        max_life: 4,
+                    },
+                ),
+            ]),
         },
     );
     entities.insert(
@@ -56,12 +65,21 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         Entity {
             id: "UNIT_P1_2".to_string(),
             spatial: SpatialPosition { q: -1, r: 1, z: 0 },
-            components: HashMap::from([(
-                "tags".to_string(),
-                Component::Tags {
-                    labels: vec!["Unit".to_string(), "P1".to_string()],
-                },
-            )]),
+            components: HashMap::from([
+                (
+                    "tags".to_string(),
+                    Component::Tags {
+                        labels: vec!["Unit".to_string(), "P1".to_string()],
+                    },
+                ),
+                (
+                    "destructible".to_string(),
+                    Component::Destructible {
+                        current_life: 4,
+                        max_life: 4,
+                    },
+                ),
+            ]),
         },
     );
 
@@ -71,12 +89,21 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         Entity {
             id: "UNIT_P2_1".to_string(),
             spatial: SpatialPosition { q: 1, r: 0, z: 0 },
-            components: HashMap::from([(
-                "tags".to_string(),
-                Component::Tags {
-                    labels: vec!["Unit".to_string(), "P2".to_string()],
-                },
-            )]),
+            components: HashMap::from([
+                (
+                    "tags".to_string(),
+                    Component::Tags {
+                        labels: vec!["Unit".to_string(), "P2".to_string()],
+                    },
+                ),
+                (
+                    "destructible".to_string(),
+                    Component::Destructible {
+                        current_life: 4,
+                        max_life: 4,
+                    },
+                ),
+            ]),
         },
     );
     entities.insert(
@@ -84,12 +111,21 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         Entity {
             id: "UNIT_P2_2".to_string(),
             spatial: SpatialPosition { q: 1, r: -1, z: 0 },
-            components: HashMap::from([(
-                "tags".to_string(),
-                Component::Tags {
-                    labels: vec!["Unit".to_string(), "P2".to_string()],
-                },
-            )]),
+            components: HashMap::from([
+                (
+                    "tags".to_string(),
+                    Component::Tags {
+                        labels: vec!["Unit".to_string(), "P2".to_string()],
+                    },
+                ),
+                (
+                    "destructible".to_string(),
+                    Component::Destructible {
+                        current_life: 4,
+                        max_life: 4,
+                    },
+                ),
+            ]),
         },
     );
 
@@ -225,8 +261,11 @@ pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
                     },
                 ),
                 (
-                    "life_points".to_string(),
-                    Component::LifePoints { current: 4, max: 4 },
+                    "destructible".to_string(),
+                    Component::Destructible {
+                        current_life: 4,
+                        max_life: 4,
+                    },
                 ),
             ]),
         };
@@ -294,8 +333,12 @@ pub fn match_exists(match_id: &str) -> bool {
     }
 }
 
-/// Applies a move token (`M:<entity_id>:Q<q>R<r>Z<z>`) to a match snapshot.
+/// Applies a move (`M:`) or attack (`A:`) token to a match snapshot.
 pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
+    if action.starts_with("A:") {
+        return apply_attack(state, action);
+    }
+
     let (entity_id, destination) = action
         .strip_prefix("M:")
         .and_then(|payload| payload.split_once(':'))
@@ -345,6 +388,58 @@ pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
         .ok_or_else(|| format!("Unknown entity: {entity_id}"))?;
 
     entity.spatial = position;
+    Ok(())
+}
+
+fn apply_attack(state: &mut GameState, action: &str) -> Result<(), String> {
+    let payload = action
+        .strip_prefix("A:")
+        .ok_or_else(|| "Invalid attack token".to_string())?;
+    let mut fields = payload.split(':');
+    let attacker_id = fields.next().unwrap_or_default();
+    let target_id = fields.next().unwrap_or_default();
+    let damage = fields.next().unwrap_or_default();
+    if attacker_id.is_empty()
+        || target_id.is_empty()
+        || damage.is_empty()
+        || fields.next().is_some()
+    {
+        return Err("Invalid attack token".into());
+    }
+
+    let damage: i32 = damage
+        .parse()
+        .map_err(|_| "Invalid attack damage".to_string())?;
+    if damage <= 0 {
+        return Err("Attack damage must be positive".into());
+    }
+
+    let attacker = state
+        .entities
+        .get(attacker_id)
+        .ok_or_else(|| format!("Unknown attacker: {attacker_id}"))?;
+    if !is_unit(attacker) {
+        return Err(format!("Entity is not an attacking unit: {attacker_id}"));
+    }
+
+    let target = state
+        .entities
+        .get_mut(target_id)
+        .ok_or_else(|| format!("Unknown target: {target_id}"))?;
+    let destructible = target
+        .components
+        .values_mut()
+        .find_map(|component| match component {
+            Component::Destructible { current_life, .. } => Some(current_life),
+            _ => None,
+        })
+        .ok_or_else(|| format!("Target is not destructible: {target_id}"))?;
+    *destructible = destructible.saturating_sub(damage);
+    let target_destroyed = *destructible <= 0;
+
+    if target_destroyed {
+        state.entities.remove(target_id);
+    }
     Ok(())
 }
 
@@ -517,7 +612,13 @@ mod tests {
                 matches!(component, Component::Tags { labels } if labels == &["Unit", player_tag])
             }));
             assert!(unit.components.values().any(|component| {
-                matches!(component, Component::LifePoints { current: 4, max: 4 })
+                matches!(
+                    component,
+                    Component::Destructible {
+                        current_life: 4,
+                        max_life: 4
+                    }
+                )
             }));
         }
 
@@ -634,6 +735,23 @@ mod tests {
 
         let position = &state.entities["UNIT_P1_1"].spatial;
         assert_eq!((position.q, position.r, position.z), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_combat_attack_deducts_life_and_destroys_unit() {
+        let mut state = generate_test_sandbox("combat_test".to_string());
+
+        apply_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:2").unwrap();
+        assert!(matches!(
+            state.entities["UNIT_P2_1"].components.get("destructible"),
+            Some(Component::Destructible {
+                current_life: 2,
+                max_life: 4
+            })
+        ));
+
+        apply_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
+        assert!(!state.entities.contains_key("UNIT_P2_1"));
     }
 
     #[test]

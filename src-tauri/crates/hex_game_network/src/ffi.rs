@@ -55,7 +55,9 @@ pub unsafe extern "C" fn hgs_native_host_match(c_match_id: *const c_char) -> *mu
         Err(_) => return make_c_string("E:Network session registry unavailable".to_string()),
     };
     if registered_sessions.contains_key(&match_id) {
-        return make_c_string(format!("E:Match already has a native network session: {match_id}"));
+        return make_c_string(format!(
+            "E:Match already has a native network session: {match_id}"
+        ));
     }
 
     let runtime = match runtime() {
