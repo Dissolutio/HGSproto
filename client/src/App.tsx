@@ -2,6 +2,7 @@ import { useState } from "react";
 import "./App.css";
 import { calculateHexDistance } from "./services/engine";
 import { loadUserData, saveUserData } from "./services/storage";
+import HexGameCockpit from "./HexGameCockpit";
 
 function App() {
   const [output, setOutput] = useState<string>('Click button to evaluate distance...');
@@ -43,6 +44,7 @@ function App() {
 
   return (
     <div style={{ padding: '20px', textAlign: 'center' }}>
+      {/* 
       <h3>HexGameSim MVP Engine Bridge Checkpoint</h3>
       <button onClick={handleTestTrigger} style={{ padding: '10px 20px', cursor: 'pointer' }}>
         Calculate Hex Distance
@@ -54,6 +56,8 @@ function App() {
         {isTestingStorage ? 'Testing Storage...' : 'Test Save / Load'}
       </button>
       <p aria-live="polite">{storageOutput}</p>
+        */}
+      <HexGameCockpit />
     </div>
   );
 }
