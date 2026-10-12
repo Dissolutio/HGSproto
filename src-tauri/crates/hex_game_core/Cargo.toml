@@ -5,4 +5,9 @@ edition = "2024"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0" # FOR TRANSIT PARSING
 # Target math crates can go here (e.g., glam or nalgebra for fast vector lookups)
+
+[lib]
+name = "hex_game_core"
+crate-type = ["cdylib", "rlib"] # Generates .dll on Windows, .dylib on macOS, .so on Linux

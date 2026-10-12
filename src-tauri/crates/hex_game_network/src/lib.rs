@@ -101,5 +101,56 @@ impl MatchSession {
     pub fn connection(&self) -> Option<&Connection> {
         self.connection.as_ref()
     }
+
+    /// Broadcast an action barcode token out over a single-use unidirectional stream
+    pub async fn send_action_token(&self, token: &str) -> Result<(), NetworkError> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| NetworkError("Cannot send: No peer connected".into()))?;
+
+        // 1. Open an ultra-fast unidirectional QUIC stream to ship the string
+        let mut send_stream = connection
+            .open_uni()
+            .await
+            .map_err(|error| NetworkError(format!("Failed to open stream: {error}")))?;
+
+        // 2. Dump the raw text barcode bytes down the wire and seal the connection
+        send_stream
+            .write_all(token.as_bytes())
+            .await
+            .map_err(|error| NetworkError(format!("Failed to write payload: {error}")))?;
+
+        send_stream
+            .finish()
+            .map_err(|error| NetworkError(format!("Failed to finish stream: {error}")))?;
+
+        Ok(())
+    }
+
+    /// Wait and listen for the next incoming action barcode from your opponent
+    pub async fn read_next_action_token(&self) -> Result<String, NetworkError> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| NetworkError("Cannot read: No peer connected".into()))?;
+
+        // 1. Block the thread until the opponent throws a matching uni-stream packet into the swarm
+        let mut receive_stream = connection
+            .accept_uni()
+            .await
+            .map_err(|error| NetworkError(format!("Failed to accept incoming stream: {error}")))?;
+
+        // 2. Read the absolute raw bytes off the wire until EOF
+        let raw_bytes = receive_stream
+            .read_to_end(1024)
+            .await // Caps barcode allocations at 1KB to protect RAM
+            .map_err(|error| NetworkError(format!("Failed to read stream contents: {error}")))?;
+
+        // 3. Rehydrate the payload into a standard clean string
+        let token_string = String::from_utf8(raw_bytes)
+            .map_err(|_| NetworkError("Received invalid UTF-8 payload token".into()))?;
+
+        Ok(token_string)
     }
 }

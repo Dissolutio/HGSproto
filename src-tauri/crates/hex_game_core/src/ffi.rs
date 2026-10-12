@@ -1,0 +1,207 @@
+use crate::engine;
+use crate::models::GameState;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+
+/// Initializes a match state using a modder's raw layout configurations.
+/// # Safety
+/// Unreal must pass valid, null-terminated C-strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_initialize_match(
+    c_match_id: *const c_char,
+    c_json_manifest: *const c_char,
+) {
+    if c_match_id.is_null() || c_json_manifest.is_null() {
+        return;
+    }
+
+    let match_id_str = unsafe { CStr::from_ptr(c_match_id) }
+        .to_string_lossy()
+        .into_owned();
+    let json_manifest_bytes = unsafe { CStr::from_ptr(c_json_manifest) }.to_bytes();
+
+    // 1. Safely deserialize the JSON layout into your Rust model structures
+    if let Ok(game_state) = serde_json::from_slice::<GameState>(json_manifest_bytes) {
+        // 2. Pin the live state into the global memory room!
+        engine::store_match(match_id_str, game_state);
+    }
+}
+
+/// Serializes the complete active match state into a JSON string block.
+/// Returns a null pointer if the target match_id does not exist in memory.
+/// # Safety
+/// Unreal must pass a valid, null-terminated C-string for c_match_id.
+/// The caller must free the returned string using hgs_free_string to prevent leaks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_get_current_state(c_match_id: *const c_char) -> *mut c_char {
+    if c_match_id.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let match_id_str = unsafe { CStr::from_ptr(c_match_id) }.to_string_lossy();
+
+    // 1. Gain temporary access to your global engine registry
+    if let Ok(matches) = engine::ACTIVE_MATCHES.lock() {
+        // 2. Locate the specific match file requested by the ID string
+        if let Some(game_state) = matches.get(match_id_str.as_ref()) {
+            // 3. Serialize the clean Rust data dictionary back into a raw JSON string
+            if let Ok(json_string) = serde_json::to_string(game_state) {
+                // 4. Transform the string allocation into an isolated C-String token pointer
+                return CString::new(json_string).unwrap().into_raw();
+            }
+        }
+    }
+
+    std::ptr::null_mut()
+}
+
+/// Processes an action barcode string from Unreal Engine.
+/// # Safety
+/// Unreal must pass a valid, null-terminated C-string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_process_token(c_token: *const c_char) -> *mut c_char {
+    if c_token.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let c_str = unsafe { CStr::from_ptr(c_token) };
+    let token_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return CString::new("E:INVALID_UTF8").unwrap().into_raw(),
+    };
+
+    let response_token = if token_str.starts_with("M:") {
+        format!("VALID_STEP:{}", token_str)
+    } else {
+        format!("E:UNMAPPED_TOKEN")
+    };
+
+    CString::new(response_token).unwrap().into_raw()
+}
+
+/// Processes an action token against a specific initialized match.
+/// # Safety
+/// Both arguments must be valid, null-terminated C-strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_process_token_for_match(
+    c_match_id: *const c_char,
+    c_token: *const c_char,
+) -> *mut c_char {
+    if c_match_id.is_null() || c_token.is_null() {
+        return CString::new("E:INVALID_ARGUMENT").unwrap().into_raw();
+    }
+
+    let match_id = unsafe { CStr::from_ptr(c_match_id) }.to_string_lossy();
+    let token = match unsafe { CStr::from_ptr(c_token) }.to_str() {
+        Ok(token) => token,
+        Err(_) => return CString::new("E:INVALID_UTF8").unwrap().into_raw(),
+    };
+
+    let response = match engine::process_action(&match_id, token) {
+        Ok(()) => format!("VALID_STEP:{token}"),
+        Err(error) => format!("E:{error}"),
+    };
+
+    CString::new(response).unwrap().into_raw()
+}
+
+/// Frees memory allocated by Rust back to the system.
+/// # Safety
+/// Must only be called on pointers originally returned by hgs_process_token or hgs_get_current_state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        let _ = unsafe { CString::from_raw(ptr) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn test_unreal_token_processing_flow() {
+        // 1. Simulate Unreal Engine creating a valid C-style string token
+        let input_token = CString::new("M:U1:Q0R2Z1").unwrap();
+        let raw_input_ptr = input_token.as_ptr();
+
+        // 2. Call your FFI function exactly how Unreal's C++ code will call it.
+        // Because the function is marked as unsafe, we wrap it in an unsafe block.
+        let raw_output_ptr = unsafe { hgs_process_token(raw_input_ptr) };
+
+        // 3. Convert the returned raw pointer back into a Rust CString to assert against it
+        assert!(
+            !raw_output_ptr.is_null(),
+            "Rust core returned a null pointer!"
+        );
+
+        let output_cstring = unsafe { CString::from_raw(raw_output_ptr) };
+        let output_str = output_cstring.to_str().unwrap();
+
+        // Verify your Blind Evaluation Loop output matched expectations
+        assert_eq!(output_str, "VALID_STEP:M:U1:Q0R2Z1");
+
+        // 4. Test your cleanup function to ensure memory doesn't leak
+        // We pass ownership of the raw pointer back out to simulate the FFI free cycle
+        let raw_to_free = output_cstring.into_raw();
+        unsafe { hgs_free_string(raw_to_free) };
+    }
+
+    #[test]
+    fn test_null_pointer_guard() {
+        // Ensure that if a buggy client passes a null pointer, the engine handles it gracefully
+        let raw_output_ptr = unsafe { hgs_process_token(std::ptr::null()) };
+        assert!(
+            raw_output_ptr.is_null(),
+            "Engine should return null for null input"
+        );
+    }
+
+    #[test]
+    fn test_match_initialization_and_query_pipeline() {
+        let raw_match_id = CString::new("test_match_123").unwrap();
+        let sample_json_layout = CString::new(
+            r#"{
+            "context": {
+                "match_id": "test_match_123",
+                "active_player": "Player_1",
+                "turn_phase": "Action"
+            },
+            "entities": {
+                "U1": {
+                    "id": "U1",
+                    "spatial": { "q": 2, "r": -1, "z": 3 },
+                    "components": {}
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        unsafe {
+            hgs_initialize_match(raw_match_id.as_ptr(), sample_json_layout.as_ptr());
+        }
+
+        let raw_state_ptr = unsafe { hgs_get_current_state(raw_match_id.as_ptr()) };
+        assert!(
+            !raw_state_ptr.is_null(),
+            "Engine failed to locate or serialize match data!"
+        );
+
+        let json_output = unsafe { CStr::from_ptr(raw_state_ptr) }.to_str().unwrap();
+        let state: serde_json::Value = serde_json::from_str(json_output).unwrap();
+
+        assert_eq!(state["context"]["match_id"], "test_match_123");
+        assert_eq!(state["context"]["active_player"], "Player_1");
+        assert_eq!(state["entities"]["U1"]["spatial"]["q"], 2);
+        assert_eq!(state["entities"]["U1"]["spatial"]["r"], -1);
+        assert_eq!(state["entities"]["U1"]["spatial"]["z"], 3);
+
+        unsafe { hgs_free_string(raw_state_ptr) };
+
+        let unknown_match = CString::new("unknown_match").unwrap();
+        let missing_state_ptr = unsafe { hgs_get_current_state(unknown_match.as_ptr()) };
+        assert!(missing_state_ptr.is_null());
+    }
+}
