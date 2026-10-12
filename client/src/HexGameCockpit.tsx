@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
-import { Canvas, type ThreeEvent } from "@react-three/fiber";
-import { Html, OrbitControls, Stats } from "@react-three/drei";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
+import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { OrbitControls, Stats } from "@react-three/drei";
 import * as THREE from "three";
 import init, {
   wasm_get_current_state,
@@ -302,52 +302,97 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
   const worldX = sizeX * (entity.spatial.q + entity.spatial.r * 0.5);
   const worldZ = sizeY * entity.spatial.r;
   const worldY = entity.spatial.z * 0.5 + PILLAR_HEIGHT + 0.08;
-  const health = unitHealth(entity);
   const hero = entity.id.includes("HERO");
 
   return (
-    <group position={[worldX, worldY, worldZ]} onClick={onSelect}>
-      <Html center distanceFactor={6} position={[0, hero ? 1.1 : 0.8, 0]}>
-        <div
-          style={{
-            background: "rgba(0, 0, 0, 0.75)",
-            padding: "2px 6px",
-            borderRadius: 4,
-            border: "1px solid #555",
-            color: "#fff",
-            fontSize: 10,
-            fontFamily: "monospace",
-            pointerEvents: "none",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {health ? `${health.currentLife} / ${health.maxLife} HP` : "HP unavailable"}
-        </div>
-      </Html>
-      {selected && (
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.005, 0]}>
-          <ringGeometry args={[0.3, 0.38, 32]} />
-          <meshBasicMaterial color="#f0d47a" />
-        </mesh>
-      )}
-      {hero ? (
-        <group position={[0, 0.3, 0]}>
+    <>
+      <group position={[worldX, worldY, worldZ]} onClick={onSelect}>
+        {selected && (
+          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.005, 0]}>
+            <ringGeometry args={[0.3, 0.38, 32]} />
+            <meshBasicMaterial color="#f0d47a" />
+          </mesh>
+        )}
+        {hero ? (
+          <group position={[0, 0.3, 0]}>
+            <mesh castShadow>
+              <sphereGeometry args={[0.3, 16, 16]} />
+              <meshStandardMaterial color={playerOne ? "#1e3a8a" : "#991b1b"} />
+            </mesh>
+            <mesh position={[0, 0.4, 0]} castShadow>
+              <sphereGeometry args={[0.2, 16, 16]} />
+              <meshStandardMaterial color={playerOne ? "#3b82f6" : "#ef4444"} />
+            </mesh>
+          </group>
+        ) : (
           <mesh castShadow>
-            <sphereGeometry args={[0.3, 16, 16]} />
-            <meshStandardMaterial color={playerOne ? "#1e3a8a" : "#991b1b"} />
+            <sphereGeometry args={[0.23, 20, 14]} />
+            <meshStandardMaterial color={playerOne ? "#58a9e8" : "#f07868"} roughness={0.45} />
           </mesh>
-          <mesh position={[0, 0.4, 0]} castShadow>
-            <sphereGeometry args={[0.2, 16, 16]} />
-            <meshStandardMaterial color={playerOne ? "#3b82f6" : "#ef4444"} />
-          </mesh>
-        </group>
-      ) : (
-        <mesh castShadow>
-          <sphereGeometry args={[0.23, 20, 14]} />
-          <meshStandardMaterial color={playerOne ? "#58a9e8" : "#f07868"} roughness={0.45} />
-        </mesh>
-      )}
-    </group>
+        )}
+      </group>
+    </>
+  );
+}
+
+function UnitHealthProjection({
+  units,
+  target,
+  labelElements,
+}: {
+  units: RenderEntity[];
+  target: THREE.Vector3;
+  labelElements: RefObject<Map<string, HTMLDivElement>>;
+}) {
+  const { camera, size } = useThree();
+  const projectedUnits = useMemo(
+    () =>
+      units.map((entity) => {
+        const sizeX = HEX_RADIUS * Math.sqrt(3);
+        const sizeY = HEX_RADIUS * 1.5;
+        const worldX = sizeX * (entity.spatial.q + entity.spatial.r * 0.5);
+        const worldZ = sizeY * entity.spatial.r;
+        const hero = entity.id.includes("HERO");
+        const worldY =
+          entity.spatial.z * 0.5 + PILLAR_HEIGHT + 0.08 + (hero ? 1.1 : 0.8);
+
+        return {
+          entity,
+          health: unitHealth(entity),
+          position: new THREE.Vector3(
+            worldX - target.x,
+            worldY - target.y,
+            worldZ - target.z,
+          ),
+        };
+      }),
+    [units, target],
+  );
+  const projectedPosition = useMemo(() => new THREE.Vector3(), []);
+
+  useFrame(() => {
+    for (const { entity, position } of projectedUnits) {
+      const element = labelElements.current.get(entity.id);
+      if (!element) continue;
+
+      projectedPosition.copy(position).project(camera);
+      const visible =
+        projectedPosition.z >= -1 &&
+        projectedPosition.z <= 1 &&
+        Math.abs(projectedPosition.x) <= 1 &&
+        Math.abs(projectedPosition.y) <= 1;
+      element.style.visibility = visible ? "visible" : "hidden";
+      if (visible) {
+        const x = (projectedPosition.x + 1) * size.width / 2;
+        const y = (1 - projectedPosition.y) * size.height / 2;
+        element.style.transform =
+          `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%)`;
+      }
+    }
+  });
+
+  return (
+    null
   );
 }
 
@@ -355,11 +400,19 @@ type SceneProps = {
   terrain: TerrainData[];
   units: RenderEntity[];
   selectedUnitId: string | null;
+  healthLabelElements: RefObject<Map<string, HTMLDivElement>>;
   onSelectUnit: (entity: RenderEntity, event: ThreeEvent<MouseEvent>) => void;
   onHexClick: (entity: TerrainData) => void;
 };
 
-function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onHexClick }: SceneProps) {
+function HexScene({
+  terrain,
+  units,
+  selectedUnitId,
+  healthLabelElements,
+  onSelectUnit,
+  onHexClick,
+}: SceneProps) {
   const target = useMemo(() => {
     if (terrain.length === 0) return new THREE.Vector3(0, 0, 0);
     const sum = terrain.reduce(
@@ -404,6 +457,11 @@ function HexScene({ terrain, units, selectedUnitId, onSelectUnit, onHexClick }: 
           />
         ))}
       </group>
+      <UnitHealthProjection
+        units={units}
+        target={target}
+        labelElements={healthLabelElements}
+      />
       <OrbitControls makeDefault target={[0, 0, 0]} enableDamping dampingFactor={0.08} />
       <Stats />
     </>
@@ -418,6 +476,7 @@ export default function HexGameCockpit() {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [notice, setNotice] = useState("Loading local WebAssembly engine");
   const [socket, setSocket] = useState<WebSocket | null>(null);
+  const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
     let cancelled = false;
@@ -658,10 +717,29 @@ export default function HexGameCockpit() {
             terrain={terrain}
             units={units}
             selectedUnitId={selectedUnitId}
+            healthLabelElements={healthLabelElements}
             onSelectUnit={selectUnit}
             onHexClick={handleHexClick}
           />
         </Canvas>
+        <div style={styles.healthOverlayLayer} aria-label="Unit health overlays">
+          {units.map((unit) => {
+            const health = unitHealth(unit);
+            return (
+              <div
+                key={unit.id}
+                ref={(element) => {
+                  if (element) healthLabelElements.current.set(unit.id, element);
+                  else healthLabelElements.current.delete(unit.id);
+                }}
+                data-unit-id={unit.id}
+                style={styles.healthTag}
+              >
+                {health ? `${health.currentLife} / ${health.maxLife} HP` : "HP unavailable"}
+              </div>
+            );
+          })}
+        </div>
         <aside style={styles.inspector} aria-label="Entity component inspector">
           <h2 style={styles.inspectorTitle}>📊 HGS Real-Time Component Inspector</h2>
           {inspectedEntity ? (
@@ -789,6 +867,28 @@ const styles: Record<string, CSSProperties> = {
   },
   inspectorEmpty: { margin: 0, color: "#9aac9e", fontSize: 12, lineHeight: 1.5 },
   canvas: { width: "100%", height: "100%", display: "block" },
+  healthOverlayLayer: {
+    position: "absolute",
+    inset: 1,
+    zIndex: 1,
+    overflow: "hidden",
+    pointerEvents: "none",
+  },
+  healthTag: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    visibility: "hidden",
+    transform: "translate3d(-10000px, -10000px, 0)",
+    background: "rgba(0, 0, 0, 0.75)",
+    padding: "2px 6px",
+    borderRadius: 4,
+    border: "1px solid #555",
+    color: "#fff",
+    fontSize: 10,
+    fontFamily: "monospace",
+    whiteSpace: "nowrap",
+  },
   footer: { maxWidth: 1240, margin: "0 auto", display: "flex", alignItems: "center", gap: 22, paddingTop: 16, color: "#49635a", fontSize: 12 },
   hint: { marginLeft: "auto", textAlign: "right", color: "#688077" },
 };
