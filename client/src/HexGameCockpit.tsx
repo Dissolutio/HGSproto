@@ -162,6 +162,19 @@ function unitLabels(entity: EngineEntity): string[] {
   return tagged?.data?.labels ?? tagged?.Tags?.labels ?? [];
 }
 
+function unitSeat(entity: EngineEntity): PlayerSeat | null {
+  const labels = unitLabels(entity);
+  const playerOne = labels.includes("P1");
+  const playerTwo = labels.includes("P2");
+  return playerOne !== playerTwo ? (playerOne ? "P1" : "P2") : null;
+}
+
+function isAdjacent(left: Position, right: Position): boolean {
+  const dq = left.q - right.q;
+  const dr = left.r - right.r;
+  return left.z === right.z && (Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2 === 1;
+}
+
 function unitHealth(entity: EngineEntity): { currentLife: number; maxLife: number } | null {
   const destructible = findComponent(entity, "Destructible");
   const currentLife =
@@ -181,6 +194,11 @@ function unitHealth(entity: EngineEntity): { currentLife: number; maxLife: numbe
     return null;
   }
   return { currentLife, maxLife };
+}
+
+function unitAttackDamage(entity: EngineEntity): number {
+  const health = unitHealth(entity);
+  return health ? Math.max(1, Math.floor(health.maxLife / 4)) : 1;
 }
 
 function entitiesFromState(state: EngineState | null): RenderEntity[] {
@@ -429,10 +447,11 @@ function ProceduralHexPillar({
 type UnitMarkerProps = {
   entity: RenderEntity;
   selected: boolean;
+  attackTarget: boolean;
   onSelect: (event: ThreeEvent<MouseEvent>) => void;
 };
 
-function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
+function UnitMarker({ entity, selected, attackTarget, onSelect }: UnitMarkerProps) {
   const labels = unitLabels(entity);
   const playerOne = labels.includes("P1") || labels.includes("Player_1");
   const sizeX = HEX_RADIUS * Math.sqrt(3);
@@ -447,6 +466,12 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
   return (
     <>
       <group position={[worldX, worldY, worldZ]} onClick={onSelect}>
+        {attackTarget && (
+          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.01, 0]}>
+            <ringGeometry args={[0.48, 0.65, 6]} />
+            <meshBasicMaterial color="#ff3333" toneMapped={false} side={THREE.DoubleSide} />
+          </mesh>
+        )}
         {selected && (
           <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.005, 0]}>
             <ringGeometry args={[0.3, 0.38, 32]} />
@@ -456,12 +481,12 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
         {isSphere ? (
           <mesh castShadow position={[0, 0.3, 0]}>
             <sphereGeometry args={[0.3, 16, 16]} />
-            <meshStandardMaterial color={unitColor} />
+            <meshStandardMaterial color={unitColor} emissive={attackTarget ? "#ff3333" : "#000000"} emissiveIntensity={0.65} />
           </mesh>
         ) : (
           <mesh castShadow position={[0, 0.3, 0]}>
             <boxGeometry args={[0.4, 0.4, 0.4]} />
-            <meshStandardMaterial color={unitColor} />
+            <meshStandardMaterial color={unitColor} emissive={attackTarget ? "#ff3333" : "#000000"} emissiveIntensity={0.65} />
           </mesh>
         )}
       </group>
@@ -534,6 +559,7 @@ type SceneProps = {
   terrain: TerrainData[];
   units: RenderEntity[];
   selectedUnitId: string | null;
+  attackTargetIds: Set<string>;
   healthLabelElements: RefObject<Map<string, HTMLDivElement>>;
   onSelectUnit: (entity: RenderEntity, event: ThreeEvent<MouseEvent>) => void;
   onHexClick: (entity: TerrainData) => void;
@@ -543,6 +569,7 @@ function HexScene({
   terrain,
   units,
   selectedUnitId,
+  attackTargetIds,
   healthLabelElements,
   onSelectUnit,
   onHexClick,
@@ -587,6 +614,7 @@ function HexScene({
             key={unit.id}
             entity={unit}
             selected={selectedUnitId === unit.id}
+            attackTarget={attackTargetIds.has(unit.id)}
             onSelect={(event) => onSelectUnit(unit, event)}
           />
         ))}
@@ -607,7 +635,11 @@ export default function HexGameCockpit() {
   const [mode, setMode] = useState<Mode>("wasm");
   const [gameState, setGameState] = useState<EngineState | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
-  const [attackTargeting, setAttackTargeting] = useState(false);
+  const [actionPending, setActionPending] = useState(false);
+  const [endTurnAfterSkip, setEndTurnAfterSkip] = useState<{
+    seat: string;
+    matchId: string;
+  } | null>(null);
   const [inspectedEntity, setInspectedEntity] = useState<RenderEntity | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [notice, setNotice] = useState("Loading local WebAssembly engine");
@@ -808,6 +840,8 @@ export default function HexGameCockpit() {
           return;
         }
         if (message === "P2P_RESET") {
+          setActionPending(false);
+          setEndTurnAfterSkip(null);
           clearActiveSession();
           setLocalNodeId(null);
           setLocalMatchId(null);
@@ -821,6 +855,8 @@ export default function HexGameCockpit() {
           return;
         }
         if (message === "E:SESSION_EXPIRED") {
+          setActionPending(false);
+          setEndTurnAfterSkip(null);
           clearActiveSession();
           setLocalNodeId(null);
           setLocalMatchId(null);
@@ -832,13 +868,18 @@ export default function HexGameCockpit() {
           return;
         }
         if (message.startsWith("E:")) {
+          setActionPending(false);
+          setEndTurnAfterSkip(null);
           setNotice(message.slice(2));
           return;
         }
         try {
           setGameState(parseState(message));
+          setActionPending(false);
           setNotice("State synchronized");
         } catch (error) {
+          setActionPending(false);
+          setEndTurnAfterSkip(null);
           setNotice(`Invalid engine response: ${error instanceof Error ? error.message : String(error)}`);
         }
       };
@@ -850,6 +891,8 @@ export default function HexGameCockpit() {
       };
       gatewaySocket.onclose = () => {
         if (cancelled) return;
+        setActionPending(false);
+        setEndTurnAfterSkip(null);
         setConnection("offline");
         setIsPeerConnected(false);
         const storedSession = readRecoverySession();
@@ -921,6 +964,50 @@ export default function HexGameCockpit() {
   const deploymentSlot =
     deploymentSlots.find((unit) => unit.id === deploymentSlotId) ?? deploymentSlots[0] ?? null;
   const selectedProfile = loadedModProfiles.find((profile) => profile.modId === selectedModId);
+  const activeSeat = gameState?.context?.active_player;
+  const turnPhase = gameState?.context?.turn_phase;
+  const winner = gameState?.context?.winner;
+  const playerSeat = mode === "wasm"
+    ? (activeSeat === "P1" || activeSeat === "P2" ? activeSeat : null)
+    : localSeat;
+  const isYourTurn = !!playerSeat && playerSeat === activeSeat && !winner;
+  const canAct = isYourTurn && !actionPending &&
+    (mode === "wasm" ? connection === "ready" : connection === "connected");
+  const selectedUnit = units.find((unit) => unit.id === selectedUnitId);
+  const attackTargetIds = useMemo(() => {
+    if (!canAct || turnPhase !== "attack" || !selectedUnit || unitSeat(selectedUnit) !== activeSeat) {
+      return new Set<string>();
+    }
+    return new Set(units.filter((unit) => {
+      const seat = unitSeat(unit);
+      return seat !== null && seat !== activeSeat &&
+        !!findComponent(unit, "Destructible") &&
+        isAdjacent(selectedUnit.spatial, unit.spatial);
+    }).map((unit) => unit.id));
+  }, [canAct, turnPhase, selectedUnit, activeSeat, units]);
+
+  useEffect(() => {
+    if (!canAct || !selectedUnit || unitSeat(selectedUnit) !== activeSeat ||
+      !["movement", "attack"].includes(turnPhase ?? "")) {
+      setSelectedUnitId(null);
+    }
+  }, [canAct, selectedUnit, activeSeat, turnPhase]);
+
+  const clearSelection = () => {
+    setSelectedUnitId(null);
+    setNotice("Selection cleared");
+  };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSelectedUnitId(null);
+        setNotice("Selection cleared");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const findEntityAtCoordinate = (q: number, r: number, z: number) =>
     units.find(
@@ -935,74 +1022,122 @@ export default function HexGameCockpit() {
   };
 
   const submitAction = (token: string) => {
+    if (!canAct) {
+      setNotice(actionPending
+        ? "Waiting for the referee to confirm the previous action"
+        : winner ? "Match is finished" : !isYourTurn
+          ? "Action unavailable: wait for your assigned seat's turn"
+          : "Action not sent: engine stream is offline");
+      return false;
+    }
     if (mode === "wasm") {
       const actingSeat = gameState?.context?.active_player;
       if (!actingSeat) {
         setNotice("Referee action rejected: active seat is missing from the match state");
-        return;
+        return false;
       }
       try {
         const result = wasm_process_token_for_match(WASM_MATCH_ID, actingSeat, token);
         if (result.startsWith("E:")) {
           console.error("Referee Rejected Action:", result);
           setNotice(result.slice(2));
-          return;
+          return false;
         }
         setSelectedUnitId(null);
-        setAttackTargeting(false);
         sync3DCanvasWithWasmState();
         setNotice(`Applied locally: ${token}`);
+        return true;
       } catch (error) {
         setNotice(`WASM action failed: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
       }
-      return;
     }
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       setNotice("Action not sent: engine stream is offline");
-      return;
+      return false;
     }
     try {
       socket.send(token);
+      setActionPending(true);
       setNotice(`Sent ${token}`);
       setSelectedUnitId(null);
-      setAttackTargeting(false);
+      return true;
     } catch (error) {
       setNotice(`Action could not be sent: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
+  };
+
+  useEffect(() => {
+    if (!endTurnAfterSkip || actionPending) return;
+    if (winner || activeSeat !== endTurnAfterSkip.seat ||
+      gameState?.context?.match_id !== endTurnAfterSkip.matchId) {
+      setEndTurnAfterSkip(null);
+      return;
+    }
+    if (turnPhase === "end") {
+      setEndTurnAfterSkip(null);
+      submitAction("E");
+    }
+  }, [gameState, endTurnAfterSkip, actionPending]);
+
+  const handleEndTurn = () => {
+    if (turnPhase !== "attack") {
+      submitAction("E");
+      return;
+    }
+    if (!activeSeat || !gameState?.context?.match_id) {
+      setNotice("Cannot skip attack: match identity is unavailable");
+      return;
+    }
+    setEndTurnAfterSkip({ seat: activeSeat, matchId: gameState.context.match_id });
+    if (!submitAction("S")) setEndTurnAfterSkip(null);
+  };
+
+  const handleUnitClick = (unit: RenderEntity) => {
+    setInspectedEntity(unit);
+    if (!canAct || !["movement", "attack"].includes(turnPhase ?? "")) {
+      setNotice(winner ? "Match is finished" : "Unit inspected; turn actions are unavailable");
+      return;
+    }
+    if (attackTargetIds.has(unit.id) && selectedUnitId) {
+      submitAction(`A:${selectedUnitId}:${unit.id}`);
+      return;
+    }
+    if (unitSeat(unit) !== activeSeat) {
+      setNotice(turnPhase === "attack"
+        ? "Select a friendly unit, then click a red adjacent enemy target"
+        : "Select a unit belonging to your active seat");
+      return;
+    }
+    const nextId = selectedUnitId === unit.id ? null : unit.id;
+    setSelectedUnitId(nextId);
+    setNotice(nextId ? `${unit.id} selected` : "Selection cleared");
   };
 
   const handleHexClick = (cell: TerrainData) => {
     setInspectedEntity(entities.find((entity) => entity.id === cell.id) ?? cell);
     const { q, r, z } = cell.spatial;
-    if (!selectedUnitId) {
-      const occupant = findEntityAtCoordinate(q, r, z);
-      if (occupant) {
-        setSelectedUnitId(occupant.id);
-        setNotice(`${occupant.id} selected`);
-      }
+    const occupant = findEntityAtCoordinate(q, r, z);
+    if (occupant) {
+      handleUnitClick(occupant);
       return;
     }
-
-    submitAction(`M:${selectedUnitId}:Q${q}R${r}Z${z}`);
+    if (canAct && turnPhase === "movement" && selectedUnitId) {
+      submitAction(`M:${selectedUnitId}:Q${q}R${r}Z${z}`);
+    }
   };
 
   const selectUnit = (unit: RenderEntity, event: ThreeEvent<MouseEvent>) => {
     event.stopPropagation();
-    setInspectedEntity(unit);
-    if (attackTargeting && selectedUnitId && unit.id !== selectedUnitId) {
-      submitAction(`A:${selectedUnitId}:${unit.id}`);
-      return;
-    }
-    const nextId = selectedUnitId === unit.id ? null : unit.id;
-    setSelectedUnitId(nextId);
-    setAttackTargeting(false);
-    setNotice(nextId ? `${unit.id} selected` : "Selection cleared");
+    handleUnitClick(unit);
   };
 
   const chooseMode = (nextMode: Mode) => {
     if (nextMode === mode) return;
     setSelectedUnitId(null);
-    setAttackTargeting(false);
+    setActionPending(false);
+    setEndTurnAfterSkip(null);
     setInspectedEntity(null);
     setGameState(null);
     setLocalSeat(null);
@@ -1211,6 +1346,8 @@ export default function HexGameCockpit() {
   };
 
   const handleDisconnectAndReset = () => {
+    setActionPending(false);
+    setEndTurnAfterSkip(null);
     let gatewayResetRequested = false;
     if (socket && socket.readyState === WebSocket.OPEN) {
       try {
@@ -1245,7 +1382,9 @@ export default function HexGameCockpit() {
     : gameState?.context?.turn_phase === "movement"
       ? "Move one friendly unit one adjacent hex, or skip movement"
       : gameState?.context?.turn_phase === "attack"
-        ? "Attack one adjacent enemy for 1 damage, or skip attack"
+        ? selectedUnit
+          ? `Attack one adjacent enemy for ${unitAttackDamage(selectedUnit)} damage, or skip attack`
+          : "Select a friendly unit to attack (damage scales with max health), or skip attack"
         : gameState?.context?.turn_phase === "end"
           ? "End the turn to activate the other seat"
           : "Referee state unavailable";
@@ -1388,75 +1527,87 @@ export default function HexGameCockpit() {
 
       <section style={styles.toolbar} aria-live="polite">
         <span style={styles.notice}>{notice}</span>
-        {mode === "network" && (
-          <span
-            role="status"
-            aria-live="polite"
-            style={{
-              ...styles.playerIdentity,
-              borderColor: localSeat ? PLAYER_COLORS[localSeat] : "#a8b7ae",
-            }}
-          >
-            <span
-              aria-hidden="true"
-              style={{
-                ...styles.playerColorDot,
-                background: localSeat ? PLAYER_COLORS[localSeat] : "#94a3b8",
-              }}
-            />
-            {localSeat
-              ? `You are Player ${localSeat === "P1" ? "1" : "2"} (${localSeat})`
-              : "Your player seat is awaiting host/join"}
-          </span>
-        )}
         <span style={styles.counts}>{terrain.length} hexes <i /> {units.length} units</span>
       </section>
 
       <section style={styles.rulesBar} aria-label="Referee turn controls">
-        <strong role="status">
-          {gameState?.context?.winner
-            ? `${gameState.context.winner} wins — match finished`
-            : `${gameState?.context?.active_player ?? "Seat unavailable"} · ${gameState?.context?.turn_phase ?? "phase unavailable"} phase`}
-        </strong>
+        <span
+          style={{ ...styles.playerIdentity, borderColor: playerSeat ? PLAYER_COLORS[playerSeat] : "#94a3b8" }}
+          aria-label="Player identity"
+        >
+          <span aria-hidden="true" style={{
+            ...styles.playerColorDot,
+            background: playerSeat ? PLAYER_COLORS[playerSeat] : "#94a3b8",
+          }} />
+          {playerSeat
+            ? `${mode === "wasm" ? "Local hotseat" : "Your seat"}: ${playerSeat} · ${playerSeat === "P1" ? "Blue" : "Red"}`
+            : "Your seat: unassigned · Color: pending"}
+        </span>
+        <div
+          role="status"
+          aria-label="Turn status"
+          style={{
+            ...styles.turnBanner,
+            background: winner ? "#18302d" : isYourTurn ? "#183b35" : "#475569",
+          }}
+        >
+          <strong>
+            {winner ? `${winner} wins — match finished`
+              : !gameState ? "Loading turn state"
+                : !playerSeat ? "Awaiting seat assignment"
+                  : isYourTurn ? "Your Turn" : "Waiting for Opponent"}
+          </strong>
+          <span style={styles.turnDetails}>
+            Active seat: {activeSeat ?? "unavailable"} · Phase: {turnPhase ?? "unavailable"}
+            {actionPending ? " · Confirming action..." : !canAct && isYourTurn ? " · Connection unavailable" : ""}
+          </span>
+        </div>
         <div style={styles.rulesButtons}>
           <button
             type="button"
-            onClick={() => setAttackTargeting((targeting) => !targeting)}
-            disabled={
-              gameState?.context?.turn_phase !== "attack" ||
-              !selectedUnitId ||
-              !!gameState?.context?.winner
-            }
+            onClick={clearSelection}
+            disabled={!selectedUnitId}
             style={styles.ruleButton}
           >
-            {attackTargeting ? "Cancel attack" : "Attack selected unit"}
+            Cancel selection
           </button>
           <button
             type="button"
             onClick={() => submitAction("S")}
             disabled={
-              !["movement", "attack"].includes(gameState?.context?.turn_phase ?? "") ||
-              !!gameState?.context?.winner
+              !canAct || turnPhase !== "movement"
             }
             style={styles.ruleButton}
           >
-            {gameState?.context?.turn_phase === "attack" ? "Skip attack" : "Skip movement"}
+            Skip movement
           </button>
           <button
             type="button"
-            onClick={() => submitAction("E")}
-            disabled={gameState?.context?.turn_phase !== "end" || !!gameState?.context?.winner}
+            onClick={handleEndTurn}
+            disabled={!canAct || !["attack", "end"].includes(turnPhase ?? "") || !!endTurnAfterSkip}
             style={styles.ruleButton}
           >
-            End turn
+            {turnPhase === "attack" ? "Skip Attack / End Turn" : "End Turn"}
           </button>
         </div>
-        {attackTargeting && (
-          <span style={styles.ruleHint}>Select an adjacent enemy unit to attack for 1 damage.</span>
-        )}
+        <span style={styles.ruleHint}>
+          {turnPhase === "attack" && selectedUnitId
+            ? attackTargetIds.size
+              ? `${attackTargetIds.size} valid target(s): click a red highlighted enemy to attack for ${selectedUnit ? unitAttackDamage(selectedUnit) : 1} damage.`
+              : "No adjacent enemies on the same level. Select another friendly unit or skip attack."
+            : ruleHint}
+          {" "}Right-click the board or press Escape to cancel selection.
+        </span>
       </section>
 
-      <section style={styles.boardFrame} aria-label="3D tactical board">
+      <section
+        style={styles.boardFrame}
+        aria-label="3D tactical board"
+        onContextMenu={(event) => {
+          event.preventDefault();
+          clearSelection();
+        }}
+      >
         <Canvas
           camera={{ position: [8, 9, 11], fov: 42, near: 0.1, far: 500 }}
           shadows="percentage"
@@ -1469,6 +1620,7 @@ export default function HexGameCockpit() {
             terrain={terrain}
             units={units}
             selectedUnitId={selectedUnitId}
+            attackTargetIds={attackTargetIds}
             healthLabelElements={healthLabelElements}
             onSelectUnit={selectUnit}
             onHexClick={handleHexClick}
@@ -1485,8 +1637,14 @@ export default function HexGameCockpit() {
                   else healthLabelElements.current.delete(unit.id);
                 }}
                 data-unit-id={unit.id}
-                style={styles.healthTag}
+                data-attack-target={attackTargetIds.has(unit.id) ? "true" : undefined}
+                data-selected={selectedUnitId === unit.id ? "true" : undefined}
+                style={{
+                  ...styles.healthTag,
+                  ...(attackTargetIds.has(unit.id) ? styles.targetHealthTag : {}),
+                }}
               >
+                {attackTargetIds.has(unit.id) ? "TARGET · " : ""}
                 {health ? `${health.currentLife} / ${health.maxLife} HP` : "HP unavailable"}
               </div>
             );
@@ -1824,6 +1982,17 @@ const styles: Record<string, CSSProperties> = {
     fontSize: 13,
   },
   rulesButtons: { display: "flex", flexWrap: "wrap", gap: 8 },
+  turnBanner: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    flex: "1 1 240px",
+    padding: "12px 16px",
+    borderRadius: 6,
+    color: "#fff",
+    fontSize: 20,
+  },
+  turnDetails: { fontSize: 12, fontWeight: 400 },
   ruleButton: {
     padding: "7px 10px",
     border: "1px solid #789087",
@@ -1994,6 +2163,11 @@ const styles: Record<string, CSSProperties> = {
     fontSize: 10,
     fontFamily: "monospace",
     whiteSpace: "nowrap",
+  },
+  targetHealthTag: {
+    border: "2px solid #ff3333",
+    boxShadow: "0 0 12px #ff3333",
+    color: "#fff",
   },
   footer: { maxWidth: 1240, margin: "0 auto", display: "flex", alignItems: "center", gap: 22, paddingTop: 16, color: "#49635a", fontSize: 12 },
   hint: { marginLeft: "auto", textAlign: "right", color: "#688077" },

@@ -133,8 +133,10 @@ The M2 reference game alternates P1 and P2. Each turn proceeds through
 Movement, Attack, and End phases. In Movement, the active seat may move one
 friendly unit exactly one adjacent board hex at the same height, or skip the
 phase. A successful move or skip advances to Attack. In Attack, the active
-seat may damage one adjacent enemy unit at the same height for exactly one
-core-defined life point, or skip. A successful attack or skip advances to End.
+seat may damage one adjacent enemy unit at the same height. Damage is the
+attacker's maximum health divided by four, rounded down and with a minimum of
+one (so 4-health units deal 1 and 8-health units deal 2), or the seat may skip.
+A successful attack or skip advances to End.
 Only the active seat may act, and it may control only units with its matching
 seat tag. The End action rotates the active seat and starts the next Movement
 phase.
@@ -162,14 +164,14 @@ peer stream:
 
 Movement coordinates are signed integers. The core checks the acting seat,
 phase, unit ownership, one-hex movement distance, board membership, height, and
-occupancy. Attacks require an adjacent enemy unit at the same height and do
-exactly one damage; a supplied damage field is rejected. An action request
-must include the acting seat when submitted through the C/WASM API; the native
-gateway binds local actions to its host/join seat and assigns peer actions the
-opposite seat. Action processing returns `VALID_STEP:<original-token>` on
-success. The WASM bridge and native WebSocket gateway return errors prefixed
-with `E:`; a gateway action is a WebSocket text message containing the token
-itself, without a JSON wrapper.
+occupancy. Attacks require an adjacent enemy unit at the same height; damage
+is determined by the attacker's maximum health and a supplied damage field is
+rejected. An action request must include the acting seat when submitted through
+the C/WASM API; the native gateway binds local actions to its host/join seat and
+assigns peer actions the opposite seat. Action processing returns
+`VALID_STEP:<original-token>` on success. The WASM bridge and native WebSocket
+gateway return errors prefixed with `E:`; a gateway action is a WebSocket text
+message containing the token itself, without a JSON wrapper.
 
 On 2026-10-13, the browser smoke moved a P1 unit one adjacent hex, applied a
 legal adjacent attack, and confirmed the target health overlay and inspector

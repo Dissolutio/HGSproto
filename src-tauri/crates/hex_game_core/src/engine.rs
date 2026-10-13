@@ -808,6 +808,14 @@ fn apply_referee_action(
                 {
                     return Err(format!("Target is not destructible: {target_id}"));
                 }
+                let damage = attacker
+                    .components
+                    .values()
+                    .find_map(|component| match component {
+                        Component::Destructible { max_life, .. } => Some((max_life / 4).max(1)),
+                        _ => None,
+                    })
+                    .unwrap_or(1);
                 let target = state
                     .entities
                     .get_mut(target_id)
@@ -820,7 +828,7 @@ fn apply_referee_action(
                         _ => None,
                     })
                     .unwrap();
-                *destructible = destructible.saturating_sub(1);
+                *destructible = destructible.saturating_sub(damage);
                 if *destructible <= 0 {
                     state.entities.remove(target_id);
                 }
@@ -1514,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn referee_enforces_seats_phases_action_budgets_and_fixed_attack_damage() {
+    fn referee_enforces_seats_phases_action_budgets_and_health_scaled_damage() {
         let match_id = format!("referee_rules_test_{}", std::process::id());
         store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
         let initial = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
@@ -1596,6 +1604,21 @@ mod tests {
         let next_turn = &ACTIVE_MATCHES.lock().unwrap()[&match_id].context;
         assert_eq!(next_turn.active_player, "P1");
         assert_eq!(next_turn.turn_phase, TurnPhase::Movement);
+    }
+
+    #[test]
+    fn referee_uses_attacker_max_life_to_calculate_damage() {
+        let match_id = format!("referee_scaled_damage_test_{}", std::process::id());
+        store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
+
+        process_action(&match_id, "P1", "M:HERO_P1:Q0R0Z0").unwrap();
+        process_action(&match_id, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
+
+        let state = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
+            2
+        );
     }
 
     #[test]
