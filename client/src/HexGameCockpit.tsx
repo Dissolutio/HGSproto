@@ -34,6 +34,7 @@ type EngineEntity = {
   id?: string;
   spatial?: Position;
   visual_primitive?: string;
+  display_name?: string;
   components?: Record<string, EngineComponent> | EngineComponent[];
 };
 type EngineState = {
@@ -156,6 +157,68 @@ function parseState(serializedState: string): EngineState {
   const parsed = JSON.parse(serializedState) as EngineState | { error?: string };
   if ("error" in parsed && parsed.error) throw new Error(parsed.error);
   return parsed as EngineState;
+}
+
+function injectGoliath(entity: EngineEntity): EngineEntity {
+  const components = entity.components;
+  if (Array.isArray(components)) {
+    let hasDestructible = false;
+    const updatedComponents = components.map((component) => {
+      if (component.type === "Destructible") {
+        hasDestructible = true;
+        return {
+          ...component,
+          data: { ...component.data, current_life: 12, max_life: 12 },
+        };
+      }
+      if (component.Destructible) {
+        hasDestructible = true;
+        return {
+          ...component,
+          Destructible: { ...component.Destructible, current_life: 12, max_life: 12 },
+        };
+      }
+      if (component.destructible) {
+        hasDestructible = true;
+        return {
+          ...component,
+          destructible: { ...component.destructible, current_life: 12, max_life: 12 },
+        };
+      }
+      return component;
+    });
+    if (!hasDestructible) {
+      updatedComponents.push({
+        type: "Destructible",
+        data: { current_life: 12, max_life: 12 },
+      });
+    }
+    return {
+      ...entity,
+      visual_primitive: "CUBE",
+      display_name: "Goliath Exo-Suit",
+      components: updatedComponents,
+    };
+  }
+
+  const existingDestructible = components?.destructible ?? {};
+  return {
+    ...entity,
+    visual_primitive: "CUBE",
+    display_name: "Goliath Exo-Suit",
+    components: {
+      ...components,
+      destructible: {
+        ...existingDestructible,
+        type: existingDestructible.type ?? "Destructible",
+        data: {
+          ...existingDestructible.data,
+          current_life: 12,
+          max_life: 12,
+        },
+      },
+    },
+  };
 }
 
 function makeProceduralTexture(textureKey: string, isSide: boolean): THREE.CanvasTexture {
@@ -685,6 +748,47 @@ export default function HexGameCockpit() {
     }
   };
 
+  const handleDevInjectGoliath = () => {
+    if (!selectedUnitId) {
+      window.alert("Please click to select a 3D unit mesh on the board first!");
+      return;
+    }
+    const selectedUnit = units.find((unit) => unit.id === selectedUnitId);
+    if (!selectedUnit) {
+      setNotice(`Cannot inject Goliath: selected unit '${selectedUnitId}' is no longer available`);
+      return;
+    }
+
+    setGameState((previous) => {
+      if (!previous?.entities) return previous;
+      if (Array.isArray(previous.entities)) {
+        return {
+          ...previous,
+          entities: previous.entities.map((entity, index) =>
+            (entity.id ?? String(index)) === selectedUnitId
+              ? injectGoliath(entity)
+              : entity,
+          ),
+        };
+      }
+      return {
+        ...previous,
+        entities: Object.fromEntries(
+          Object.entries(previous.entities).map(([key, entity]) => [
+            key,
+            (entity.id ?? key) === selectedUnitId ? injectGoliath(entity) : entity,
+          ]),
+        ),
+      };
+    });
+    setInspectedEntity({
+      ...injectGoliath(selectedUnit),
+      id: selectedUnit.id,
+      spatial: selectedUnit.spatial,
+    });
+    setNotice(`Injected Goliath Exo-Suit onto ${selectedUnitId}`);
+  };
+
   const playerOneCount = units.filter((unit) => {
     const labels = unitLabels(unit);
     return labels.includes("P1") || labels.includes("Player_1");
@@ -811,6 +915,21 @@ export default function HexGameCockpit() {
               style={styles.modProfileButton}
             >
               Load Mod Profile
+            </button>
+            <button
+              type="button"
+              onClick={handleDevInjectGoliath}
+              style={{
+                marginTop: 8,
+                padding: "4px 8px",
+                background: "#d97706",
+                color: "#fff",
+                border: "none",
+                borderRadius: 4,
+                cursor: "pointer",
+              }}
+            >
+              🧪 Inject Goliath onto Active Selection
             </button>
             {loadedModProfiles.length > 0 && (
               <ul style={styles.modProfileList} aria-label="Loaded mod profiles">
