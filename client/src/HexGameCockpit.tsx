@@ -5,6 +5,7 @@ import * as THREE from "three";
 import init, {
   wasm_get_current_state,
   wasm_initialize_match,
+  wasm_load_mod_profiles,
   wasm_process_token_for_match,
 } from "./wasm/hex_game_core";
 
@@ -32,6 +33,7 @@ type EngineComponent = {
 type EngineEntity = {
   id?: string;
   spatial?: Position;
+  visual_primitive?: string;
   components?: Record<string, EngineComponent> | EngineComponent[];
 };
 type EngineState = {
@@ -45,6 +47,11 @@ type TerrainData = RenderEntity & {
 };
 type Mode = "network" | "wasm";
 type ConnectionState = "connecting" | "connected" | "offline" | "ready";
+type ModProfileSummary = {
+  modId: string;
+  displayName: string;
+  visualPrimitive: string;
+};
 
 const SOCKET_URL = "ws://127.0.0.1:8080";
 const WASM_MATCH_ID = "wasm_sandbox";
@@ -302,7 +309,9 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
   const worldX = sizeX * (entity.spatial.q + entity.spatial.r * 0.5);
   const worldZ = sizeY * entity.spatial.r;
   const worldY = entity.spatial.z * 0.5 + PILLAR_HEIGHT + 0.08;
-  const hero = entity.id.includes("HERO");
+  const visualPrimitive = entity.visual_primitive?.trim().toUpperCase();
+  const isSphere = visualPrimitive === "SPHERE";
+  const unitColor = playerOne ? "#3b82f6" : "#ef4444";
 
   return (
     <>
@@ -313,21 +322,15 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
             <meshBasicMaterial color="#f0d47a" />
           </mesh>
         )}
-        {hero ? (
-          <group position={[0, 0.3, 0]}>
-            <mesh castShadow>
-              <sphereGeometry args={[0.3, 16, 16]} />
-              <meshStandardMaterial color={playerOne ? "#1e3a8a" : "#991b1b"} />
-            </mesh>
-            <mesh position={[0, 0.4, 0]} castShadow>
-              <sphereGeometry args={[0.2, 16, 16]} />
-              <meshStandardMaterial color={playerOne ? "#3b82f6" : "#ef4444"} />
-            </mesh>
-          </group>
+        {isSphere ? (
+          <mesh castShadow position={[0, 0.3, 0]}>
+            <sphereGeometry args={[0.3, 16, 16]} />
+            <meshStandardMaterial color={unitColor} />
+          </mesh>
         ) : (
-          <mesh castShadow>
-            <sphereGeometry args={[0.23, 20, 14]} />
-            <meshStandardMaterial color={playerOne ? "#58a9e8" : "#f07868"} roughness={0.45} />
+          <mesh castShadow position={[0, 0.3, 0]}>
+            <boxGeometry args={[0.4, 0.4, 0.4]} />
+            <meshStandardMaterial color={unitColor} />
           </mesh>
         )}
       </group>
@@ -476,6 +479,8 @@ export default function HexGameCockpit() {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [notice, setNotice] = useState("Loading local WebAssembly engine");
   const [socket, setSocket] = useState<WebSocket | null>(null);
+  const [modProfileText, setModProfileText] = useState("");
+  const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
   const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
@@ -645,6 +650,41 @@ export default function HexGameCockpit() {
     setMode(nextMode);
   };
 
+  const loadModProfiles = () => {
+    if (!modProfileText.trim()) {
+      setNotice("Paste a mod profile before loading");
+      return;
+    }
+    try {
+      const parsed: unknown = JSON.parse(modProfileText);
+      const profiles = Array.isArray(parsed) ? parsed : [parsed];
+      const summaries = profiles.map((profile): ModProfileSummary => {
+        if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+          throw new Error("Each mod profile must be a JSON object");
+        }
+        const record = profile as Record<string, unknown>;
+        return {
+          modId: typeof record.mod_id === "string" ? record.mod_id : "Unknown mod ID",
+          displayName:
+            typeof record.display_name === "string" ? record.display_name : "Unnamed profile",
+          visualPrimitive:
+            typeof record.visual_primitive === "string"
+              ? record.visual_primitive
+              : "Unknown primitive",
+        };
+      });
+      const loadedCount = wasm_load_mod_profiles(modProfileText);
+      setLoadedModProfiles(summaries);
+      setNotice(
+        `Loaded ${loadedCount} community mod profile${loadedCount === 1 ? "" : "s"}`,
+      );
+    } catch (error) {
+      setNotice(
+        `Mod profile load failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+
   const playerOneCount = units.filter((unit) => {
     const labels = unitLabels(unit);
     return labels.includes("P1") || labels.includes("Player_1");
@@ -751,6 +791,37 @@ export default function HexGameCockpit() {
               Click a unit or hex pillar to inspect its components.
             </p>
           )}
+          <details style={styles.modLoader}>
+            <summary style={styles.modLoaderSummary}>🔌 Community Mod Profile Loader</summary>
+            <label style={styles.modLoaderLabel} htmlFor="mod-profile-json">
+              Paste a mod profile or profile batch as JSON
+            </label>
+            <textarea
+              id="mod-profile-json"
+              aria-label="Community mod profile JSON"
+              value={modProfileText}
+              onChange={(event) => setModProfileText(event.target.value)}
+              placeholder={'{\n  "schema_version": 1,\n  "mod_id": "com.community.scout",\n  "display_name": "Community Scout",\n  "visual_primitive": "CUBE",\n  "components": {\n    "destructible": { "current_life": 5, "max_life": 5 },\n    "tags": ["Unit"]\n  }\n}'}
+              style={styles.modProfileInput}
+            />
+            <button
+              type="button"
+              onClick={loadModProfiles}
+              disabled={mode !== "wasm" || connection !== "ready"}
+              style={styles.modProfileButton}
+            >
+              Load Mod Profile
+            </button>
+            {loadedModProfiles.length > 0 && (
+              <ul style={styles.modProfileList} aria-label="Loaded mod profiles">
+                {loadedModProfiles.map((profile) => (
+                  <li key={profile.modId}>
+                    {profile.displayName} · {profile.modId} · {profile.visualPrimitive}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </details>
         </aside>
       </section>
 
@@ -866,6 +937,40 @@ const styles: Record<string, CSSProperties> = {
     overflowWrap: "anywhere",
   },
   inspectorEmpty: { margin: 0, color: "#9aac9e", fontSize: 12, lineHeight: 1.5 },
+  modLoader: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTop: "1px solid #4d6860",
+  },
+  modLoaderSummary: {
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: 650,
+    lineHeight: 1.5,
+  },
+  modLoaderLabel: { display: "block", margin: "10px 0 5px", color: "#b4c5ba", fontSize: 11 },
+  modProfileInput: {
+    width: "100%",
+    minHeight: 150,
+    boxSizing: "border-box",
+    resize: "vertical",
+    padding: 8,
+    border: "1px solid #4d6860",
+    background: "#101c1d",
+    color: "#e5efe8",
+    font: "11px/1.45 ui-monospace, monospace",
+  },
+  modProfileButton: {
+    marginTop: 8,
+    padding: "7px 10px",
+    border: "1px solid #70d6a4",
+    background: "#183b35",
+    color: "#f1f4ed",
+    font: "inherit",
+    fontSize: 11,
+    cursor: "pointer",
+  },
+  modProfileList: { margin: "9px 0 0", paddingLeft: 16, color: "#b4c5ba", fontSize: 10, overflowWrap: "anywhere" },
   canvas: { width: "100%", height: "100%", display: "block" },
   healthOverlayLayer: {
     position: "absolute",

@@ -38,6 +38,8 @@ pub struct Entity {
     pub id: String,
     pub spatial: SpatialPosition,
     pub components: HashMap<String, Component>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_primitive: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

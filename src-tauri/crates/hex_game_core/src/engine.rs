@@ -35,6 +35,7 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
                 id: hex_id,
                 spatial: SpatialPosition { q: *q, r: *r, z: 0 },
                 components,
+                visual_primitive: None,
             },
         );
     }
@@ -45,6 +46,7 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
             id: unit.id.clone(),
             spatial: SpatialPosition { q, r, z: 0 },
             components: unit.components,
+            visual_primitive: None,
         };
         entities.insert(entity.id.clone(), entity);
     }
@@ -177,6 +179,7 @@ fn try_initialize_map_file(
                         side_texture: side_texture.to_string(),
                     },
                 )]),
+                visual_primitive: None,
             };
             game_state.entities.insert(entity_id, entity);
         }
@@ -206,8 +209,8 @@ fn try_initialize_map_file(
     let starter_units = starter_units
         .into_iter()
         .map(|unit| {
-            let components = starter_unit_components(&unit, registry)?;
-            Ok((unit.id, components))
+            let (components, visual_primitive) = starter_unit_components(&unit, registry)?;
+            Ok((unit.id, components, visual_primitive))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let unit_count = starter_units.len();
@@ -234,11 +237,14 @@ fn try_initialize_map_file(
         spawn_positions
     };
 
-    for ((unit_id, components), spatial) in starter_units.into_iter().zip(selected_spawns) {
+    for ((unit_id, components, visual_primitive), spatial) in
+        starter_units.into_iter().zip(selected_spawns)
+    {
         let entity = Entity {
             id: unit_id.clone(),
             spatial,
             components,
+            visual_primitive,
         };
         game_state.entities.insert(entity.id.clone(), entity);
     }
@@ -253,9 +259,9 @@ fn try_initialize_map_file(
 fn starter_unit_components(
     unit: &StarterUnitDefinition,
     registry: Option<&ModRegistry>,
-) -> Result<HashMap<String, Component>, String> {
+) -> Result<(HashMap<String, Component>, Option<String>), String> {
     let Some(mod_id) = unit.mod_id.as_deref() else {
-        return Ok(unit.components.clone());
+        return Ok((unit.components.clone(), None));
     };
     let registry = registry.ok_or_else(|| {
         format!(
@@ -288,7 +294,7 @@ fn starter_unit_components(
     labels.retain(|label| label != "P1" && label != "P2");
     labels.push(seat.to_string());
     components.insert("tags".to_string(), Component::Tags { labels });
-    Ok(components)
+    Ok((components, Some(template.visual_primitive.clone())))
 }
 
 fn starter_unit_seat(unit: &StarterUnitDefinition) -> Result<&'static str, String> {
