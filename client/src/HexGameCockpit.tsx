@@ -58,9 +58,12 @@ type ModProfileSummary = {
 const SOCKET_URL = "ws://127.0.0.1:8080";
 const WASM_MATCH_ID = "wasm_sandbox";
 const TAB_ID_STORAGE_KEY = "hexgamesim.tab-id";
-const NETWORK_SESSION_STORAGE_KEY = "hexgamesim.network-session-id";
+const ACTIVE_MATCH_ID_STORAGE_KEY = "active_match_id";
+const CACHED_MANAGER_ID_STORAGE_KEY = "cached_manager_id";
 const HEX_RADIUS = 1;
 const PILLAR_HEIGHT = 0.42;
+
+type RecoverySession = { matchId: string; managerId: string };
 
 function getTabId(): string {
   const existingTabId = window.sessionStorage.getItem(TAB_ID_STORAGE_KEY);
@@ -68,6 +71,13 @@ function getTabId(): string {
   const tabId = `tab_${window.crypto.randomUUID().replace(/-/g, "")}`;
   window.sessionStorage.setItem(TAB_ID_STORAGE_KEY, tabId);
   return tabId;
+}
+
+function readRecoverySession(): RecoverySession | null {
+  const matchId = window.sessionStorage.getItem(ACTIVE_MATCH_ID_STORAGE_KEY);
+  const managerId = window.sessionStorage.getItem(CACHED_MANAGER_ID_STORAGE_KEY);
+  if (!matchId || !managerId || matchId !== `browser_${managerId}`) return null;
+  return { matchId, managerId };
 }
 
 const formatNodeId = (id: string | null | undefined) => {
@@ -566,11 +576,17 @@ export default function HexGameCockpit() {
   const [localMatchId, setLocalMatchId] = useState<string | null>(null);
   const [remoteNodeId, setRemoteNodeId] = useState<string | null>(null);
   const [joinNodeId, setJoinNodeId] = useState("");
+  const [recoverySession, setRecoverySession] = useState<RecoverySession | null>(
+    readRecoverySession,
+  );
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const reconnectAttempts = useRef(0);
   const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
     let cancelled = false;
     let ws: WebSocket | null = null;
+    let retryTimer: number | undefined;
 
     if (mode === "wasm") {
       setSocket(null);
@@ -598,18 +614,26 @@ export default function HexGameCockpit() {
     }
 
     setConnection("connecting");
-    setNotice("Opening local engine stream");
-    const managerId = `${tabId}_${window.crypto.randomUUID().slice(0, 8)}`;
-    window.sessionStorage.setItem(NETWORK_SESSION_STORAGE_KEY, managerId);
-    ws = new WebSocket(SOCKET_URL);
-    const gatewaySocket = ws;
-    setSocket(gatewaySocket);
-    gatewaySocket.onopen = () => {
-      if (!cancelled) {
-        gatewaySocket.send(`SESSION_ID:${managerId}`);
-        setConnection("connected");
-        setNotice("Live engine stream connected");
-      }
+    const savedSession = readRecoverySession();
+    const managerId =
+      savedSession?.managerId ??
+      window.sessionStorage.getItem(CACHED_MANAGER_ID_STORAGE_KEY) ??
+      `${tabId}_${window.crypto.randomUUID().slice(0, 8)}`;
+    window.sessionStorage.setItem(CACHED_MANAGER_ID_STORAGE_KEY, managerId);
+    let activeMatchId = savedSession?.matchId ?? null;
+    let recoveredActionCount = 0;
+
+    const persistActiveSession = (matchId: string) => {
+      activeMatchId = matchId;
+      window.sessionStorage.setItem(ACTIVE_MATCH_ID_STORAGE_KEY, matchId);
+      window.sessionStorage.setItem(CACHED_MANAGER_ID_STORAGE_KEY, managerId);
+      setRecoverySession({ matchId, managerId });
+    };
+    const clearActiveSession = () => {
+      activeMatchId = null;
+      window.sessionStorage.removeItem(ACTIVE_MATCH_ID_STORAGE_KEY);
+      window.sessionStorage.removeItem(CACHED_MANAGER_ID_STORAGE_KEY);
+      setRecoverySession(null);
     };
     const requestInitialMapSnapshotFromCore = () => {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -623,78 +647,161 @@ export default function HexGameCockpit() {
         setNotice(`Initial map snapshot request failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
-    gatewaySocket.onmessage = (event) => {
+    const connect = () => {
       if (cancelled) return;
-      const message = String(event.data);
-      if (message.startsWith("HOST_ALLOCATED:") || message.startsWith("P2P_HOSTED:")) {
-        const prefix = message.startsWith("HOST_ALLOCATED:")
-          ? "HOST_ALLOCATED:"
-          : "P2P_HOSTED:";
-        const [allocatedId, matchId] = message.slice(prefix.length).split(":", 2);
-        if (!allocatedId || (prefix === "HOST_ALLOCATED:" && !matchId)) {
-          setNotice("Host allocation response did not include a valid connection ticket");
+      ws = new WebSocket(SOCKET_URL);
+      const gatewaySocket = ws;
+      setSocket(gatewaySocket);
+      gatewaySocket.onopen = () => {
+        if (cancelled) return;
+        try {
+          gatewaySocket.send(
+            activeMatchId
+              ? `RECONNECT_SESSION:${activeMatchId}:${managerId}`
+              : `SESSION_ID:${managerId}`,
+          );
+          setConnection("connected");
+          setNotice(
+            activeMatchId
+              ? "Reconnecting to the existing match session…"
+              : "Live engine stream connected",
+          );
+        } catch (error) {
+          setNotice(`Network session handshake failed: ${error instanceof Error ? error.message : String(error)}`);
+          gatewaySocket.close();
+        }
+      };
+      gatewaySocket.onmessage = (event) => {
+        if (cancelled) return;
+        const message = String(event.data);
+        if (message.startsWith("HOST_ALLOCATED:") || message.startsWith("P2P_HOSTED:")) {
+          const prefix = message.startsWith("HOST_ALLOCATED:")
+            ? "HOST_ALLOCATED:"
+            : "P2P_HOSTED:";
+          const [allocatedId, matchId] = message.slice(prefix.length).split(":", 2);
+          if (!allocatedId || (prefix === "HOST_ALLOCATED:" && !matchId)) {
+            setNotice("Host allocation response did not include a valid connection ticket");
+            return;
+          }
+          setLocalNodeId(allocatedId);
+          setLocalMatchId(matchId || null);
+          if (matchId) persistActiveSession(matchId);
+          setRemoteNodeId(null);
+          requestInitialMapSnapshotFromCore();
           return;
         }
-        setLocalNodeId(allocatedId);
-        setLocalMatchId(matchId || null);
-        setRemoteNodeId(null);
-        requestInitialMapSnapshotFromCore();
-        return;
-      }
-      if (message.startsWith("P2P_JOINED:")) {
-        const [, localId, remoteId] = message.split(":", 3);
-        setLocalNodeId(localId || null);
-        setRemoteNodeId(remoteId || null);
-        setNotice("Joined and synchronized with the host");
-        return;
-      }
-      if (message.startsWith("P2P_CONNECTED:")) {
-        setRemoteNodeId(message.slice("P2P_CONNECTED:".length) || null);
-        setNotice("Peer connected; action-token synchronization is active");
-        return;
-      }
-      if (message.startsWith("P2P_DISCONNECTED:")) {
-        setRemoteNodeId(null);
-        setNotice(`Peer disconnected: ${message.slice("P2P_DISCONNECTED:".length)}`);
-        return;
-      }
-      if (message === "P2P_RESET") {
-        setLocalNodeId(null);
-        setLocalMatchId(null);
-        setRemoteNodeId(null);
-        setJoinNodeId("");
-        setSelectedUnitId(null);
-        setInspectedEntity(null);
-        setNotice("Gateway session reset; fresh sandbox state loaded");
-        return;
-      }
-      if (message.startsWith("E:")) {
-        setNotice(message.slice(2));
-        return;
-      }
-      try {
-        setGameState(parseState(message));
-        setNotice("State synchronized");
-      } catch (error) {
-        setNotice(`Invalid engine response: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    };
-    gatewaySocket.onerror = () => {
-      if (!cancelled) setNotice("WebSocket error; check the local orchestrator");
-    };
-    gatewaySocket.onclose = () => {
-      if (!cancelled) {
+        if (message.startsWith("P2P_JOINED:")) {
+          const [, localId, remoteId] = message.split(":", 3);
+          setLocalNodeId(localId || null);
+          setRemoteNodeId(remoteId || null);
+          setLocalMatchId(null);
+          persistActiveSession(`browser_${managerId}`);
+          setNotice("Joined and synchronized with the host");
+          return;
+        }
+        if (message.startsWith("P2P_CONNECTED:")) {
+          setRemoteNodeId(message.slice("P2P_CONNECTED:".length) || null);
+          setNotice("Peer connected; action-token synchronization is active");
+          return;
+        }
+        if (message.startsWith("P2P_DISCONNECTED:")) {
+          setRemoteNodeId(null);
+          setNotice(`Peer disconnected: ${message.slice("P2P_DISCONNECTED:".length)}`);
+          return;
+        }
+        if (message.startsWith("ACTION_LOG:")) {
+          try {
+            const actionLog: unknown = JSON.parse(message.slice("ACTION_LOG:".length));
+            if (!Array.isArray(actionLog) || !actionLog.every((action) => typeof action === "string")) {
+              throw new Error("Gateway returned an invalid action log");
+            }
+            recoveredActionCount = actionLog.length;
+          } catch (error) {
+            setNotice(`Could not restore action history: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          return;
+        }
+        if (message.startsWith("P2P_RECONNECTED:")) {
+          const [, matchId, localId, remoteId, role] = message.split(":", 5);
+          if (matchId) persistActiveSession(matchId);
+          setLocalNodeId(localId || null);
+          setRemoteNodeId(remoteId || null);
+          setLocalMatchId(role === "HOST" ? matchId || null : null);
+          setConnection("connected");
+          setRecoverySession(null);
+          reconnectAttempts.current = 0;
+          setNotice(
+            `Reconnected; restored match state and ${recoveredActionCount} recorded action${recoveredActionCount === 1 ? "" : "s"}`,
+          );
+          return;
+        }
+        if (message === "P2P_RESET") {
+          clearActiveSession();
+          setLocalNodeId(null);
+          setLocalMatchId(null);
+          setRemoteNodeId(null);
+          setJoinNodeId("");
+          setSelectedUnitId(null);
+          setInspectedEntity(null);
+          setNotice("Gateway session reset; fresh sandbox state loaded");
+          return;
+        }
+        if (message === "E:SESSION_EXPIRED") {
+          clearActiveSession();
+          setLocalNodeId(null);
+          setLocalMatchId(null);
+          setRemoteNodeId(null);
+          setNotice("The previous match session expired; reconnecting with a fresh session");
+          gatewaySocket.close();
+          return;
+        }
+        if (message.startsWith("E:")) {
+          setNotice(message.slice(2));
+          return;
+        }
+        try {
+          setGameState(parseState(message));
+          setNotice("State synchronized");
+        } catch (error) {
+          setNotice(`Invalid engine response: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      };
+      gatewaySocket.onerror = () => {
+        if (!cancelled) setNotice("WebSocket error; retaining session details and retrying");
+      };
+      gatewaySocket.onclose = () => {
+        if (cancelled) return;
         setConnection("offline");
-        setSocket(null);
-        setNotice("Engine stream disconnected");
-      }
+        setSocket((activeSocket) => activeSocket === gatewaySocket ? null : activeSocket);
+        const storedSession = readRecoverySession();
+        if (storedSession) setRecoverySession(storedSession);
+        setNotice(
+          storedSession
+            ? "Unexpected disconnect; preserving match details and retrying…"
+            : "Engine stream disconnected; retrying…",
+        );
+        const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempts.current, 5));
+        reconnectAttempts.current += 1;
+        retryTimer = window.setTimeout(() => {
+          setConnectionAttempt((attempt) => attempt + 1);
+        }, delay);
+      };
     };
+
+    if (savedSession) {
+      setRecoverySession(savedSession);
+      setNotice("Restoring the previous network match session…");
+    } else {
+      setNotice("Opening local engine stream");
+    }
+    connect();
     return () => {
       cancelled = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       ws?.close();
       setSocket((activeSocket) => activeSocket === ws ? null : activeSocket);
     };
-  }, [mode, tabId]);
+  }, [mode, tabId, connectionAttempt]);
 
   const entities = useMemo(() => entitiesFromState(gameState), [gameState]);
   const terrain = useMemo(
@@ -894,6 +1001,32 @@ export default function HexGameCockpit() {
     sendNetworkControl(`JOIN:${hostNodeId}@${hostMatchId}`);
   };
 
+  const handleGracefulReconnection = () => {
+    const cachedSession = readRecoverySession();
+    if (!cachedSession) {
+      setRecoverySession(null);
+      setNotice("No recoverable match session is available in this tab");
+      return;
+    }
+    setRecoverySession(cachedSession);
+    setNotice(`Rebinding to match ${cachedSession.matchId}…`);
+    if (mode !== "network") {
+      setMode("network");
+      return;
+    }
+    if (socket?.readyState === WebSocket.OPEN) {
+      try {
+        socket.send(
+          `RECONNECT_SESSION:${cachedSession.matchId}:${cachedSession.managerId}`,
+        );
+        return;
+      } catch (error) {
+        setNotice(`Graceful reconnection failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    setConnectionAttempt((attempt) => attempt + 1);
+  };
+
   const triggerFreshMapSnapshotLoad = (gatewayResetRequested: boolean) => {
     if (mode === "network") {
       if (gatewayResetRequested) {
@@ -925,12 +1058,15 @@ export default function HexGameCockpit() {
     let gatewayResetRequested = false;
     if (socket && socket.readyState === WebSocket.OPEN) {
       try {
-        socket.send("DISCONNECT_SESSION_TOKEN");
+        socket.send("HARD_RESET_SESSION");
         gatewayResetRequested = true;
       } catch (error) {
         setNotice(`Gateway reset request failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    window.sessionStorage.removeItem(ACTIVE_MATCH_ID_STORAGE_KEY);
+    window.sessionStorage.removeItem(CACHED_MANAGER_ID_STORAGE_KEY);
+    setRecoverySession(null);
     setLocalNodeId(null);
     setLocalMatchId(null);
     setRemoteNodeId(null);
@@ -993,6 +1129,42 @@ export default function HexGameCockpit() {
           </span>
         </div>
       </header>
+
+      {recoverySession && (
+        <aside
+          role="alert"
+          style={{
+            margin: "12px 0",
+            padding: "12px 16px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            border: "1px solid #b45309",
+            borderRadius: 8,
+            background: "#fff7ed",
+            color: "#7c2d12",
+            fontWeight: 700,
+          }}
+        >
+          <span>⚠️ Unexpected Disconnect Detected from Match {recoverySession.matchId}</span>
+          <button
+            type="button"
+            onClick={handleGracefulReconnection}
+            style={{
+              padding: "8px 12px",
+              border: 0,
+              borderRadius: 6,
+              background: "#b45309",
+              color: "#fff",
+              cursor: "pointer",
+              fontWeight: 700,
+            }}
+          >
+            🔌 Attempt Graceful Reconnection
+          </button>
+        </aside>
+      )}
 
       <section style={styles.toolbar} aria-live="polite">
         <span style={styles.notice}>{notice}</span>
