@@ -74,6 +74,15 @@ impl NetworkManager {
     }
 
     pub async fn join_match(&self, remote_node_id: &str) -> Result<(), String> {
+        self.join_match_for_match(remote_node_id, &self.match_id)
+            .await
+    }
+
+    pub async fn join_match_for_match(
+        &self,
+        remote_node_id: &str,
+        remote_match_id: &str,
+    ) -> Result<(), String> {
         let mut session = self.session.write().await;
         if session.is_some() {
             return Err("This manager already has an active match session".to_string());
@@ -84,7 +93,7 @@ impl NetworkManager {
                 .map_err(|error| format!("Could not join match: {error}"))?,
         );
         joined
-            .authenticate_player(&self.match_id, "Player_2")
+            .authenticate_player_for_match(remote_match_id, &self.match_id, "Player_2")
             .await
             .map_err(|error| format!("Could not synchronize match state: {error}"))?;
         *session = Some(joined);
@@ -293,18 +302,30 @@ impl MatchSession {
         match_id: &str,
         player_tag: &str,
     ) -> Result<String, NetworkError> {
+        self.authenticate_player_for_match(match_id, match_id, player_tag)
+            .await
+    }
+
+    pub async fn authenticate_player_for_match(
+        &self,
+        remote_match_id: &str,
+        local_match_id: &str,
+        player_tag: &str,
+    ) -> Result<String, NetworkError> {
         if self.is_host {
             return Err(NetworkError(
                 "Host sessions authenticate through accept_peer".into(),
             ));
         }
         let connection = self.active_connection().await?;
-        let snapshot = authenticate_connection(&connection, match_id, player_tag).await?;
+        let snapshot =
+            authenticate_connection(&connection, remote_match_id, local_match_id, player_tag)
+                .await?;
         *self
             .player_session
             .lock()
             .map_err(|_| NetworkError("Player session lock poisoned".into()))? =
-            Some((match_id.to_string(), player_tag.to_string()));
+            Some((remote_match_id.to_string(), player_tag.to_string()));
         Ok(snapshot)
     }
 
@@ -333,7 +354,7 @@ impl MatchSession {
             )
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
-        let snapshot = authenticate_connection(&connection, match_id, player_tag).await?;
+        let snapshot = authenticate_connection(&connection, match_id, match_id, player_tag).await?;
         *self.connection.write().await = Some(connection);
         *self.remote_node_id.write().await = Some(target_host_id.to_string());
         *self
@@ -497,10 +518,11 @@ async fn receive_packet(connection: &Connection, max_size: usize) -> Result<Stri
 
 async fn authenticate_connection(
     connection: &Connection,
-    match_id: &str,
+    remote_match_id: &str,
+    local_match_id: &str,
     player_tag: &str,
 ) -> Result<String, NetworkError> {
-    let auth = format!("AUTH:{match_id}:{player_tag}");
+    let auth = format!("AUTH:{remote_match_id}:{player_tag}");
     if let Err(error) = send_packet(connection, &auth).await {
         return Err(error);
     }
@@ -513,7 +535,9 @@ async fn authenticate_connection(
         }
         Err(error) => return Err(error),
     };
-    if let Err(error) = engine::restore_match_snapshot(match_id, &snapshot) {
+    if let Err(error) =
+        engine::restore_match_snapshot_as(local_match_id, remote_match_id, &snapshot)
+    {
         return Err(NetworkError(error));
     }
     Ok(snapshot)

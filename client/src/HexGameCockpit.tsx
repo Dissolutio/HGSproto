@@ -57,8 +57,18 @@ type ModProfileSummary = {
 
 const SOCKET_URL = "ws://127.0.0.1:8080";
 const WASM_MATCH_ID = "wasm_sandbox";
+const TAB_ID_STORAGE_KEY = "hexgamesim.tab-id";
+const NETWORK_SESSION_STORAGE_KEY = "hexgamesim.network-session-id";
 const HEX_RADIUS = 1;
 const PILLAR_HEIGHT = 0.42;
+
+function getTabId(): string {
+  const existingTabId = window.sessionStorage.getItem(TAB_ID_STORAGE_KEY);
+  if (existingTabId) return existingTabId;
+  const tabId = `tab_${window.crypto.randomUUID().replace(/-/g, "")}`;
+  window.sessionStorage.setItem(TAB_ID_STORAGE_KEY, tabId);
+  return tabId;
+}
 
 const formatNodeId = (id: string | null | undefined) => {
   if (!id) return "None";
@@ -542,6 +552,7 @@ function HexScene({
 }
 
 export default function HexGameCockpit() {
+  const [tabId] = useState(getTabId);
   const [mode, setMode] = useState<Mode>("wasm");
   const [gameState, setGameState] = useState<EngineState | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
@@ -552,6 +563,7 @@ export default function HexGameCockpit() {
   const [modProfileText, setModProfileText] = useState("");
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
   const [localNodeId, setLocalNodeId] = useState<string | null>(null);
+  const [localMatchId, setLocalMatchId] = useState<string | null>(null);
   const [remoteNodeId, setRemoteNodeId] = useState<string | null>(null);
   const [joinNodeId, setJoinNodeId] = useState("");
   const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
@@ -587,10 +599,14 @@ export default function HexGameCockpit() {
 
     setConnection("connecting");
     setNotice("Opening local engine stream");
+    const managerId = `${tabId}_${window.crypto.randomUUID().slice(0, 8)}`;
+    window.sessionStorage.setItem(NETWORK_SESSION_STORAGE_KEY, managerId);
     ws = new WebSocket(SOCKET_URL);
-    setSocket(ws);
-    ws.onopen = () => {
+    const gatewaySocket = ws;
+    setSocket(gatewaySocket);
+    gatewaySocket.onopen = () => {
       if (!cancelled) {
+        gatewaySocket.send(`SESSION_ID:${managerId}`);
         setConnection("connected");
         setNotice("Live engine stream connected");
       }
@@ -607,19 +623,20 @@ export default function HexGameCockpit() {
         setNotice(`Initial map snapshot request failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
-    ws.onmessage = (event) => {
+    gatewaySocket.onmessage = (event) => {
       if (cancelled) return;
       const message = String(event.data);
       if (message.startsWith("HOST_ALLOCATED:") || message.startsWith("P2P_HOSTED:")) {
         const prefix = message.startsWith("HOST_ALLOCATED:")
           ? "HOST_ALLOCATED:"
           : "P2P_HOSTED:";
-        const allocatedId = message.slice(prefix.length);
-        if (!allocatedId) {
-          setNotice("Host allocation response did not include a Node ID");
+        const [allocatedId, matchId] = message.slice(prefix.length).split(":", 2);
+        if (!allocatedId || (prefix === "HOST_ALLOCATED:" && !matchId)) {
+          setNotice("Host allocation response did not include a valid connection ticket");
           return;
         }
         setLocalNodeId(allocatedId);
+        setLocalMatchId(matchId || null);
         setRemoteNodeId(null);
         requestInitialMapSnapshotFromCore();
         return;
@@ -643,6 +660,7 @@ export default function HexGameCockpit() {
       }
       if (message === "P2P_RESET") {
         setLocalNodeId(null);
+        setLocalMatchId(null);
         setRemoteNodeId(null);
         setJoinNodeId("");
         setSelectedUnitId(null);
@@ -661,10 +679,10 @@ export default function HexGameCockpit() {
         setNotice(`Invalid engine response: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
-    ws.onerror = () => {
+    gatewaySocket.onerror = () => {
       if (!cancelled) setNotice("WebSocket error; check the local orchestrator");
     };
-    ws.onclose = () => {
+    gatewaySocket.onclose = () => {
       if (!cancelled) {
         setConnection("offline");
         setSocket(null);
@@ -676,7 +694,7 @@ export default function HexGameCockpit() {
       ws?.close();
       setSocket((activeSocket) => activeSocket === ws ? null : activeSocket);
     };
-  }, [mode]);
+  }, [mode, tabId]);
 
   const entities = useMemo(() => entitiesFromState(gameState), [gameState]);
   const terrain = useMemo(
@@ -867,12 +885,13 @@ export default function HexGameCockpit() {
   const handleHostMatch = () => sendNetworkControl("HOST");
 
   const handleJoinMatch = () => {
-    const hostNodeId = joinNodeId.trim();
-    if (!hostNodeId) {
-      setNotice("Enter the host's Iroh Node ID");
+    const ticket = joinNodeId.trim();
+    const [hostNodeId, hostMatchId, extra] = ticket.split("@");
+    if (!hostNodeId || !hostMatchId || extra !== undefined) {
+      setNotice("Paste the complete host connection ticket (Node ID@match ID)");
       return;
     }
-    sendNetworkControl(`JOIN:${hostNodeId}`);
+    sendNetworkControl(`JOIN:${hostNodeId}@${hostMatchId}`);
   };
 
   const triggerFreshMapSnapshotLoad = (gatewayResetRequested: boolean) => {
@@ -913,6 +932,7 @@ export default function HexGameCockpit() {
       }
     }
     setLocalNodeId(null);
+    setLocalMatchId(null);
     setRemoteNodeId(null);
     setJoinNodeId("");
     setSelectedUnitId(null);
@@ -1111,25 +1131,25 @@ export default function HexGameCockpit() {
             >
               Host Match
             </button>
-            {localNodeId && (
+            {localNodeId && localMatchId && (
               <label style={styles.modLoaderLabel} htmlFor="local-iroh-node-id">
-                Your Iroh connection string / Node ID
+                Your connection ticket (copy for the other tab)
                 <input
                   id="local-iroh-node-id"
                   readOnly
-                  value={localNodeId}
+                  value={`${localNodeId}@${localMatchId}`}
                   onFocus={(event) => event.currentTarget.select()}
                   style={styles.networkInput}
                 />
               </label>
             )}
             <label style={styles.modLoaderLabel} htmlFor="remote-iroh-node-id">
-              Host Node ID
+              Host connection ticket
               <input
                 id="remote-iroh-node-id"
                 value={joinNodeId}
                 onChange={(event) => setJoinNodeId(event.target.value)}
-                placeholder="Paste the host's Iroh Node ID"
+                placeholder="Node ID@match ID"
                 style={styles.networkInput}
               />
             </label>

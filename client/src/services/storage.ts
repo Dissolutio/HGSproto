@@ -28,8 +28,8 @@ export async function saveUserData(key: string, value: any): Promise<void> {
     await store.set(key, value);
     await store.save(); // Force Rust to flush the buffer to disk
   } else {
-    // 🌐 Web Browser Mode: Fallback to sandboxed localStorage
-    localStorage.setItem(key, JSON.stringify(value));
+    // 🌐 Web Browser Mode: Keep cached state isolated to the current tab
+    sessionStorage.setItem(key, JSON.stringify(value));
   }
 }
 
@@ -42,7 +42,7 @@ export async function loadUserData(key: string): Promise<any | null> {
   if (store) {
     return await store.get(key);
   } else {
-    const data = localStorage.getItem(key);
+    const data = sessionStorage.getItem(key);
     return data ? JSON.parse(data) : null;
   }
 }

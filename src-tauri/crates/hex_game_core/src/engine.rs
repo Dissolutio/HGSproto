@@ -102,6 +102,15 @@ pub fn store_match(match_id: String, state: GameState) {
     }
 }
 
+pub fn remove_match(match_id: &str) {
+    if let Ok(mut matches) = ACTIVE_MATCHES.lock() {
+        matches.remove(match_id);
+    }
+    if let Ok(mut sessions) = ACTIVE_PLAYER_SESSIONS.lock() {
+        sessions.remove(match_id);
+    }
+}
+
 pub fn get_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Vec<(i32, i32)> {
     let templates_list = crate::templates::get_template_offsets(inventory_id);
     templates_list
@@ -382,6 +391,21 @@ pub fn restore_match_snapshot(match_id: &str, snapshot: &str) -> Result<(), Stri
     if state.context.match_id != match_id {
         return Err("Snapshot match ID does not match the requested match".into());
     }
+    store_match(match_id.to_string(), state);
+    Ok(())
+}
+
+pub fn restore_match_snapshot_as(
+    match_id: &str,
+    expected_match_id: &str,
+    snapshot: &str,
+) -> Result<(), String> {
+    let mut state: GameState = serde_json::from_str(snapshot)
+        .map_err(|error| format!("Invalid match snapshot: {error}"))?;
+    if state.context.match_id != expected_match_id {
+        return Err("Snapshot match ID does not match the expected host match".into());
+    }
+    state.context.match_id = match_id.to_string();
     store_match(match_id.to_string(), state);
     Ok(())
 }
