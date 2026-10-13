@@ -1,7 +1,7 @@
 use crate::mod_registry::ModRegistry;
 use crate::models::{
     Component, Entity, GameState, HexoscapeMapFile, MatchContext, SpatialPosition,
-    StarterUnitDefinition,
+    StarterUnitDefinition, TurnPhase,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -58,8 +58,10 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
     GameState {
         context: MatchContext {
             match_id,
-            active_player: "Player_1".to_string(),
-            turn_phase: "Action".to_string(),
+            active_player: "P1".to_string(),
+            turn_phase: TurnPhase::Movement,
+            setup_locked: false,
+            winner: None,
         },
         entities,
     }
@@ -171,8 +173,10 @@ fn try_initialize_map_file(
     let mut game_state = GameState {
         context: MatchContext {
             match_id: match_id.clone(),
-            active_player: "Player_1".to_string(),
-            turn_phase: "Action".to_string(),
+            active_player: "P1".to_string(),
+            turn_phase: TurnPhase::Movement,
+            setup_locked: false,
+            winner: None,
         },
         entities: HashMap::new(),
     };
@@ -381,6 +385,12 @@ pub fn deploy_profile_unit(
     let state = matches
         .get_mut(match_id)
         .ok_or_else(|| format!("Unknown match: {match_id}"))?;
+    if state.context.setup_locked
+        || state.context.turn_phase == TurnPhase::Finished
+        || state.context.winner.is_some()
+    {
+        return Err("Roster deployment is only allowed before the first referee action".into());
+    }
     let existing = state
         .entities
         .get(slot_unit_id)
@@ -406,6 +416,7 @@ pub fn deploy_profile_unit(
         mod_id: Some(mod_id.to_string()),
     };
     state.entities.insert(slot_unit_id.to_string(), deployed);
+    evaluate_victory(state);
     Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
 }
 
@@ -472,11 +483,12 @@ pub fn release_player_session(match_id: &str, player_tag: &str) {
 }
 
 pub fn restore_match_snapshot(match_id: &str, snapshot: &str) -> Result<(), String> {
-    let state: GameState = serde_json::from_str(snapshot)
+    let mut state: GameState = serde_json::from_str(snapshot)
         .map_err(|error| format!("Invalid match snapshot: {error}"))?;
     if state.context.match_id != match_id {
         return Err("Snapshot match ID does not match the requested match".into());
     }
+    evaluate_victory(&mut state);
     store_match(match_id.to_string(), state);
     Ok(())
 }
@@ -492,6 +504,7 @@ pub fn restore_match_snapshot_as(
         return Err("Snapshot match ID does not match the expected host match".into());
     }
     state.context.match_id = match_id.to_string();
+    evaluate_victory(&mut state);
     store_match(match_id.to_string(), state);
     Ok(())
 }
@@ -505,8 +518,8 @@ pub fn match_exists(match_id: &str) -> bool {
     }
 }
 
-/// Applies a move (`M:`) or attack (`A:`) token to a match snapshot.
-pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
+#[cfg(test)]
+fn apply_sandbox_action(state: &mut GameState, action: &str) -> Result<(), String> {
     if action.starts_with("A:") {
         return apply_attack(state, action);
     }
@@ -563,6 +576,7 @@ pub fn apply_action(state: &mut GameState, action: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_attack(state: &mut GameState, action: &str) -> Result<(), String> {
     let payload = action
         .strip_prefix("A:")
@@ -621,8 +635,9 @@ fn is_unit(entity: &Entity) -> bool {
     })
 }
 
-/// Applies an action to a registered match.
-pub fn process_action(match_id: &str, action: &str) -> Result<(), String> {
+/// Applies a rules-enforced action to a registered match for the claimed seat.
+pub fn process_action(match_id: &str, acting_seat: &str, action: &str) -> Result<(), String> {
+    let acting_seat = normalize_seat(acting_seat)?;
     let mut matches = ACTIVE_MATCHES
         .lock()
         .map_err(|_| "Match registry is unavailable".to_string())?;
@@ -630,7 +645,246 @@ pub fn process_action(match_id: &str, action: &str) -> Result<(), String> {
         .get_mut(match_id)
         .ok_or_else(|| format!("Unknown match: {match_id}"))?;
 
-    apply_action(state, action)
+    apply_referee_action(state, acting_seat, action)
+}
+
+fn normalize_seat(seat: &str) -> Result<&'static str, String> {
+    match seat {
+        "P1" | "Player_1" => Ok("P1"),
+        "P2" | "Player_2" => Ok("P2"),
+        _ => Err(format!("Unknown player seat: {seat}")),
+    }
+}
+
+fn unit_seat(entity: &Entity) -> Result<&'static str, String> {
+    let labels = entity
+        .components
+        .values()
+        .find_map(|component| match component {
+            Component::Tags { labels } if labels.iter().any(|label| label == "Unit") => {
+                Some(labels)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("Entity is not a unit: {}", entity.id))?;
+    match (
+        labels.iter().any(|label| label == "P1"),
+        labels.iter().any(|label| label == "P2"),
+    ) {
+        (true, false) => Ok("P1"),
+        (false, true) => Ok("P2"),
+        _ => Err(format!("Unit {} must have exactly one seat tag", entity.id)),
+    }
+}
+
+fn hex_distance(left: &SpatialPosition, right: &SpatialPosition) -> i64 {
+    let dq = (i64::from(left.q) - i64::from(right.q)).abs();
+    let dr = (i64::from(left.r) - i64::from(right.r)).abs();
+    let left_s = -i64::from(left.q) - i64::from(left.r);
+    let right_s = -i64::from(right.q) - i64::from(right.r);
+    let ds = (left_s - right_s).abs();
+    (dq + dr + ds) / 2
+}
+
+fn apply_referee_action(
+    state: &mut GameState,
+    acting_seat: &str,
+    action: &str,
+) -> Result<(), String> {
+    if state.context.turn_phase == TurnPhase::Finished || state.context.winner.is_some() {
+        return Err("Match is finished".to_string());
+    }
+    let active_seat = normalize_seat(&state.context.active_player).map_err(|_| {
+        format!(
+            "Match has an invalid active seat: {}",
+            state.context.active_player
+        )
+    })?;
+    if active_seat != acting_seat {
+        return Err(format!(
+            "Out-of-turn action: {acting_seat} cannot act while {} is active",
+            active_seat
+        ));
+    }
+    match state.context.turn_phase {
+        TurnPhase::Movement => {
+            if action == "S" {
+                state.context.turn_phase = TurnPhase::Attack;
+            } else {
+                let (entity_id, destination) = action
+                    .strip_prefix("M:")
+                    .and_then(|payload| payload.split_once(':'))
+                    .ok_or_else(|| "Movement phase accepts M: or S (skip movement)".to_string())?;
+                if entity_id.is_empty() || destination.is_empty() || destination.contains(':') {
+                    return Err("Invalid movement action token".to_string());
+                }
+                let position = parse_spatial_position(destination)?;
+                let entity = state
+                    .entities
+                    .get(entity_id)
+                    .ok_or_else(|| format!("Unknown entity: {entity_id}"))?;
+                if !is_unit(entity) {
+                    return Err(format!("Entity is not a movable unit: {entity_id}"));
+                }
+                if unit_seat(entity)? != acting_seat {
+                    return Err(format!(
+                        "Unit {entity_id} does not belong to active seat {acting_seat}"
+                    ));
+                }
+                if entity.spatial.z != position.z || hex_distance(&entity.spatial, &position) != 1 {
+                    return Err(
+                        "Movement must be exactly one adjacent hex on the same level".into(),
+                    );
+                }
+                let is_board_hex = state.entities.values().any(|entity| {
+                    entity.spatial.q == position.q
+                        && entity.spatial.r == position.r
+                        && entity.spatial.z == position.z
+                        && entity.components.values().any(|component| {
+                            matches!(
+                                component,
+                                Component::Terrain { .. } | Component::TerrainType { .. }
+                            )
+                        })
+                });
+                if !is_board_hex {
+                    return Err("Destination is not a board hex".into());
+                }
+                let is_occupied = state.entities.iter().any(|(id, entity)| {
+                    id != entity_id
+                        && is_unit(entity)
+                        && entity.spatial.q == position.q
+                        && entity.spatial.r == position.r
+                        && entity.spatial.z == position.z
+                });
+                if is_occupied {
+                    return Err("Destination tile is already occupied by a unit".into());
+                }
+                state
+                    .entities
+                    .get_mut(entity_id)
+                    .ok_or_else(|| format!("Unknown entity: {entity_id}"))?
+                    .spatial = position;
+                state.context.turn_phase = TurnPhase::Attack;
+            }
+        }
+        TurnPhase::Attack => {
+            if action == "S" {
+                state.context.turn_phase = TurnPhase::End;
+            } else {
+                let (attacker_id, target_id) = parse_attack_action(action)?;
+                let attacker = state
+                    .entities
+                    .get(attacker_id)
+                    .ok_or_else(|| format!("Unknown attacker: {attacker_id}"))?;
+                if !is_unit(attacker) {
+                    return Err(format!("Entity is not an attacking unit: {attacker_id}"));
+                }
+                if unit_seat(attacker)? != acting_seat {
+                    return Err(format!(
+                        "Attacker {attacker_id} does not belong to active seat {acting_seat}"
+                    ));
+                }
+                let target = state
+                    .entities
+                    .get(target_id)
+                    .ok_or_else(|| format!("Unknown target: {target_id}"))?;
+                if !is_unit(target) {
+                    return Err(format!("Target is not an enemy unit: {target_id}"));
+                }
+                let target_seat = unit_seat(target)?;
+                if target_seat == acting_seat {
+                    return Err(format!("Target {target_id} belongs to the attacking seat"));
+                }
+                if attacker.spatial.z != target.spatial.z
+                    || hex_distance(&attacker.spatial, &target.spatial) != 1
+                {
+                    return Err("Attacks require an adjacent enemy on the same level".into());
+                }
+                if !target
+                    .components
+                    .values()
+                    .any(|component| matches!(component, Component::Destructible { .. }))
+                {
+                    return Err(format!("Target is not destructible: {target_id}"));
+                }
+                let target = state
+                    .entities
+                    .get_mut(target_id)
+                    .ok_or_else(|| format!("Unknown target: {target_id}"))?;
+                let destructible = target
+                    .components
+                    .values_mut()
+                    .find_map(|component| match component {
+                        Component::Destructible { current_life, .. } => Some(current_life),
+                        _ => None,
+                    })
+                    .unwrap();
+                *destructible = destructible.saturating_sub(1);
+                if *destructible <= 0 {
+                    state.entities.remove(target_id);
+                }
+                state.context.turn_phase = TurnPhase::End;
+            }
+        }
+        TurnPhase::End => {
+            if action != "E" {
+                return Err("End phase accepts only E (end turn)".into());
+            }
+            state.context.active_player = if acting_seat == "P1" { "P2" } else { "P1" }.into();
+            state.context.turn_phase = TurnPhase::Movement;
+        }
+        TurnPhase::Finished => return Err("Match is finished".into()),
+    }
+
+    state.context.setup_locked = true;
+    evaluate_victory(state);
+    Ok(())
+}
+
+fn parse_attack_action(action: &str) -> Result<(&str, &str), String> {
+    let payload = action
+        .strip_prefix("A:")
+        .ok_or_else(|| "Attack phase accepts A:attacker:target or S (skip attack)".to_string())?;
+    let mut fields = payload.split(':');
+    let attacker_id = fields.next().unwrap_or_default();
+    let target_id = fields.next().unwrap_or_default();
+    if attacker_id.is_empty() || target_id.is_empty() || fields.next().is_some() {
+        return Err("Attack token must be A:attacker:target with no client damage value".into());
+    }
+    Ok((attacker_id, target_id))
+}
+
+fn evaluate_victory(state: &mut GameState) {
+    let living_count = |seat: &str| {
+        state
+            .entities
+            .values()
+            .filter(|entity| {
+                is_unit(entity)
+                    && unit_seat(entity).ok() == Some(seat)
+                    && entity.components.values().all(|component| match component {
+                        Component::Destructible { current_life, .. }
+                        | Component::LifePoints {
+                            current: current_life,
+                            ..
+                        } => *current_life > 0,
+                        _ => true,
+                    })
+            })
+            .count()
+    };
+    let p1_alive = living_count("P1") > 0;
+    let p2_alive = living_count("P2") > 0;
+    let winner = match (p1_alive, p2_alive) {
+        (true, false) => Some("P1"),
+        (false, true) => Some("P2"),
+        _ => None,
+    };
+    if let Some(winner) = winner {
+        state.context.winner = Some(winner.to_string());
+        state.context.turn_phase = TurnPhase::Finished;
+    }
 }
 
 fn parse_spatial_position(value: &str) -> Result<SpatialPosition, String> {
@@ -846,7 +1100,7 @@ mod tests {
 
         let first_position = {
             let matches = ACTIVE_MATCHES.lock().unwrap();
-            matches[&match_id].entities["UNIT_P1_1"].spatial.clone()
+            matches[&match_id].entities["UNIT_P1_2"].spatial.clone()
         };
         assert_eq!(
             deploy_profile_unit(
@@ -862,7 +1116,7 @@ mod tests {
         );
         deploy_profile_unit(
             &match_id,
-            "UNIT_P2_1",
+            "HERO_P2",
             "com.example.goliath",
             "P2",
             12,
@@ -929,44 +1183,42 @@ mod tests {
             before_invalid_deploy
         );
 
-        let open_hex = {
-            let matches = ACTIVE_MATCHES.lock().unwrap();
-            let state = &matches[&match_id];
-            state
-                .entities
-                .values()
-                .filter(|entity| {
-                    entity.components.values().any(|component| {
-                        matches!(
-                            component,
-                            Component::Terrain { .. } | Component::TerrainType { .. }
-                        )
-                    })
-                })
-                .map(|entity| entity.spatial.clone())
-                .find(|position| {
-                    !state.entities.values().any(|entity| {
-                        is_unit(entity)
-                            && entity.spatial.q == position.q
-                            && entity.spatial.r == position.r
-                            && entity.spatial.z == position.z
-                    })
-                })
-                .unwrap()
-        };
+        let open_hex = SpatialPosition { q: 0, r: 2, z: 0 };
         process_action(
             &match_id,
-            &format!("M:UNIT_P1_1:Q{}R{}Z{}", open_hex.q, open_hex.r, open_hex.z),
+            "P1",
+            &format!("M:UNIT_P1_2:Q{}R{}Z{}", open_hex.q, open_hex.r, open_hex.z),
         )
         .unwrap();
-        process_action(&match_id, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
+        let before_locked_deployment = {
+            let matches = ACTIVE_MATCHES.lock().unwrap();
+            serde_json::to_value(&matches[&match_id]).unwrap()
+        };
+        assert!(
+            deploy_profile_unit(
+                &match_id,
+                "UNIT_P1_1",
+                "com.example.goliath",
+                "P1",
+                12,
+                &registry,
+            )
+            .unwrap_err()
+            .contains("before the first referee action")
+        );
+        assert_eq!(
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap(),
+            before_locked_deployment
+        );
+        process_action(&match_id, "P1", "A:UNIT_P1_1:HERO_P2").unwrap();
         let matches = ACTIVE_MATCHES.lock().unwrap();
         let player_one = &matches[&match_id].entities["UNIT_P1_1"];
-        let player_two = &matches[&match_id].entities["UNIT_P2_1"];
-        assert_eq!(player_one.spatial.q, open_hex.q);
-        assert_eq!(player_one.spatial.r, open_hex.r);
+        let moved_unit = &matches[&match_id].entities["UNIT_P1_2"];
+        let player_two = &matches[&match_id].entities["HERO_P2"];
+        assert_eq!(moved_unit.spatial.q, open_hex.q);
+        assert_eq!(moved_unit.spatial.r, open_hex.r);
         assert_ne!(
-            (player_one.spatial.q, player_one.spatial.r),
+            (moved_unit.spatial.q, moved_unit.spatial.r),
             (first_position.q, first_position.r)
         );
         assert_eq!(player_one.display_name.as_deref(), Some("Goliath"));
@@ -981,7 +1233,7 @@ mod tests {
         assert!(matches!(
             player_two.components.get("destructible"),
             Some(Component::Destructible {
-                current_life: 9,
+                current_life: 11,
                 max_life: 12
             })
         ));
@@ -1091,7 +1343,7 @@ mod tests {
             occupied_unit_position.q, occupied_unit_position.r, occupied_unit_position.z
         );
         let mut state_for_move = state.clone();
-        assert!(apply_action(&mut state_for_move, &token).is_err());
+        assert!(apply_sandbox_action(&mut state_for_move, &token).is_err());
         assert_eq!(
             (
                 state_for_move.entities["UNIT_P1_1"].spatial.q,
@@ -1131,7 +1383,7 @@ mod tests {
             free_terrain_position.q, free_terrain_position.r, free_terrain_position.z
         );
         let mut state_for_legal_move = state.clone();
-        apply_action(&mut state_for_legal_move, &legal_move).unwrap();
+        apply_sandbox_action(&mut state_for_legal_move, &legal_move).unwrap();
         assert_eq!(
             (
                 state_for_legal_move.entities["UNIT_P1_1"].spatial.q,
@@ -1185,7 +1437,7 @@ mod tests {
     #[test]
     fn move_action_updates_unit_position_on_board() {
         let mut state = generate_test_sandbox("test".to_string());
-        apply_action(&mut state, "M:UNIT_P1_1:Q0R0Z0").unwrap();
+        apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q0R0Z0").unwrap();
 
         let position = &state.entities["UNIT_P1_1"].spatial;
         assert_eq!((position.q, position.r, position.z), (0, 0, 0));
@@ -1195,7 +1447,7 @@ mod tests {
     fn test_combat_attack_deducts_life_and_destroys_unit() {
         let mut state = generate_test_sandbox("combat_test".to_string());
 
-        apply_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:2").unwrap();
+        apply_sandbox_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:2").unwrap();
         assert!(matches!(
             state.entities["UNIT_P2_1"].components.get("destructible"),
             Some(Component::Destructible {
@@ -1204,22 +1456,22 @@ mod tests {
             })
         ));
 
-        apply_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
+        apply_sandbox_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
         assert!(!state.entities.contains_key("UNIT_P2_1"));
     }
 
     #[test]
     fn move_action_allows_unit_to_remain_on_its_current_hex() {
         let mut state = generate_test_sandbox("test".to_string());
-        apply_action(&mut state, "M:UNIT_P1_1:Q-1R0Z0").unwrap();
+        apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q-1R0Z0").unwrap();
     }
 
     #[test]
     fn move_action_rejects_occupied_or_off_board_destinations() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_action(&mut state, "M:UNIT_P1_1:Q-1R1Z0").is_err());
-        assert!(apply_action(&mut state, "M:UNIT_P1_1:Q9R9Z0").is_err());
+        assert!(apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q-1R1Z0").is_err());
+        assert!(apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q9R9Z0").is_err());
         assert_eq!(state.entities["UNIT_P1_1"].spatial.q, -1);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.r, 0);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.z, 0);
@@ -1229,8 +1481,8 @@ mod tests {
     fn move_action_rejects_malformed_extra_token_segments_without_mutation() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_action(&mut state, "M:UNIT_P1_1:Q0R0Z0:extra").is_err());
-        assert!(apply_action(&mut state, "M::Q0R0Z0").is_err());
+        assert!(apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q0R0Z0:extra").is_err());
+        assert!(apply_sandbox_action(&mut state, "M::Q0R0Z0").is_err());
         assert_eq!(state.entities["UNIT_P1_1"].spatial.q, -1);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.r, 0);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.z, 0);
@@ -1240,7 +1492,7 @@ mod tests {
     fn move_action_rejects_non_unit_entities() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_action(&mut state, "M:HEX_0:Q0R0Z0").is_err());
+        assert!(apply_sandbox_action(&mut state, "M:HEX_0:Q0R0Z0").is_err());
         assert_eq!(state.entities["HEX_0"].spatial.q, 0);
         assert_eq!(state.entities["HEX_0"].spatial.r, 0);
     }
@@ -1251,11 +1503,185 @@ mod tests {
             context: MatchContext {
                 match_id: "test".to_string(),
                 active_player: "P1".to_string(),
-                turn_phase: "movement".to_string(),
+                turn_phase: TurnPhase::Movement,
+                setup_locked: false,
+                winner: None,
             },
             entities: HashMap::new(),
         };
 
-        assert!(apply_action(&mut state, "M:missing:Q0R2Z1").is_err());
+        assert!(apply_sandbox_action(&mut state, "M:missing:Q0R2Z1").is_err());
+    }
+
+    #[test]
+    fn referee_enforces_seats_phases_action_budgets_and_fixed_attack_damage() {
+        let match_id = format!("referee_rules_test_{}", std::process::id());
+        store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
+        let initial = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+
+        assert!(
+            process_action(&match_id, "P2", "S")
+                .unwrap_err()
+                .contains("Out-of-turn")
+        );
+        assert!(
+            process_action(&match_id, "P1", "M:UNIT_P2_1:Q0R0Z0")
+                .unwrap_err()
+                .contains("does not belong")
+        );
+        assert!(
+            process_action(&match_id, "P1", "M:UNIT_P1_1:Q2R2Z0")
+                .unwrap_err()
+                .contains("exactly one adjacent")
+        );
+        assert!(process_action(&match_id, "P1", "A:UNIT_P1_1:UNIT_P2_1").is_err());
+        assert_eq!(
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap(),
+            initial
+        );
+
+        process_action(&match_id, "P1", "M:UNIT_P1_1:Q0R0Z0").unwrap();
+        let after_move = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(after_move["context"]["turn_phase"], "attack");
+        assert!(after_move["context"]["setup_locked"].as_bool().unwrap());
+        assert!(
+            process_action(&match_id, "P1", "M:UNIT_P1_1:Q-1R0Z0")
+                .unwrap_err()
+                .contains("Attack phase")
+        );
+        assert!(
+            process_action(&match_id, "P1", "A:UNIT_P1_1:UNIT_P2_1:9")
+                .unwrap_err()
+                .contains("no client damage")
+        );
+        assert!(
+            process_action(&match_id, "P1", "A:UNIT_P1_1:UNIT_P1_2")
+                .unwrap_err()
+                .contains("belongs to the attacking seat")
+        );
+        assert_eq!(
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap(),
+            after_move
+        );
+
+        process_action(&match_id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        let after_attack =
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(after_attack["context"]["turn_phase"], "end");
+        assert_eq!(
+            after_attack["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
+            3
+        );
+        assert!(
+            process_action(&match_id, "P2", "E")
+                .unwrap_err()
+                .contains("Out-of-turn")
+        );
+        process_action(&match_id, "P1", "E").unwrap();
+        let p2_turn = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(p2_turn["context"]["active_player"], "P2");
+        assert_eq!(p2_turn["context"]["turn_phase"], "movement");
+
+        process_action(&match_id, "P2", "S").unwrap();
+        assert_eq!(
+            ACTIVE_MATCHES.lock().unwrap()[&match_id].context.turn_phase,
+            TurnPhase::Attack
+        );
+        process_action(&match_id, "P2", "S").unwrap();
+        assert_eq!(
+            ACTIVE_MATCHES.lock().unwrap()[&match_id].context.turn_phase,
+            TurnPhase::End
+        );
+        process_action(&match_id, "P2", "E").unwrap();
+        let next_turn = &ACTIVE_MATCHES.lock().unwrap()[&match_id].context;
+        assert_eq!(next_turn.active_player, "P1");
+        assert_eq!(next_turn.turn_phase, TurnPhase::Movement);
+    }
+
+    #[test]
+    fn referee_ends_match_immediately_when_a_seat_loses_all_units() {
+        let match_id = format!("referee_victory_test_{}", std::process::id());
+        let mut state = generate_test_sandbox(match_id.clone());
+        state.entities.remove("UNIT_P2_2");
+        state.entities.remove("HERO_P2");
+        state
+            .entities
+            .get_mut("UNIT_P2_1")
+            .unwrap()
+            .components
+            .insert(
+                "destructible".to_string(),
+                Component::Destructible {
+                    current_life: 1,
+                    max_life: 4,
+                },
+            );
+        store_match(match_id.clone(), state);
+
+        process_action(&match_id, "P1", "M:UNIT_P1_1:Q0R0Z0").unwrap();
+        process_action(&match_id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        let finished = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(finished["context"]["turn_phase"], "finished");
+        assert_eq!(finished["context"]["winner"], "P1");
+        assert!(finished["entities"].get("UNIT_P2_1").is_none());
+
+        assert!(
+            process_action(&match_id, "P1", "E")
+                .unwrap_err()
+                .contains("Match is finished")
+        );
+        assert!(
+            process_action(&match_id, "P2", "S")
+                .unwrap_err()
+                .contains("Match is finished")
+        );
+        assert_eq!(
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap(),
+            finished
+        );
+    }
+
+    #[test]
+    fn referee_rejects_nonadjacent_attacks_without_mutating_state() {
+        let match_id = format!("referee_attack_range_test_{}", std::process::id());
+        store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
+        process_action(&match_id, "P1", "S").unwrap();
+        let before_invalid_attack =
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+
+        assert!(
+            process_action(&match_id, "P1", "A:UNIT_P1_1:UNIT_P2_1")
+                .unwrap_err()
+                .contains("adjacent enemy")
+        );
+        assert_eq!(
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap(),
+            before_invalid_attack
+        );
+
+        process_action(&match_id, "P1", "A:UNIT_P1_1:HERO_P2").unwrap();
+        let state = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(
+            state["entities"]["HERO_P2"]["components"]["destructible"]["data"]["current_life"],
+            7
+        );
+        assert_eq!(state["context"]["turn_phase"], "end");
+    }
+
+    #[test]
+    fn restored_elimination_snapshot_is_marked_finished() {
+        let match_id = format!("referee_restore_victory_test_{}", std::process::id());
+        let mut state = generate_test_sandbox(match_id.clone());
+        state.entities.remove("UNIT_P2_1");
+        state.entities.remove("UNIT_P2_2");
+        state.entities.remove("HERO_P2");
+        let snapshot = serde_json::to_string(&state).unwrap();
+
+        restore_match_snapshot(&match_id, &snapshot).unwrap();
+
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        let restored = &matches[&match_id];
+        assert_eq!(restored.context.turn_phase, TurnPhase::Finished);
+        assert_eq!(restored.context.winner.as_deref(), Some("P1"));
     }
 }

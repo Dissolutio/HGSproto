@@ -63,19 +63,9 @@ pub unsafe extern "C" fn hgs_process_token(c_token: *const c_char) -> *mut c_cha
         return std::ptr::null_mut();
     }
 
-    let c_str = unsafe { CStr::from_ptr(c_token) };
-    let token_str = match c_str.to_str() {
-        Ok(s) => s,
-        Err(_) => return CString::new("E:INVALID_UTF8").unwrap().into_raw(),
-    };
-
-    let response_token = if token_str.starts_with("M:") {
-        format!("VALID_STEP:{}", token_str)
-    } else {
-        format!("E:UNMAPPED_TOKEN")
-    };
-
-    CString::new(response_token).unwrap().into_raw()
+    CString::new("E:Match ID and acting seat are required")
+        .unwrap()
+        .into_raw()
 }
 
 /// Spawns a pre-loaded testing sandbox match directly in memory.
@@ -112,13 +102,36 @@ pub unsafe extern "C" fn hgs_process_token_for_match(
         return CString::new("E:INVALID_ARGUMENT").unwrap().into_raw();
     }
 
+    CString::new("E:Acting seat is required")
+        .unwrap()
+        .into_raw()
+}
+
+/// Processes a rules-enforced action for a specific match and acting seat.
+///
+/// # Safety
+/// All arguments must be valid, null-terminated C-strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_process_token_for_match_as(
+    c_match_id: *const c_char,
+    c_acting_seat: *const c_char,
+    c_token: *const c_char,
+) -> *mut c_char {
+    if c_match_id.is_null() || c_acting_seat.is_null() || c_token.is_null() {
+        return CString::new("E:INVALID_ARGUMENT").unwrap().into_raw();
+    }
+
     let match_id = unsafe { CStr::from_ptr(c_match_id) }.to_string_lossy();
+    let acting_seat = match unsafe { CStr::from_ptr(c_acting_seat) }.to_str() {
+        Ok(seat) => seat,
+        Err(_) => return CString::new("E:INVALID_UTF8").unwrap().into_raw(),
+    };
     let token = match unsafe { CStr::from_ptr(c_token) }.to_str() {
         Ok(token) => token,
         Err(_) => return CString::new("E:INVALID_UTF8").unwrap().into_raw(),
     };
 
-    let response = match engine::process_action(&match_id, token) {
+    let response = match engine::process_action(&match_id, acting_seat, token) {
         Ok(()) => format!("VALID_STEP:{token}"),
         Err(error) => format!("E:{error}"),
     };
@@ -162,7 +175,7 @@ mod tests {
         let output_str = output_cstring.to_str().unwrap();
 
         // Verify your Blind Evaluation Loop output matched expectations
-        assert_eq!(output_str, "VALID_STEP:M:U1:Q0R2Z1");
+        assert_eq!(output_str, "E:Match ID and acting seat are required");
 
         // 4. Test your cleanup function to ensure memory doesn't leak
         // We pass ownership of the raw pointer back out to simulate the FFI free cycle
@@ -211,7 +224,7 @@ mod tests {
         let state: serde_json::Value = serde_json::from_str(json_output).unwrap();
 
         assert_eq!(state["context"]["match_id"], "test_match_123");
-        assert_eq!(state["context"]["active_player"], "Player_1");
+        assert_eq!(state["context"]["active_player"], "P1");
         assert_eq!(state["entities"].as_object().unwrap().len(), 13);
         assert!(state["entities"].get("UNIT_P1_1").is_some());
         assert!(state["entities"].get("UNIT_P1_2").is_some());
@@ -237,8 +250,10 @@ mod tests {
 
         unsafe { hgs_initialize_test_match(match_id.as_ptr()) };
 
-        let response_ptr =
-            unsafe { hgs_process_token_for_match(match_id.as_ptr(), token.as_ptr()) };
+        let acting_seat = CString::new("P1").unwrap();
+        let response_ptr = unsafe {
+            hgs_process_token_for_match_as(match_id.as_ptr(), acting_seat.as_ptr(), token.as_ptr())
+        };
         assert!(!response_ptr.is_null());
         let response = unsafe { CStr::from_ptr(response_ptr) }.to_str().unwrap();
         assert_eq!(response, "VALID_STEP:M:UNIT_P1_1:Q0R0Z0");
@@ -254,5 +269,28 @@ mod tests {
         assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
         assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["z"], 0);
         unsafe { hgs_free_string(state_ptr) };
+    }
+
+    #[test]
+    fn seatless_compatibility_action_entrypoint_rejects_without_mutating_state() {
+        let match_id = CString::new("ffi_seatless_action_rejection").unwrap();
+        let token = CString::new("M:UNIT_P1_1:Q0R0Z0").unwrap();
+        unsafe { hgs_initialize_test_match(match_id.as_ptr()) };
+
+        let before_ptr = unsafe { hgs_get_current_state(match_id.as_ptr()) };
+        let before: serde_json::Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(before_ptr) }.to_str().unwrap()).unwrap();
+        unsafe { hgs_free_string(before_ptr) };
+
+        let result_ptr = unsafe { hgs_process_token_for_match(match_id.as_ptr(), token.as_ptr()) };
+        let result = unsafe { CStr::from_ptr(result_ptr) }.to_str().unwrap();
+        assert_eq!(result, "E:Acting seat is required");
+        unsafe { hgs_free_string(result_ptr) };
+
+        let after_ptr = unsafe { hgs_get_current_state(match_id.as_ptr()) };
+        let after: serde_json::Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(after_ptr) }.to_str().unwrap()).unwrap();
+        unsafe { hgs_free_string(after_ptr) };
+        assert_eq!(after, before);
     }
 }

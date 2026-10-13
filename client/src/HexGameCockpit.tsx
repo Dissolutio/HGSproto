@@ -40,7 +40,13 @@ type EngineEntity = {
   components?: Record<string, EngineComponent> | EngineComponent[];
 };
 type EngineState = {
-  context?: { match_id?: string; active_player?: string; turn_phase?: string };
+  context?: {
+    match_id?: string;
+    active_player?: string;
+    turn_phase?: string;
+    setup_locked?: boolean;
+    winner?: string;
+  };
   entities?: Record<string, EngineEntity> | EngineEntity[];
 };
 type RenderEntity = EngineEntity & { id: string; spatial: Position };
@@ -596,6 +602,7 @@ export default function HexGameCockpit() {
   const [mode, setMode] = useState<Mode>("wasm");
   const [gameState, setGameState] = useState<EngineState | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
+  const [attackTargeting, setAttackTargeting] = useState(false);
   const [inspectedEntity, setInspectedEntity] = useState<RenderEntity | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [notice, setNotice] = useState("Loading local WebAssembly engine");
@@ -872,6 +879,14 @@ export default function HexGameCockpit() {
   }, [mode, tabId, connectionAttempt]);
 
   const entities = useMemo(() => entitiesFromState(gameState), [gameState]);
+  useEffect(() => {
+    const inspectedId = inspectedEntity?.id;
+    if (!inspectedId) return;
+    setInspectedEntity(
+      entities.find((entity) => entity.id === inspectedId) ?? null,
+    );
+  }, [entities, inspectedEntity?.id]);
+
   const terrain = useMemo(
     () => entities.flatMap((entity): TerrainData[] => {
       const terrainComponent = findComponent(entity, "Terrain");
@@ -908,6 +923,43 @@ export default function HexGameCockpit() {
     setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
   };
 
+  const submitAction = (token: string) => {
+    if (mode === "wasm") {
+      const actingSeat = gameState?.context?.active_player;
+      if (!actingSeat) {
+        setNotice("Referee action rejected: active seat is missing from the match state");
+        return;
+      }
+      try {
+        const result = wasm_process_token_for_match(WASM_MATCH_ID, actingSeat, token);
+        if (result.startsWith("E:")) {
+          console.error("Referee Rejected Action:", result);
+          setNotice(result.slice(2));
+          return;
+        }
+        setSelectedUnitId(null);
+        setAttackTargeting(false);
+        sync3DCanvasWithWasmState();
+        setNotice(`Applied locally: ${token}`);
+      } catch (error) {
+        setNotice(`WASM action failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setNotice("Action not sent: engine stream is offline");
+      return;
+    }
+    try {
+      socket.send(token);
+      setNotice(`Sent ${token}`);
+      setSelectedUnitId(null);
+      setAttackTargeting(false);
+    } catch (error) {
+      setNotice(`Action could not be sent: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   const handleHexClick = (cell: TerrainData) => {
     setInspectedEntity(entities.find((entity) => entity.id === cell.id) ?? cell);
     const { q, r, z } = cell.spatial;
@@ -920,59 +972,26 @@ export default function HexGameCockpit() {
       return;
     }
 
-    const occupied = units.some(
-      (unit) =>
-        unit.id !== selectedUnitId &&
-        unit.spatial.q === q &&
-        unit.spatial.r === r &&
-        unit.spatial.z === z,
-    );
-    if (occupied) {
-      setNotice("Move rejected locally: that hex is occupied");
-      return;
-    }
-
-    const token = `M:${selectedUnitId}:Q${q}R${r}Z${z}`;
-    if (mode === "wasm") {
-      try {
-        const presentationEcho = wasm_process_token_for_match(WASM_MATCH_ID, token);
-        if (presentationEcho.startsWith("E:")) {
-          console.error("Referee Rejected Action:", presentationEcho);
-          setNotice(presentationEcho.slice(2));
-          return;
-        }
-        setSelectedUnitId(null);
-        sync3DCanvasWithWasmState();
-        setNotice(`Applied locally: ${token}`);
-      } catch (error) {
-        setNotice(`WASM move failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      return;
-    }
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      setNotice("Move not sent: engine stream is offline");
-      return;
-    }
-    try {
-      socket.send(token);
-      setNotice(`Sent ${token}`);
-      setSelectedUnitId(null);
-    } catch (error) {
-      setNotice(`Move could not be sent: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    submitAction(`M:${selectedUnitId}:Q${q}R${r}Z${z}`);
   };
 
   const selectUnit = (unit: RenderEntity, event: ThreeEvent<MouseEvent>) => {
     event.stopPropagation();
     setInspectedEntity(unit);
+    if (attackTargeting && selectedUnitId && unit.id !== selectedUnitId) {
+      submitAction(`A:${selectedUnitId}:${unit.id}`);
+      return;
+    }
     const nextId = selectedUnitId === unit.id ? null : unit.id;
     setSelectedUnitId(nextId);
+    setAttackTargeting(false);
     setNotice(nextId ? `${unit.id} selected` : "Selection cleared");
   };
 
   const chooseMode = (nextMode: Mode) => {
     if (nextMode === mode) return;
     setSelectedUnitId(null);
+    setAttackTargeting(false);
     setInspectedEntity(null);
     setGameState(null);
     setMode(nextMode);
@@ -1208,6 +1227,15 @@ export default function HexGameCockpit() {
     return labels.includes("P1") || labels.includes("Player_1");
   }).length;
   const playerTwoCount = units.length - playerOneCount;
+  const ruleHint = gameState?.context?.winner
+    ? `${gameState.context.winner} won by elimination`
+    : gameState?.context?.turn_phase === "movement"
+      ? "Move one friendly unit one adjacent hex, or skip movement"
+      : gameState?.context?.turn_phase === "attack"
+        ? "Attack one adjacent enemy for 1 damage, or skip attack"
+        : gameState?.context?.turn_phase === "end"
+          ? "End the turn to activate the other seat"
+          : "Referee state unavailable";
   const storedRecoverySession = recoverySession ? readRecoverySession() : null;
   const showRecoveryBanner =
     mode === "network" &&
@@ -1348,6 +1376,50 @@ export default function HexGameCockpit() {
       <section style={styles.toolbar} aria-live="polite">
         <span style={styles.notice}>{notice}</span>
         <span style={styles.counts}>{terrain.length} hexes <i /> {units.length} units</span>
+      </section>
+
+      <section style={styles.rulesBar} aria-label="Referee turn controls">
+        <strong role="status">
+          {gameState?.context?.winner
+            ? `${gameState.context.winner} wins — match finished`
+            : `${gameState?.context?.active_player ?? "Seat unavailable"} · ${gameState?.context?.turn_phase ?? "phase unavailable"} phase`}
+        </strong>
+        <div style={styles.rulesButtons}>
+          <button
+            type="button"
+            onClick={() => setAttackTargeting((targeting) => !targeting)}
+            disabled={
+              gameState?.context?.turn_phase !== "attack" ||
+              !selectedUnitId ||
+              !!gameState?.context?.winner
+            }
+            style={styles.ruleButton}
+          >
+            {attackTargeting ? "Cancel attack" : "Attack selected unit"}
+          </button>
+          <button
+            type="button"
+            onClick={() => submitAction("S")}
+            disabled={
+              !["movement", "attack"].includes(gameState?.context?.turn_phase ?? "") ||
+              !!gameState?.context?.winner
+            }
+            style={styles.ruleButton}
+          >
+            {gameState?.context?.turn_phase === "attack" ? "Skip attack" : "Skip movement"}
+          </button>
+          <button
+            type="button"
+            onClick={() => submitAction("E")}
+            disabled={gameState?.context?.turn_phase !== "end" || !!gameState?.context?.winner}
+            style={styles.ruleButton}
+          >
+            End turn
+          </button>
+        </div>
+        {attackTargeting && (
+          <span style={styles.ruleHint}>Select an adjacent enemy unit to attack for 1 damage.</span>
+        )}
       </section>
 
       <section style={styles.boardFrame} aria-label="3D tactical board">
@@ -1499,14 +1571,16 @@ export default function HexGameCockpit() {
                     mode !== "wasm" ||
                     connection !== "ready" ||
                     !selectedProfile ||
-                    !deploymentSlot
+                    !deploymentSlot ||
+                    gameState?.context?.setup_locked ||
+                    !!gameState?.context?.winner
                   }
                   style={styles.modProfileButton}
                 >
                   Deploy Profile into Roster Slot
                 </button>
                 <p role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
-                  The Rust core replaces the selected unit in place and owns its health, tags, and visual.
+                  The Rust core replaces the selected unit in place and owns its health, tags, and visual. Deployment locks after the first referee action.
                 </p>
               </div>
             )}
@@ -1637,9 +1711,7 @@ export default function HexGameCockpit() {
         <span><b style={{ color: "#58a9e8" }}>P1</b> Player 1 · {playerOneCount}</span>
         <span><b style={{ color: "#f07868" }}>P2</b> Player 2 · {playerTwoCount}</span>
         <span style={styles.hint}>
-          {selectedUnitId
-            ? `Selected: ${selectedUnitId} · click an open pillar to move`
-            : "Select a unit to issue a move"}
+          {selectedUnitId ? `Selected: ${selectedUnitId} · ${ruleHint}` : ruleHint}
         </span>
       </footer>
     </main>
@@ -1701,6 +1773,33 @@ const styles: Record<string, CSSProperties> = {
   statusDot: { width: 9, height: 9, borderRadius: "50%", display: "inline-block" },
   matchId: { borderLeft: "1px solid #bcc9bf", paddingLeft: 12, fontFamily: "ui-monospace, monospace", color: "#75847c" },
   toolbar: { maxWidth: 1240, margin: "0 auto", minHeight: 52, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 },
+  rulesBar: {
+    maxWidth: 1240,
+    margin: "0 auto 12px",
+    minHeight: 48,
+    padding: "8px 12px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 10,
+    border: "1px solid #c4d0c7",
+    borderRadius: 6,
+    background: "#f7faf5",
+    color: "#18302d",
+    fontSize: 13,
+  },
+  rulesButtons: { display: "flex", flexWrap: "wrap", gap: 8 },
+  ruleButton: {
+    padding: "7px 10px",
+    border: "1px solid #789087",
+    borderRadius: 4,
+    background: "#fff",
+    color: "#18302d",
+    font: "inherit",
+    cursor: "pointer",
+  },
+  ruleHint: { flexBasis: "100%", color: "#416158" },
   notice: { color: "#416158", fontSize: 13, overflowWrap: "anywhere" },
   counts: { color: "#587168", fontSize: 12, whiteSpace: "nowrap" },
   boardFrame: {

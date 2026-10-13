@@ -91,7 +91,9 @@ Example:
 ```
 
 The current match snapshot is a JSON `GameState` object with `context`
-(`match_id`, `active_player`, `turn_phase`) and `entities`. Each entity has
+(`match_id`, `active_player`, `turn_phase`, `setup_locked`, and an optional
+`winner`) and `entities`. `active_player` is `P1` or `P2`; `turn_phase` is
+`movement`, `attack`, `end`, or `finished`. Each entity has
 `id`, `spatial` (`q`, `r`, `z`), `components`, and optional
 `visual_primitive`, `display_name`, and `mod_id`. The Rust/WASM snapshot is
 authoritative; presentation-only React edits do not update it.
@@ -105,8 +107,9 @@ authoritative Rust/WASM snapshot, retaining its entity ID and board coordinate
 while cloning the profile's components and visual metadata. Seat tags are
 normalized by the core. Replacing two different slots with the same profile
 creates independent health components; damaging one does not alter the other
-or the registry template. An unknown profile, wrong-seat slot, or invalid
-health value fails without changing the snapshot.
+or the registry template. Roster deployment is permitted only before the
+first referee action. An unknown profile, wrong-seat slot, invalid health
+value, or locked setup fails without changing the snapshot.
 
 This is roster/setup replacement, not an additive spawn or a new movement
 rule. Current movement still checks unit identity, board membership, and
@@ -124,6 +127,26 @@ tags and `display_name`, and a `movement_speed` profile was rejected with a
 visible Rust validation diagnostic. The board remained at 6 units and both
 custom health overlays stayed at 12/12 after the rejected import.
 
+## Reference-game turn rules
+
+The M2 reference game alternates P1 and P2. Each turn proceeds through
+Movement, Attack, and End phases. In Movement, the active seat may move one
+friendly unit exactly one adjacent board hex at the same height, or skip the
+phase. A successful move or skip advances to Attack. In Attack, the active
+seat may damage one adjacent enemy unit at the same height for exactly one
+core-defined life point, or skip. A successful attack or skip advances to End.
+Only the active seat may act, and it may control only units with its matching
+seat tag. The End action rotates the active seat and starts the next Movement
+phase.
+
+The core ends the match immediately when one seat has no living units and
+records the winner in the snapshot. Rejected actions do not mutate the match.
+Production action routes use these rules; permissive helpers exist only in
+Rust tests and are not exposed through WASM, C, or network APIs.
+`setup_locked` becomes true after the first accepted referee action; profile
+deployment is rejected thereafter to prevent setup controls from resetting
+live health.
+
 ## Action tokens
 
 Action tokens are plain UTF-8 text, shared unchanged between the WASM
@@ -133,15 +156,27 @@ peer stream:
 | Action | Shape | Example |
 | --- | --- | --- |
 | Move | `M:<entity_id>:Q<q>R<r>Z<z>` | `M:UNIT_P2_1:Q1R0Z0` |
-| Attack | `A:<attacker_id>:<target_id>:<positive_integer_damage>` | `A:UNIT_P1_1:UNIT_P2_1:2` |
+| Attack | `A:<attacker_id>:<target_id>` | `A:UNIT_P1_1:UNIT_P2_1` |
+| Skip current phase | `S` | `S` |
+| End turn | `E` | `E` |
 
-Movement coordinates are signed integers. The core checks that the mover is a
-unit, the destination is a board hex, and it is unoccupied. Attacks require a
-unit attacker and a destructible target; destroyed entities are removed.
-Action processing returns `VALID_STEP:<original-token>` on success. The WASM
-bridge returns errors prefixed with `E:`; the native WebSocket gateway emits
-errors as `E:<message>`. A gateway action is a WebSocket text message containing
-the token itself, without a JSON wrapper.
+Movement coordinates are signed integers. The core checks the acting seat,
+phase, unit ownership, one-hex movement distance, board membership, height, and
+occupancy. Attacks require an adjacent enemy unit at the same height and do
+exactly one damage; a supplied damage field is rejected. An action request
+must include the acting seat when submitted through the C/WASM API; the native
+gateway binds local actions to its host/join seat and assigns peer actions the
+opposite seat. Action processing returns `VALID_STEP:<original-token>` on
+success. The WASM bridge and native WebSocket gateway return errors prefixed
+with `E:`; a gateway action is a WebSocket text message containing the token
+itself, without a JSON wrapper.
+
+On 2026-10-13, the browser smoke moved a P1 unit one adjacent hex, applied a
+legal adjacent attack, and confirmed the target health overlay and inspector
+updated to 7/8. It also exercised skip-movement, skip-attack, and end-turn
+controls to confirm the P1/P2 phase rotation. A second browser check imported
+and deployed a 5/5 profile before play, then confirmed that the deployment
+control disables after the first accepted phase action.
 
 ## Native WebSocket session protocol
 

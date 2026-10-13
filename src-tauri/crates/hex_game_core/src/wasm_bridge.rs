@@ -77,8 +77,12 @@ pub fn wasm_get_current_state(match_id: String) -> String {
 }
 
 #[wasm_bindgen]
-pub fn wasm_process_token_for_match(match_id: String, token: String) -> String {
-    match engine::process_action(&match_id, &token) {
+pub fn wasm_process_token_for_match(
+    match_id: String,
+    acting_seat: String,
+    token: String,
+) -> String {
+    match engine::process_action(&match_id, &acting_seat, &token) {
         Ok(()) => format!("VALID_STEP:{token}"),
         Err(error) => format!("E:{error}"),
     }
@@ -117,12 +121,18 @@ mod tests {
         assert_eq!(state["entities"].as_object().unwrap().len(), 13);
 
         assert_eq!(
-            wasm_process_token_for_match(match_id.clone(), "M:UNIT_P1_1:Q0R2Z0".to_string()),
-            "VALID_STEP:M:UNIT_P1_1:Q0R2Z0"
+            wasm_process_token_for_match(
+                match_id.clone(),
+                "P1".to_string(),
+                "M:UNIT_P1_2:Q0R2Z0".to_string()
+            ),
+            "VALID_STEP:M:UNIT_P1_2:Q0R2Z0"
         );
         let updated: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
-        assert_eq!(updated["entities"]["UNIT_P1_1"]["spatial"]["r"], 2);
+        assert_eq!(updated["entities"]["UNIT_P1_2"]["spatial"]["q"], 0);
+        assert_eq!(updated["entities"]["UNIT_P1_2"]["spatial"]["r"], 2);
+        assert_eq!(updated["context"]["turn_phase"], "attack");
     }
 
     #[test]
@@ -212,14 +222,15 @@ mod tests {
         .unwrap();
         wasm_deploy_profile_unit(
             match_id.clone(),
-            "UNIT_P2_1".to_string(),
+            "HERO_P2".to_string(),
             mod_id,
             "P2".to_string(),
             12,
         )
         .unwrap();
 
-        crate::engine::process_action(&match_id, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
+        crate::engine::process_action(&match_id, "P1", "M:UNIT_P1_2:Q0R2Z0").unwrap();
+        crate::engine::process_action(&match_id, "P1", "A:UNIT_P1_1:HERO_P2").unwrap();
         let state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
         assert_eq!(
@@ -227,8 +238,8 @@ mod tests {
             12
         );
         assert_eq!(
-            state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
-            9
+            state["entities"]["HERO_P2"]["components"]["destructible"]["data"]["current_life"],
+            11
         );
     }
 
@@ -248,13 +259,13 @@ mod tests {
         wasm_initialize_match(match_id.clone(), map_json.to_string()).unwrap();
         let initial_state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
-        let initial_position = initial_state["entities"]["UNIT_P1_1"]["spatial"].clone();
-        crate::engine::process_action(&match_id, "M:UNIT_P1_1:Q0R2Z0").unwrap();
+        let initial_position = initial_state["entities"]["UNIT_P1_2"]["spatial"].clone();
+        crate::engine::process_action(&match_id, "P1", "M:UNIT_P1_2:Q0R2Z0").unwrap();
 
         wasm_reset_match(match_id.clone(), map_json.to_string()).unwrap();
 
         let state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
-        assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"], initial_position);
+        assert_eq!(state["entities"]["UNIT_P1_2"]["spatial"], initial_position);
     }
 }

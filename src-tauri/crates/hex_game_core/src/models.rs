@@ -50,7 +50,24 @@ pub struct Entity {
 pub struct MatchContext {
     pub match_id: String,
     pub active_player: String,
-    pub turn_phase: String,
+    pub turn_phase: TurnPhase,
+    #[serde(default)]
+    pub setup_locked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    #[serde(alias = "Action", alias = "Movement")]
+    Movement,
+    #[serde(alias = "Attack")]
+    Attack,
+    #[serde(alias = "End")]
+    End,
+    #[serde(alias = "Finished")]
+    Finished,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

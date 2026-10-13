@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use hex_game_core::engine::{rebind_player_session, release_player_session, remove_match};
-use hex_game_core::ffi::{hgs_free_string, hgs_get_current_state, hgs_process_token_for_match};
+use hex_game_core::ffi::{hgs_free_string, hgs_get_current_state, hgs_process_token_for_match_as};
 use hex_game_core::mod_registry::ModRegistry;
 use hex_game_network::{MatchSession, NetworkManager};
 use tokio::net::{TcpListener, TcpStream};
@@ -26,6 +26,7 @@ struct ManagedSession {
     match_id: String,
     map_json: String,
     manager: Arc<NetworkManager>,
+    local_seat: Mutex<&'static str>,
     state_updates: broadcast::Sender<String>,
     peer_session: Mutex<Option<Weak<ManagedSession>>>,
     action_log: Mutex<Vec<String>>,
@@ -163,6 +164,7 @@ fn get_or_create_session(
         match_id: match_id.clone(),
         map_json: map_json.to_string(),
         manager: Arc::new(NetworkManager::new(match_id)),
+        local_seat: Mutex::new("P1"),
         state_updates,
         peer_session: Mutex::new(None),
         action_log: Mutex::new(Vec::new()),
@@ -262,10 +264,17 @@ async fn notify_peer_recovered(session: &ManagedSession) {
     }
 }
 
-fn process_token(match_id: &str, token: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+fn process_token(
+    match_id: &str,
+    acting_seat: &str,
+    token: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
     let match_id = CString::new(match_id)?;
+    let acting_seat = CString::new(acting_seat)?;
     let token = CString::new(token)?;
-    let raw_result = unsafe { hgs_process_token_for_match(match_id.as_ptr(), token.as_ptr()) };
+    let raw_result = unsafe {
+        hgs_process_token_for_match_as(match_id.as_ptr(), acting_seat.as_ptr(), token.as_ptr())
+    };
     if raw_result.is_null() {
         return Err("Core returned a null action result".into());
     }
@@ -274,7 +283,7 @@ fn process_token(match_id: &str, token: &str) -> Result<String, Box<dyn Error + 
         .to_string_lossy()
         .into_owned();
     unsafe { hgs_free_string(raw_result) };
-    Ok(result)
+    Ok(result.strip_prefix("E:").unwrap_or(&result).to_string())
 }
 
 fn get_current_state(match_id: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -516,7 +525,11 @@ async fn serve_websocket(stream: TcpStream) -> Result<(), Box<dyn Error + Send +
                         }
                     }
                     Message::Text(command) if is_action_token(&command) => {
-                        match process_token(&session.match_id, &command) {
+                        let acting_seat = *session
+                            .local_seat
+                            .lock()
+                            .map_err(|_| std::io::Error::other("Session seat is unavailable"))?;
+                        match process_token(&session.match_id, acting_seat, &command) {
                             Ok(result) if result.starts_with("VALID_STEP:") => {
                                 if let Err(error) = session.append_action(&command) {
                                     let _ = session
@@ -597,6 +610,10 @@ async fn start_host_session(session: Arc<ManagedSession>) -> Result<String, Stri
     }
     initialize_from_map(&session.match_id, &session.map_json)?;
     rebind_player_session(&session.match_id, "Player_1")?;
+    *session
+        .local_seat
+        .lock()
+        .map_err(|_| "Session seat is unavailable".to_string())? = "P1";
     match session.manager.host_match().await {
         Ok(node_id) => {
             let match_session = session.manager.active_session().await?;
@@ -628,6 +645,10 @@ async fn start_join_session(
         .manager
         .join_match_for_match(remote_node_id, remote_match_id)
         .await?;
+    *session
+        .local_seat
+        .lock()
+        .map_err(|_| "Session seat is unavailable".to_string())? = "P2";
     if let Some(peer_session) = peer_session {
         session.set_peer_session(&peer_session)?;
         peer_session.set_peer_session(&session)?;
@@ -698,7 +719,7 @@ async fn run_host_peer_loop(network_session: Arc<MatchSession>, session: Arc<Man
         }
         loop {
             match network_session.read_next_action_token().await {
-                Ok(token) => apply_peer_action(&session, &token),
+                Ok(token) => apply_peer_action(&session, "P2", &token),
                 Err(error) => {
                     network_session.mark_disconnected().await;
                     if network_session.is_closed() {
@@ -717,7 +738,7 @@ async fn run_host_peer_loop(network_session: Arc<MatchSession>, session: Arc<Man
 async fn run_join_peer_loop(network_session: Arc<MatchSession>, session: Arc<ManagedSession>) {
     loop {
         match network_session.read_next_action_token().await {
-            Ok(token) => apply_peer_action(&session, &token),
+            Ok(token) => apply_peer_action(&session, "P1", &token),
             Err(error) => {
                 network_session.mark_disconnected().await;
                 let _ = session
@@ -730,17 +751,17 @@ async fn run_join_peer_loop(network_session: Arc<MatchSession>, session: Arc<Man
 }
 
 fn is_action_token(token: &str) -> bool {
-    token.starts_with("M:") || token.starts_with("A:")
+    token.starts_with("M:") || token.starts_with("A:") || matches!(token, "S" | "E")
 }
 
-fn apply_peer_action(session: &ManagedSession, token: &str) {
+fn apply_peer_action(session: &ManagedSession, acting_seat: &str, token: &str) {
     if !is_action_token(token) {
         let _ = session
             .state_updates
             .send("E:Peer sent a non-action protocol message".to_string());
         return;
     }
-    match process_token(&session.match_id, token) {
+    match process_token(&session.match_id, acting_seat, token) {
         Ok(result) if result.starts_with("VALID_STEP:") => {
             if let Err(error) = session.append_action(token) {
                 let _ = session
@@ -866,7 +887,9 @@ mod tests {
                 let Ok(state) = serde_json::from_str::<Value>(&message) else {
                     continue;
                 };
-                if state["entities"]["UNIT_P1_1"]["spatial"]["q"] == 0 {
+                if state["entities"]["UNIT_P1_2"]["spatial"]["q"] == 0
+                    && state["entities"]["UNIT_P1_2"]["spatial"]["r"] == 2
+                {
                     return state;
                 }
             }
@@ -945,8 +968,28 @@ mod tests {
         .await
         .expect("second tab did not join the host session");
 
+        join_tab
+            .send(Message::Text("M:UNIT_P2_1:Q0R0Z0".into()))
+            .await
+            .unwrap();
+        let mut join_action_messages = Vec::new();
+        let join_action_result = timeout(Duration::from_secs(10), async {
+            loop {
+                let message = receive_text(&mut join_tab).await;
+                if message == "E:Out-of-turn action: P2 cannot act while P1 is active" {
+                    break;
+                }
+                join_action_messages.push(message);
+            }
+        })
+        .await;
+        assert!(
+            join_action_result.is_ok(),
+            "join seat action was not rejected; received {join_action_messages:?}"
+        );
+
         host_tab
-            .send(Message::Text("M:UNIT_P1_1:Q0R2Z0".into()))
+            .send(Message::Text("M:UNIT_P1_2:Q0R2Z0".into()))
             .await
             .unwrap();
         let host_state = wait_for_move_state(&mut host_tab).await;
@@ -960,7 +1003,7 @@ mod tests {
         let (mut join_tab, recovered_state, recovered_actions) =
             reconnect_session(address, "tab_join_456", &join_match_id).await;
         assert_eq!(recovered_state, join_state);
-        assert_eq!(recovered_actions, vec!["M:UNIT_P1_1:Q0R2Z0"]);
+        assert_eq!(recovered_actions, vec!["M:UNIT_P1_2:Q0R2Z0"]);
         assert_eq!(receive_text(&mut host_tab).await, "PEER_DISCONNECTED");
         assert_eq!(receive_text(&mut host_tab).await, "PEER_RECOVERED");
 
@@ -975,7 +1018,7 @@ mod tests {
         assert_eq!(replayed_state, recovered_state);
         assert_eq!(
             receive_text(&mut join_tab).await,
-            r#"ACTION_LOG:["M:UNIT_P1_1:Q0R2Z0"]"#
+            r#"ACTION_LOG:["M:UNIT_P1_2:Q0R2Z0"]"#
         );
         assert!(
             receive_text(&mut join_tab)
@@ -1009,8 +1052,8 @@ mod tests {
         );
         let host_state: Value =
             serde_json::from_str(&super::get_current_state(&host_match_id).unwrap()).unwrap();
-        assert_eq!(host_state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
-        assert_eq!(host_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 2);
+        assert_eq!(host_state["entities"]["UNIT_P1_2"]["spatial"]["q"], 0);
+        assert_eq!(host_state["entities"]["UNIT_P1_2"]["spatial"]["r"], 2);
 
         let (mut reused_tab, reused_state) = connect_session(address, "tab_join_456").await;
         assert_eq!(reused_state["context"]["match_id"], join_match_id);

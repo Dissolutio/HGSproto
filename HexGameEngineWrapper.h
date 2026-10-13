@@ -17,7 +17,7 @@ public:
 	static FString GetCurrentState(FString MatchID);
 
 	UFUNCTION(BlueprintCallable, Category = "HexGameSim")
-	static FString ProcessTokenForMatch(FString MatchID, FString Token);
+	static FString ProcessTokenForMatch(FString MatchID, FString ActingSeat, FString Token);
 
 	UFUNCTION(BlueprintCallable, Category = "HexGameSim")
 	static FString HostMatch(FString MatchID);

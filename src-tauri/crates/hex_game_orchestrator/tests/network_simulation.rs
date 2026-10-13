@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use hex_game_core::engine::{match_exists, rebind_player_session, release_player_session};
 use hex_game_core::ffi::{
-    hgs_free_string, hgs_get_current_state, hgs_initialize_test_match, hgs_process_token_for_match,
+    hgs_free_string, hgs_get_current_state, hgs_initialize_test_match,
+    hgs_process_token_for_match_as,
 };
 use hex_game_network::{MatchSession, NetworkManager};
 use tokio::time::{sleep, timeout};
@@ -51,17 +52,18 @@ async fn network_manager_host_join_and_action_token_sync() {
         Some(client_node_id.as_str())
     );
 
-    let token = "M:UNIT_P2_1:Q1R0Z0";
+    let token = "M:UNIT_P1_1:Q0R0Z0";
     client.send_action_token(token).await.unwrap();
     let received = timeout(NETWORK_TIMEOUT, host.read_next_action_token())
         .await
         .expect("host action receive timed out")
         .expect("host failed to receive action");
     assert_eq!(received, token);
-    hex_game_core::engine::process_action(&match_id, &received).unwrap();
+    hex_game_core::engine::process_action(&match_id, "P1", &received).unwrap();
 
     let state = current_state(&match_id);
-    assert_eq!(state["entities"]["UNIT_P2_1"]["spatial"]["q"], 1);
+    assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
+    assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
     client.disconnect_session().await.unwrap();
     host.disconnect_session().await.unwrap();
     assert!(client.active_session().await.is_err());
@@ -109,7 +111,7 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
     assert!(initial_state["entities"].get("UNIT_P1_1").is_some());
     assert!(initial_state["entities"].get("UNIT_P2_1").is_some());
 
-    let client_token = "M:UNIT_P2_1:Q1R0Z0";
+    let client_token = "M:UNIT_P2_1:Q0R0Z0";
     client.send_action_token(client_token).await.unwrap();
     let received_token = timeout(NETWORK_TIMEOUT, host.read_next_action_token())
         .await
@@ -117,13 +119,25 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
         .expect("host failed to receive client action");
     assert_eq!(received_token, client_token);
     assert_eq!(
-        process_token(MATCH_ID, &received_token),
-        "VALID_STEP:M:UNIT_P2_1:Q1R0Z0"
+        process_token(MATCH_ID, "P2", &received_token),
+        "E:Out-of-turn action: P2 cannot act while P1 is active"
     );
 
+    assert_eq!(process_token(MATCH_ID, "P1", "S"), "VALID_STEP:S");
+    assert_eq!(process_token(MATCH_ID, "P1", "S"), "VALID_STEP:S");
+    assert_eq!(process_token(MATCH_ID, "P1", "E"), "VALID_STEP:E");
+    client.send_action_token(client_token).await.unwrap();
+    let received_token = timeout(NETWORK_TIMEOUT, host.read_next_action_token())
+        .await
+        .expect("host action receive timed out")
+        .expect("host failed to receive valid client action");
+    assert_eq!(
+        process_token(MATCH_ID, "P2", &received_token),
+        "VALID_STEP:M:UNIT_P2_1:Q0R0Z0"
+    );
     sleep(Duration::from_millis(150)).await;
     let synced_state = current_state(MATCH_ID);
-    assert_eq!(synced_state["entities"]["UNIT_P2_1"]["spatial"]["q"], 1);
+    assert_eq!(synced_state["entities"]["UNIT_P2_1"]["spatial"]["q"], 0);
     assert_eq!(synced_state["entities"]["UNIT_P2_1"]["spatial"]["r"], 0);
     assert_eq!(synced_state["entities"]["UNIT_P2_1"]["spatial"]["z"], 0);
 
@@ -141,21 +155,23 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
     host.mark_disconnected().await;
     release_player_session(MATCH_ID, "Player_2");
 
+    assert_eq!(process_token(MATCH_ID, "P2", "S"), "VALID_STEP:S");
+    assert_eq!(process_token(MATCH_ID, "P2", "E"), "VALID_STEP:E");
     assert_eq!(
-        process_token(MATCH_ID, "M:UNIT_P1_1:Q0R0Z0"),
-        "VALID_STEP:M:UNIT_P1_1:Q0R0Z0"
+        process_token(MATCH_ID, "P1", "M:HERO_P1:Q1R0Z0"),
+        "VALID_STEP:M:HERO_P1:Q1R0Z0"
     );
     let host_mid_dropout_state = current_state(MATCH_ID);
     assert_eq!(
-        host_mid_dropout_state["entities"]["UNIT_P1_1"]["spatial"]["q"],
+        host_mid_dropout_state["entities"]["HERO_P1"]["spatial"]["q"],
+        1
+    );
+    assert_eq!(
+        host_mid_dropout_state["entities"]["HERO_P1"]["spatial"]["r"],
         0
     );
     assert_eq!(
-        host_mid_dropout_state["entities"]["UNIT_P1_1"]["spatial"]["r"],
-        0
-    );
-    assert_eq!(
-        host_mid_dropout_state["entities"]["UNIT_P1_1"]["spatial"]["z"],
+        host_mid_dropout_state["entities"]["HERO_P1"]["spatial"]["z"],
         0
     );
 
@@ -181,13 +197,13 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
         .expect("host rejected reconnection");
 
     let restored_state: serde_json::Value = serde_json::from_str(&restored_snapshot).unwrap();
-    assert_eq!(restored_state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
-    assert_eq!(restored_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
-    assert_eq!(restored_state["entities"]["UNIT_P1_1"]["spatial"]["z"], 0);
+    assert_eq!(restored_state["entities"]["HERO_P1"]["spatial"]["q"], 1);
+    assert_eq!(restored_state["entities"]["HERO_P1"]["spatial"]["r"], 0);
+    assert_eq!(restored_state["entities"]["HERO_P1"]["spatial"]["z"], 0);
     let client_state = current_state(MATCH_ID);
-    assert_eq!(client_state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
-    assert_eq!(client_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
-    assert_eq!(client_state["entities"]["UNIT_P1_1"]["spatial"]["z"], 0);
+    assert_eq!(client_state["entities"]["HERO_P1"]["spatial"]["q"], 1);
+    assert_eq!(client_state["entities"]["HERO_P1"]["spatial"]["r"], 0);
+    assert_eq!(client_state["entities"]["HERO_P1"]["spatial"]["z"], 0);
 
     reconnected_client.mark_disconnected().await;
     host.mark_disconnected().await;
@@ -201,10 +217,13 @@ fn initialize_test_match(match_id: &str) {
     unsafe { hgs_initialize_test_match(match_id.as_ptr()) };
 }
 
-fn process_token(match_id: &str, token: &str) -> String {
+fn process_token(match_id: &str, acting_seat: &str, token: &str) -> String {
     let match_id = CString::new(match_id).unwrap();
+    let acting_seat = CString::new(acting_seat).unwrap();
     let token = CString::new(token).unwrap();
-    let raw_result = unsafe { hgs_process_token_for_match(match_id.as_ptr(), token.as_ptr()) };
+    let raw_result = unsafe {
+        hgs_process_token_for_match_as(match_id.as_ptr(), acting_seat.as_ptr(), token.as_ptr())
+    };
     assert!(!raw_result.is_null(), "core returned a null token result");
     let result = unsafe { CStr::from_ptr(raw_result) }
         .to_string_lossy()

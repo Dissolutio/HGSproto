@@ -10,7 +10,11 @@ extern "C"
 {
 	HGS_DLL_IMPORT void hgs_initialize_test_match(const char* c_match_id);
 	HGS_DLL_IMPORT char* hgs_get_current_state(const char* c_match_id);
-	HGS_DLL_IMPORT char* hgs_process_token_for_match(const char* c_match_id, const char* c_token);
+	HGS_DLL_IMPORT char* hgs_process_token_for_match_as(
+		const char* c_match_id,
+		const char* c_acting_seat,
+		const char* c_token
+	);
 	HGS_DLL_IMPORT void hgs_free_string(char* rust_string);
 	HGS_DLL_IMPORT char* hgs_native_host_match(const char* c_match_id);
 	HGS_DLL_IMPORT bool hgs_native_join_match(const char* c_match_id, const char* c_host_node_id);
@@ -39,11 +43,20 @@ FString UHexGameEngineWrapper::GetCurrentState(FString MatchID)
 	return Result;
 }
 
-FString UHexGameEngineWrapper::ProcessTokenForMatch(FString MatchID, FString Token)
+FString UHexGameEngineWrapper::ProcessTokenForMatch(
+	FString MatchID,
+	FString ActingSeat,
+	FString Token
+)
 {
 	FTCHARToUTF8 MatchIDUtf8(*MatchID);
+	FTCHARToUTF8 ActingSeatUtf8(*ActingSeat);
 	FTCHARToUTF8 TokenUtf8(*Token);
-	char* RawPtr = hgs_process_token_for_match(MatchIDUtf8.Get(), TokenUtf8.Get());
+	char* RawPtr = hgs_process_token_for_match_as(
+		MatchIDUtf8.Get(),
+		ActingSeatUtf8.Get(),
+		TokenUtf8.Get()
+	);
 	if (RawPtr == nullptr)
 	{
 		return TEXT("E:Rust core returned a null response");

@@ -152,7 +152,7 @@ pub unsafe extern "C" fn hgs_native_join_match(
     true
 }
 
-/// Sends a local M:/A: action token to the connected peer.
+/// Sends a local M:/A:/S/E action token to the connected peer.
 ///
 /// # Safety
 /// Both arguments must be null or point to valid, null-terminated C strings.
@@ -173,9 +173,13 @@ pub unsafe extern "C" fn hgs_native_send_action_token(
         }
     };
     let token = match unsafe { CStr::from_ptr(c_token) }.to_str() {
-        Ok(token) if token.starts_with("M:") || token.starts_with("A:") => token,
+        Ok(token)
+            if token.starts_with("M:") || token.starts_with("A:") || matches!(token, "S" | "E") =>
+        {
+            token
+        }
         Ok(_) => {
-            eprintln!("Native token send failed: only M:/A: action tokens are supported");
+            eprintln!("Native token send failed: unsupported referee action token");
             return false;
         }
         Err(error) => {
@@ -237,8 +241,13 @@ fn spawn_peer_reader(manager: Arc<NetworkManager>, match_id: String, host: bool)
             }
             loop {
                 match manager.read_next_action_token().await {
-                    Ok(token) if token.starts_with("M:") || token.starts_with("A:") => {
-                        if let Err(error) = engine::process_action(&match_id, &token) {
+                    Ok(token)
+                        if token.starts_with("M:")
+                            || token.starts_with("A:")
+                            || matches!(token.as_str(), "S" | "E") =>
+                    {
+                        let acting_seat = if host { "P2" } else { "P1" };
+                        if let Err(error) = engine::process_action(&match_id, acting_seat, &token) {
                             eprintln!("Native peer sent an invalid action: {error}");
                         }
                     }
