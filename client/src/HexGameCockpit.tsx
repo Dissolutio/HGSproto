@@ -766,7 +766,7 @@ export default function HexGameCockpit() {
           setJoinNodeId("");
           setSelectedUnitId(null);
           setInspectedEntity(null);
-          setNotice("Gateway session reset; fresh sandbox state loaded");
+          triggerFreshMapSnapshotLoad(false);
           return;
         }
         if (message === "E:SESSION_EXPIRED") {
@@ -1328,21 +1328,29 @@ export default function HexGameCockpit() {
             >
               Load Mod Profile
             </button>
-            <button
-              type="button"
-              onClick={handleDevInjectGoliath}
-              style={{
-                marginTop: 8,
-                padding: "4px 8px",
-                background: "#d97706",
-                color: "#fff",
-                border: "none",
-                borderRadius: 4,
-                cursor: "pointer",
-              }}
-            >
-              🧪 Inject Goliath onto Active Selection
-            </button>
+            {import.meta.env.DEV && (
+              <>
+                <p role="note" style={{ margin: "8px 0 0", color: "#92400e", fontSize: 12 }}>
+                  Developer presentation demo only: changes the React view, not authoritative
+                  Rust/WASM or network match state.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleDevInjectGoliath}
+                  style={{
+                    marginTop: 8,
+                    padding: "4px 8px",
+                    background: "#d97706",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                  }}
+                >
+                  🧪 Demo: show Goliath on selected unit
+                </button>
+              </>
+            )}
             {loadedModProfiles.length > 0 && (
               <ul style={styles.modProfileList} aria-label="Loaded mod profiles">
                 {loadedModProfiles.map((profile) => (
