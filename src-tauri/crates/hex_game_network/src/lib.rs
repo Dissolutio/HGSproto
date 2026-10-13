@@ -43,6 +43,95 @@ pub struct MatchSession {
     player_session: Arc<Mutex<Option<(String, String)>>>,
 }
 
+#[derive(Clone)]
+pub struct NetworkManager {
+    match_id: String,
+    session: Arc<RwLock<Option<Arc<MatchSession>>>>,
+}
+
+impl NetworkManager {
+    pub fn new(match_id: impl Into<String>) -> Self {
+        Self {
+            match_id: match_id.into(),
+            session: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub async fn host_match(&self) -> Result<String, String> {
+        let mut session = self.session.write().await;
+        if session.is_some() {
+            return Err("This manager already has an active match session".to_string());
+        }
+        let hosted = Arc::new(
+            MatchSession::host_match()
+                .await
+                .map_err(|error| format!("Could not host match: {error}"))?,
+        );
+        let node_id = hosted.local_node_id.clone();
+        *session = Some(hosted);
+        Ok(node_id)
+    }
+
+    pub async fn join_match(&self, remote_node_id: &str) -> Result<(), String> {
+        let mut session = self.session.write().await;
+        if session.is_some() {
+            return Err("This manager already has an active match session".to_string());
+        }
+        let joined = Arc::new(
+            MatchSession::join_match(remote_node_id)
+                .await
+                .map_err(|error| format!("Could not join match: {error}"))?,
+        );
+        joined
+            .authenticate_player(&self.match_id, "Player_2")
+            .await
+            .map_err(|error| format!("Could not synchronize match state: {error}"))?;
+        *session = Some(joined);
+        Ok(())
+    }
+
+    pub async fn accept_peer(&self) -> Result<(), String> {
+        let session = self.active_session().await?;
+        session
+            .accept_peer_for_match(Some(&self.match_id))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn read_next_action_token(&self) -> Result<String, String> {
+        self.active_session()
+            .await?
+            .read_next_action_token()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn send_action_token(&self, token: &str) -> Result<(), String> {
+        self.active_session()
+            .await?
+            .send_action_token(token)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn mark_disconnected(&self) -> Result<(), String> {
+        self.active_session().await?.mark_disconnected().await;
+        Ok(())
+    }
+
+    pub async fn peer_connected(&self) -> Result<bool, String> {
+        Ok(self.active_session().await?.has_active_connection().await)
+    }
+
+    pub async fn active_session(&self) -> Result<Arc<MatchSession>, String> {
+        self.session
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "No active network match session".to_string())
+    }
+}
+
 impl MatchSession {
     /// Start listening for a peer and return the node ID to share as the invite.
     pub async fn host_match() -> Result<Self, NetworkError> {
@@ -102,6 +191,13 @@ impl MatchSession {
 
     /// Wait for the first peer to complete the match protocol handshake.
     pub async fn accept_peer(&self) -> Result<(), NetworkError> {
+        self.accept_peer_for_match(None).await
+    }
+
+    async fn accept_peer_for_match(
+        &self,
+        expected_match_id: Option<&str>,
+    ) -> Result<(), NetworkError> {
         if !self.is_host {
             return Err(NetworkError("Only the host can accept a peer".into()));
         }
@@ -124,6 +220,10 @@ impl MatchSession {
                         Ok(identity) => identity,
                         Err(_) => continue,
                     };
+                    if expected_match_id.is_some_and(|expected| expected != match_id) {
+                        let _ = send_packet(&connection, "E:AUTH_REJECTED").await;
+                        continue;
+                    }
                     if !engine::match_exists(&match_id)
                         || engine::rebind_player_session(&match_id, &player_tag).is_err()
                     {
@@ -239,6 +339,10 @@ impl MatchSession {
             .await
             .clone()
             .ok_or_else(|| NetworkError("No active peer connection".into()))
+    }
+
+    async fn has_active_connection(&self) -> bool {
+        self.connection.read().await.is_some()
     }
 
     /// Broadcast an action barcode token out over a single-use unidirectional stream

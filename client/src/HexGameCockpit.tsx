@@ -544,6 +544,8 @@ export default function HexGameCockpit() {
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [modProfileText, setModProfileText] = useState("");
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
+  const [networkNodeId, setNetworkNodeId] = useState("");
+  const [remoteNodeId, setRemoteNodeId] = useState("");
   const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
@@ -588,6 +590,20 @@ export default function HexGameCockpit() {
     ws.onmessage = (event) => {
       if (cancelled) return;
       const message = String(event.data);
+      if (message.startsWith("P2P_HOSTED:") || message.startsWith("P2P_JOINED:")) {
+        const [eventName, nodeId] = message.split(":", 2);
+        setNetworkNodeId(nodeId ?? "");
+        setNotice(eventName === "P2P_HOSTED" ? "Iroh host is ready; share your Node ID" : "Joined and synchronized with the host");
+        return;
+      }
+      if (message === "P2P_CONNECTED") {
+        setNotice("Peer connected; action-token synchronization is active");
+        return;
+      }
+      if (message.startsWith("P2P_DISCONNECTED:")) {
+        setNotice(`Peer disconnected: ${message.slice("P2P_DISCONNECTED:".length)}`);
+        return;
+      }
       if (message.startsWith("E:")) {
         setNotice(message.slice(2));
         return;
@@ -789,6 +805,30 @@ export default function HexGameCockpit() {
     setNotice(`Injected Goliath Exo-Suit onto ${selectedUnitId}`);
   };
 
+  const sendNetworkControl = (message: string) => {
+    if (mode !== "network" || !socket || socket.readyState !== WebSocket.OPEN) {
+      setNotice("Switch to Live Network Mode and connect to the local Iroh gateway first");
+      return;
+    }
+    try {
+      socket.send(message);
+      setNotice(message === "HOST" ? "Starting Iroh host endpoint…" : "Connecting to Iroh host…");
+    } catch (error) {
+      setNotice(`Network request failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const handleHostMatch = () => sendNetworkControl("HOST");
+
+  const handleJoinMatch = () => {
+    const hostNodeId = remoteNodeId.trim();
+    if (!hostNodeId) {
+      setNotice("Enter the host's Iroh Node ID");
+      return;
+    }
+    sendNetworkControl(`JOIN:${hostNodeId}`);
+  };
+
   const playerOneCount = units.filter((unit) => {
     const labels = unitLabels(unit);
     return labels.includes("P1") || labels.includes("Player_1");
@@ -941,6 +981,50 @@ export default function HexGameCockpit() {
               </ul>
             )}
           </details>
+          <details style={styles.networkPortal}>
+            <summary style={styles.modLoaderSummary}>🌐 Multiplayer Connection Portal</summary>
+            <p style={styles.networkPortalHelp}>
+              Host or join through the local native gateway. Iroh handles encrypted peer transport and relay discovery; browser traffic reaches it over this local WebSocket.
+            </p>
+            <button
+              type="button"
+              onClick={handleHostMatch}
+              disabled={mode !== "network" || !socket || socket.readyState !== WebSocket.OPEN || !!networkNodeId}
+              style={styles.networkButton}
+            >
+              Host Match
+            </button>
+            {networkNodeId && (
+              <label style={styles.modLoaderLabel} htmlFor="local-iroh-node-id">
+                Your Iroh connection string / Node ID
+                <input
+                  id="local-iroh-node-id"
+                  readOnly
+                  value={networkNodeId}
+                  onFocus={(event) => event.currentTarget.select()}
+                  style={styles.networkInput}
+                />
+              </label>
+            )}
+            <label style={styles.modLoaderLabel} htmlFor="remote-iroh-node-id">
+              Host Node ID
+              <input
+                id="remote-iroh-node-id"
+                value={remoteNodeId}
+                onChange={(event) => setRemoteNodeId(event.target.value)}
+                placeholder="Paste the host's Iroh Node ID"
+                style={styles.networkInput}
+              />
+            </label>
+            <button
+              type="button"
+              onClick={handleJoinMatch}
+              disabled={mode !== "network" || !socket || socket.readyState !== WebSocket.OPEN}
+              style={styles.networkButton}
+            >
+              Join Match
+            </button>
+          </details>
         </aside>
       </section>
 
@@ -1090,6 +1174,33 @@ const styles: Record<string, CSSProperties> = {
     cursor: "pointer",
   },
   modProfileList: { margin: "9px 0 0", paddingLeft: 16, color: "#b4c5ba", fontSize: 10, overflowWrap: "anywhere" },
+  networkPortal: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTop: "1px solid #4d6860",
+  },
+  networkPortalHelp: { margin: "8px 0", color: "#9aac9e", fontSize: 10, lineHeight: 1.45 },
+  networkInput: {
+    display: "block",
+    width: "100%",
+    boxSizing: "border-box",
+    marginTop: 5,
+    padding: 7,
+    border: "1px solid #4d6860",
+    background: "#101c1d",
+    color: "#e5efe8",
+    font: "10px ui-monospace, monospace",
+  },
+  networkButton: {
+    margin: "4px 5px 4px 0",
+    padding: "7px 10px",
+    border: "1px solid #70d6a4",
+    background: "#183b35",
+    color: "#f1f4ed",
+    font: "inherit",
+    fontSize: 11,
+    cursor: "pointer",
+  },
   canvas: { width: "100%", height: "100%", display: "block" },
   healthOverlayLayer: {
     position: "absolute",

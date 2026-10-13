@@ -1,15 +1,13 @@
 use std::error::Error;
 use std::ffi::{CStr, CString};
-use std::io::{self, Write};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use hex_game_core::engine::{match_exists, rebind_player_session};
+use hex_game_core::engine::{match_exists, rebind_player_session, release_player_session};
 use hex_game_core::ffi::{
     hgs_free_string, hgs_get_current_state, hgs_initialize_test_match, hgs_process_token_for_match,
 };
-use hex_game_network::MatchSession;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use hex_game_network::NetworkManager;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -17,159 +15,16 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 const MATCH_ID: &str = "p2p_sandbox_match";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    println!("========================================");
-    println!("          HEXGAMESIM P2P SANDBOX");
-    println!("========================================");
-    println!("1. Host a Match");
-    println!("2. Join an Active Match");
-
-    let mut input = BufReader::new(tokio::io::stdin());
-    let role = prompt_line(&mut input, "Select role (1 or 2): ").await?;
-    let (session, is_host) = match role.trim() {
-        "1" => {
-            initialize_if_missing(MATCH_ID)?;
-            rebind_player_session(MATCH_ID, "Player_1")?;
-            let session = MatchSession::host_match().await?;
-            println!("Host endpoint ready.");
-            println!("Share this Node ID with the joining player:");
-            println!("{}", session.local_node_id);
-            (session, true)
-        }
-        "2" => {
-            let target_id = prompt_line(&mut input, "Paste the host Node ID: ").await?;
-            initialize_if_missing(MATCH_ID)?;
-            let session = MatchSession::join_match(target_id.trim()).await?;
-            let snapshot = session.authenticate_player(MATCH_ID, "Player_2").await?;
-            println!("Authenticated and restored match snapshot: {snapshot}");
-            (session, false)
-        }
-        _ => return Err("Invalid selection. Choose 1 to host or 2 to join.".into()),
-    };
-
-    let session = Arc::new(session);
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    initialize_if_missing(MATCH_ID)?;
+    let manager = Arc::new(NetworkManager::new(MATCH_ID));
     let (state_updates, _) = broadcast::channel(64);
-    let gateway_session = Arc::clone(&session);
-    let gateway_updates = state_updates.clone();
-    tokio::spawn(async move {
-        if let Err(error) = run_websocket_gateway(gateway_session, gateway_updates).await {
-            eprintln!("WebSocket gateway stopped: {error}");
-        }
-    });
-    println!("Web cockpit listening at ws://127.0.0.1:8080");
-
-    if is_host {
-        println!("Waiting for a peer to connect...");
-        session.accept_peer().await?;
-    }
-    println!("Peer connected. Local match is ready: {MATCH_ID}");
-
-    let incoming_session = Arc::clone(&session);
-    let incoming_updates = state_updates.clone();
-    tokio::spawn(async move {
-        loop {
-            match incoming_session.read_next_action_token().await {
-                Ok(token) => {
-                    println!("\nReceived action: {token}");
-                    match process_token(MATCH_ID, &token) {
-                        Ok(result) if result.starts_with("VALID_STEP:") => {
-                            publish_current_state(MATCH_ID, &incoming_updates);
-                        }
-                        Ok(result) => {
-                            let _ = incoming_updates.send(format!("E:{result}"));
-                        }
-                        Err(error) => {
-                            let _ = incoming_updates.send(format!("E:{error}"));
-                        }
-                    }
-                    print!("Move token (or /quit): ");
-                    let _ = io::stdout().flush();
-                }
-                Err(error) => {
-                    eprintln!("Incoming network stream ended: {error}");
-                    incoming_session.mark_disconnected().await;
-                    if incoming_session.is_host {
-                        eprintln!("Waiting for an authenticated reconnection...");
-                        if let Err(error) = incoming_session.accept_peer().await {
-                            eprintln!("Could not accept reconnection: {error}");
-                            break;
-                        }
-                        println!("Peer reconnected; live match state retained.");
-                    } else {
-                        eprintln!("Reconnect with /reconnect <host-node-id>.");
-                        incoming_session.wait_for_connection().await;
-                    }
-                }
-            }
-        }
-    });
-
-    print!("Move token (or /quit): ");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    while input.read_line(&mut line).await? != 0 {
-        let token = line.trim();
-        if token == "/quit" {
-            break;
-        }
-        if token.is_empty() {
-            print!("Move token (or /quit): ");
-            io::stdout().flush()?;
-            continue;
-        }
-
-        if let Some(target_id) = token.strip_prefix("/reconnect ") {
-            match session
-                .reconnect_match(target_id.trim(), MATCH_ID, "Player_2")
-                .await
-            {
-                Ok(snapshot) => {
-                    println!("Reconnected; authoritative snapshot restored: {snapshot}")
-                }
-                Err(error) => eprintln!("Could not reconnect: {error}"),
-            }
-            print!("Move token (or /quit): ");
-            io::stdout().flush()?;
-            line.clear();
-            continue;
-        }
-
-        match process_token(MATCH_ID, token) {
-            Ok(result) => {
-                println!("Local action result: {result}");
-                if result.starts_with("VALID_STEP:") {
-                    publish_current_state(MATCH_ID, &state_updates);
-                    if let Err(error) = session.send_action_token(token).await {
-                        eprintln!("Could not broadcast action: {error}");
-                        let _ = state_updates.send(format!("E:Network send failed: {error}"));
-                    }
-                } else {
-                    let _ = state_updates.send(format!("E:{result}"));
-                }
-            }
-            Err(error) => eprintln!("Could not process action: {error}"),
-        }
-        print!("Move token (or /quit): ");
-        io::stdout().flush()?;
-        line.clear();
-    }
-
-    println!("Leaving P2P sandbox.");
+    println!("P2P gateway ready at ws://127.0.0.1:8080 for {MATCH_ID}");
+    run_websocket_gateway(manager, state_updates).await?;
     Ok(())
 }
 
-async fn prompt_line<R>(input: &mut R, prompt: &str) -> io::Result<String>
-where
-    R: AsyncBufRead + Unpin,
-{
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    input.read_line(&mut line).await?;
-    Ok(line)
-}
-
-fn initialize_if_missing(match_id: &str) -> Result<(), Box<dyn Error>> {
+fn initialize_if_missing(match_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     if match_exists(match_id) {
         return Ok(());
     }
@@ -208,16 +63,16 @@ fn get_current_state(match_id: &str) -> Result<String, Box<dyn Error + Send + Sy
 }
 
 async fn run_websocket_gateway(
-    session: Arc<MatchSession>,
+    manager: Arc<NetworkManager>,
     state_updates: broadcast::Sender<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
     loop {
         let (stream, _) = listener.accept().await?;
-        let session = Arc::clone(&session);
+        let manager = Arc::clone(&manager);
         let state_updates = state_updates.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_websocket(stream, session, state_updates).await {
+            if let Err(error) = serve_websocket(stream, manager, state_updates).await {
                 eprintln!("WebSocket client disconnected: {error}");
             }
         });
@@ -226,7 +81,7 @@ async fn run_websocket_gateway(
 
 async fn serve_websocket(
     stream: TcpStream,
-    session: Arc<MatchSession>,
+    manager: Arc<NetworkManager>,
     state_updates: broadcast::Sender<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let websocket = accept_async(stream).await?;
@@ -242,12 +97,46 @@ async fn serve_websocket(
                 let Some(incoming) = incoming else { break };
                 let message = incoming?;
                 match message {
-                    Message::Text(command) if command.starts_with("M:") => {
+                    Message::Text(command) if command == "HOST" => {
+                        match start_host_session(Arc::clone(&manager), state_updates.clone()).await {
+                            Ok(node_id) => {
+                                let _ = state_updates.send(format!("P2P_HOSTED:{node_id}"));
+                            }
+                            Err(error) => {
+                                let _ = state_updates.send(format!("E:{error}"));
+                            }
+                        }
+                    }
+                    Message::Text(command) if command.starts_with("JOIN:") => {
+                        let remote_node_id = command["JOIN:".len()..].trim();
+                        match start_join_session(
+                            Arc::clone(&manager),
+                            remote_node_id,
+                            state_updates.clone(),
+                        ).await {
+                            Ok(node_id) => {
+                                publish_current_state(MATCH_ID, &state_updates);
+                                let _ = state_updates.send(format!("P2P_JOINED:{node_id}"));
+                            }
+                            Err(error) => {
+                                let _ = state_updates.send(format!("E:{error}"));
+                            }
+                        }
+                    }
+                    Message::Text(command) if is_action_token(&command) => {
                         match process_token(MATCH_ID, &command) {
                             Ok(result) if result.starts_with("VALID_STEP:") => {
                                 publish_current_state(MATCH_ID, &state_updates);
-                                if let Err(error) = session.send_action_token(&command).await {
-                                    let _ = state_updates.send(format!("E:Network send failed: {error}"));
+                                match manager.peer_connected().await {
+                                    Ok(true) => {
+                                        if let Err(error) = manager.send_action_token(&command).await {
+                                            let _ = state_updates.send(format!("E:Network send failed: {error}"));
+                                        }
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        let _ = state_updates.send(format!("E:{error}"));
+                                    }
                                 }
                             }
                             Ok(result) => {
@@ -259,7 +148,9 @@ async fn serve_websocket(
                         }
                     }
                     Message::Text(_) => {
-                        let _ = state_updates.send("E:Only M: movement tokens are supported".to_string());
+                        let _ = state_updates.send(
+                            "E:Expected HOST, JOIN:<node-id>, or an M:/A: action token".to_string(),
+                        );
                     }
                     Message::Close(_) => break,
                     Message::Ping(payload) => websocket_sink.send(Message::Pong(payload)).await?,
@@ -280,6 +171,103 @@ async fn serve_websocket(
         }
     }
     Ok(())
+}
+
+async fn start_host_session(
+    manager: Arc<NetworkManager>,
+    state_updates: broadcast::Sender<String>,
+) -> Result<String, String> {
+    if manager.active_session().await.is_ok() {
+        return Err("This gateway already has a network session".to_string());
+    }
+    initialize_if_missing(MATCH_ID).map_err(|error| error.to_string())?;
+    rebind_player_session(MATCH_ID, "Player_1")?;
+    match manager.host_match().await {
+        Ok(node_id) => {
+            tokio::spawn(run_host_peer_loop(manager, state_updates));
+            Ok(node_id)
+        }
+        Err(error) => {
+            release_player_session(MATCH_ID, "Player_1");
+            Err(error)
+        }
+    }
+}
+
+async fn start_join_session(
+    manager: Arc<NetworkManager>,
+    remote_node_id: &str,
+    state_updates: broadcast::Sender<String>,
+) -> Result<String, String> {
+    if remote_node_id.is_empty() {
+        return Err("Enter the host's Iroh Node ID".to_string());
+    }
+    manager.join_match(remote_node_id).await?;
+    let joined = manager.active_session().await?;
+    let local_node_id = joined.local_node_id.clone();
+    tokio::spawn(run_join_peer_loop(manager, state_updates));
+    Ok(local_node_id)
+}
+
+async fn run_host_peer_loop(
+    manager: Arc<NetworkManager>,
+    state_updates: broadcast::Sender<String>,
+) {
+    loop {
+        if let Err(error) = manager.accept_peer().await {
+            let _ = state_updates.send(format!("E:Could not accept peer: {error}"));
+            return;
+        }
+        let _ = state_updates.send("P2P_CONNECTED".to_string());
+        loop {
+            match manager.read_next_action_token().await {
+                Ok(token) => apply_peer_action(&token, &state_updates),
+                Err(error) => {
+                    let _ = manager.mark_disconnected().await;
+                    let _ = state_updates.send(format!("P2P_DISCONNECTED:{error}"));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn run_join_peer_loop(
+    manager: Arc<NetworkManager>,
+    state_updates: broadcast::Sender<String>,
+) {
+    loop {
+        match manager.read_next_action_token().await {
+            Ok(token) => apply_peer_action(&token, &state_updates),
+            Err(error) => {
+                let _ = manager.mark_disconnected().await;
+                let _ = state_updates.send(format!("P2P_DISCONNECTED:{error}"));
+                break;
+            }
+        }
+    }
+}
+
+fn is_action_token(token: &str) -> bool {
+    token.starts_with("M:") || token.starts_with("A:")
+}
+
+fn apply_peer_action(token: &str, state_updates: &broadcast::Sender<String>) {
+    if !is_action_token(token) {
+        let _ = state_updates.send("E:Peer sent a non-action protocol message".to_string());
+        return;
+    }
+    match process_token(MATCH_ID, token) {
+        Ok(result) if result.starts_with("VALID_STEP:") => {
+            publish_current_state(MATCH_ID, state_updates);
+        }
+        Ok(result) => {
+            let _ = state_updates.send(format!("E:{result}"));
+        }
+        Err(error) => {
+            let _ = state_updates.send(format!("E:{error}"));
+        }
+    }
 }
 
 fn publish_current_state(match_id: &str, state_updates: &broadcast::Sender<String>) {

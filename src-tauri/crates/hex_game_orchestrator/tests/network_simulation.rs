@@ -6,11 +6,57 @@ use hex_game_core::engine::{match_exists, rebind_player_session, release_player_
 use hex_game_core::ffi::{
     hgs_free_string, hgs_get_current_state, hgs_initialize_test_match, hgs_process_token_for_match,
 };
-use hex_game_network::MatchSession;
+use hex_game_network::{MatchSession, NetworkManager};
 use tokio::time::{sleep, timeout};
 
 const MATCH_ID: &str = "p2p_auto_match";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(25);
+
+#[tokio::test]
+async fn network_manager_host_join_and_action_token_sync() {
+    let match_id = format!("network_manager_test_{}", std::process::id());
+    hex_game_core::engine::store_match(
+        match_id.clone(),
+        hex_game_core::engine::generate_test_sandbox(match_id.clone()),
+    );
+    rebind_player_session(&match_id, "Player_1").unwrap();
+
+    let host = Arc::new(NetworkManager::new(match_id.clone()));
+    let host_node_id = timeout(NETWORK_TIMEOUT, host.host_match())
+        .await
+        .expect("host startup timed out")
+        .expect("host startup failed");
+    let host_accept = {
+        let host = Arc::clone(&host);
+        tokio::spawn(async move { host.accept_peer().await })
+    };
+
+    let client = Arc::new(NetworkManager::new(match_id.clone()));
+    timeout(NETWORK_TIMEOUT, client.join_match(&host_node_id))
+        .await
+        .expect("client connection timed out")
+        .expect("client join failed");
+    timeout(NETWORK_TIMEOUT, host_accept)
+        .await
+        .expect("host authentication timed out")
+        .expect("host accept task panicked")
+        .expect("host rejected the client");
+
+    let token = "M:UNIT_P2_1:Q1R0Z0";
+    client.send_action_token(token).await.unwrap();
+    let received = timeout(NETWORK_TIMEOUT, host.read_next_action_token())
+        .await
+        .expect("host action receive timed out")
+        .expect("host failed to receive action");
+    assert_eq!(received, token);
+    hex_game_core::engine::process_action(&match_id, &received).unwrap();
+
+    let state = current_state(&match_id);
+    assert_eq!(state["entities"]["UNIT_P2_1"]["spatial"]["q"], 1);
+    client.mark_disconnected().await.unwrap();
+    host.mark_disconnected().await.unwrap();
+    release_player_session(&match_id, "Player_1");
+}
 
 #[tokio::test]
 async fn network_simulation_auth_sync_disconnect_and_recovery() {
