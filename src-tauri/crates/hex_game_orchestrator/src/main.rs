@@ -8,24 +8,23 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use hex_game_core::engine::{
-    match_exists, rebind_player_session, release_player_session, remove_match,
-};
-use hex_game_core::ffi::{
-    hgs_free_string, hgs_get_current_state, hgs_initialize_test_match, hgs_process_token_for_match,
-};
+use hex_game_core::engine::{rebind_player_session, release_player_session, remove_match};
+use hex_game_core::ffi::{hgs_free_string, hgs_get_current_state, hgs_process_token_for_match};
+use hex_game_core::mod_registry::ModRegistry;
 use hex_game_network::{MatchSession, NetworkManager};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 const DISCONNECTED_SESSION_RETENTION: Duration = Duration::from_secs(15 * 60);
+static MOD_REGISTRY: LazyLock<ModRegistry> = LazyLock::new(ModRegistry::default);
 static MANAGED_SESSIONS: LazyLock<Mutex<HashMap<String, Arc<ManagedSession>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct ManagedSession {
     manager_id: String,
     match_id: String,
+    map_json: String,
     manager: Arc<NetworkManager>,
     state_updates: broadcast::Sender<String>,
     action_log: Mutex<Vec<String>>,
@@ -105,16 +104,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-fn initialize_if_missing(match_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if match_exists(match_id) {
-        return Ok(());
-    }
-    let match_id = CString::new(match_id)?;
-    unsafe { hgs_initialize_test_match(match_id.as_ptr()) };
-    Ok(())
+fn initialize_from_map(match_id: &str, map_json: &str) -> Result<(), String> {
+    hex_game_core::engine::try_initialize_from_hexoscape_with_registry(
+        match_id.to_string(),
+        map_json,
+        &MOD_REGISTRY,
+    )
 }
 
-fn get_or_create_session(manager_id: &str) -> Result<(Arc<ManagedSession>, bool), String> {
+fn get_or_create_session(
+    manager_id: &str,
+    map_json: &str,
+) -> Result<(Arc<ManagedSession>, bool), String> {
     if !is_valid_session_id(manager_id) {
         return Err("Invalid cached manager ID".to_string());
     }
@@ -132,11 +133,12 @@ fn get_or_create_session(manager_id: &str) -> Result<(Arc<ManagedSession>, bool)
     }
 
     let match_id = format!("browser_{manager_id}");
-    initialize_if_missing(&match_id).map_err(|error| error.to_string())?;
+    initialize_from_map(&match_id, map_json)?;
     let (state_updates, _) = broadcast::channel(64);
     let session = Arc::new(ManagedSession {
         manager_id: manager_id.to_string(),
         match_id: match_id.clone(),
+        map_json: map_json.to_string(),
         manager: Arc::new(NetworkManager::new(match_id)),
         state_updates,
         action_log: Mutex::new(Vec::new()),
@@ -277,8 +279,11 @@ async fn serve_websocket(stream: TcpStream) -> Result<(), Box<dyn Error + Send +
         _ => return Err("Expected a text session initialization packet".into()),
     };
     let reconnect_requested = handshake.starts_with("RECONNECT_SESSION:");
-    let session_result = if let Some(manager_id) = handshake.strip_prefix("SESSION_ID:") {
-        get_or_create_session(manager_id)
+    let session_result = if let Some(payload) = handshake.strip_prefix("SESSION_ID:") {
+        match payload.split_once(':') {
+            Some((manager_id, map_json)) => get_or_create_session(manager_id, map_json),
+            None => Err("SESSION_ID handshake must include map JSON".to_string()),
+        }
     } else if let Some(payload) = handshake.strip_prefix("RECONNECT_SESSION:") {
         match parse_reconnect_payload(payload) {
             Ok((match_id, manager_id)) => {
@@ -385,31 +390,43 @@ async fn serve_websocket(stream: TcpStream) -> Result<(), Box<dyn Error + Send +
                         }
                     }
                     Message::Text(command)
-                        if command == "HARD_RESET_SESSION"
-                            || command == "DISCONNECT_SESSION_TOKEN" =>
+                        if matches!(
+                            command.as_str(),
+                            "LEAVE_MATCH"
+                                | "RESET"
+                                | "HARD_RESET_SESSION"
+                                | "DISCONNECT_SESSION_TOKEN"
+                        ) =>
                     {
+                        let eviction_result = MANAGED_SESSIONS
+                            .lock()
+                            .map(|mut sessions| sessions.remove(&session.manager_id))
+                            .map_err(|_| "Network session registry is unavailable".to_string());
                         let disconnect_result = session.manager.disconnect_session().await;
-                        hex_game_core::engine::store_match(
-                            session.match_id.clone(),
-                            hex_game_core::engine::generate_test_sandbox(session.match_id.clone()),
-                        );
-                        let log_result = session.clear_action_log();
-                        publish_current_state(&session.match_id, &session.state_updates);
-                        match disconnect_result {
-                            Ok(()) => {
-                                if let Err(error) = log_result {
-                                    websocket_sink
-                                        .send(Message::Text(format!("E:{error}").into()))
-                                        .await?;
-                                }
-                                let _ = session.state_updates.send("P2P_RESET".to_string());
-                            }
-                            Err(error) => {
-                                websocket_sink
-                                    .send(Message::Text(format!("E:{error}").into()))
-                                    .await?;
-                            }
+                        release_player_session(&session.match_id, "Player_1");
+                        release_player_session(&session.match_id, "Player_2");
+                        remove_match(&session.match_id);
+                        let action_log_result = session.clear_action_log();
+
+                        if let Err(error) = eviction_result {
+                            websocket_sink
+                                .send(Message::Text(format!("E:{error}").into()))
+                                .await?;
                         }
+                        if let Err(error) = disconnect_result {
+                            websocket_sink
+                                .send(Message::Text(format!("E:{error}").into()))
+                                .await?;
+                        }
+                        if let Err(error) = action_log_result {
+                            websocket_sink
+                                .send(Message::Text(format!("E:{error}").into()))
+                                .await?;
+                        }
+                        websocket_sink
+                            .send(Message::Text("P2P_RESET".into()))
+                            .await?;
+                        break;
                     }
                     Message::Text(command) if command.starts_with("RECONNECT_SESSION:") => {
                         match parse_reconnect_payload(&command["RECONNECT_SESSION:".len()..]) {
@@ -527,7 +544,7 @@ async fn start_host_session(session: Arc<ManagedSession>) -> Result<String, Stri
     if session.manager.active_session().await.is_ok() {
         return Err("This gateway already has a network session".to_string());
     }
-    initialize_if_missing(&session.match_id).map_err(|error| error.to_string())?;
+    initialize_from_map(&session.match_id, &session.map_json)?;
     rebind_player_session(&session.match_id, "Player_1")?;
     match session.manager.host_match().await {
         Ok(node_id) => {
@@ -693,7 +710,7 @@ fn publish_current_state(match_id: &str, state_updates: &broadcast::Sender<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::serve_websocket;
+    use super::{MANAGED_SESSIONS, serve_websocket};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::Value;
     use std::net::SocketAddr;
@@ -702,6 +719,17 @@ mod tests {
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
     type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    const TEST_MAP_JSON: &str = r#"{
+        "hexMap": {"name": "orchestrator-test"},
+        "boardPieces": [{
+            "uid": "sandbox-g7",
+            "inventoryID": "g7",
+            "altitude": 0,
+            "rotation": 0,
+            "pieceCoords": {"q": 0, "r": 0, "s": 0}
+        }]
+    }"#;
 
     async fn receive_text(socket: &mut TestSocket) -> String {
         timeout(Duration::from_secs(45), async {
@@ -727,7 +755,9 @@ mod tests {
         .expect("WebSocket connect timed out")
         .expect("WebSocket connect failed");
         socket
-            .send(Message::Text(format!("SESSION_ID:{session_id}").into()))
+            .send(Message::Text(
+                format!("SESSION_ID:{session_id}:{TEST_MAP_JSON}").into(),
+            ))
             .await
             .expect("failed to send session handshake");
         let initial_state: Value = serde_json::from_str(&receive_text(&mut socket).await)
@@ -790,7 +820,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut sessions = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (stream, _) = listener.accept().await.unwrap();
                 sessions.push(tokio::spawn(async move { serve_websocket(stream).await }));
             }
@@ -800,6 +830,20 @@ mod tests {
         });
 
         let (mut host_tab, host_initial) = connect_session(address, "tab_host_123").await;
+        assert!(
+            host_initial["entities"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|entity| {
+                    entity["components"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .any(|component| component["type"] == "Terrain")
+                }),
+            "data-driven map initialization should serialize terrain cells"
+        );
         let host_match_id = host_initial["context"]["match_id"]
             .as_str()
             .unwrap()
@@ -841,7 +885,7 @@ mod tests {
         .expect("second tab did not join the host session");
 
         host_tab
-            .send(Message::Text("M:UNIT_P1_1:Q0R0Z0".into()))
+            .send(Message::Text("M:UNIT_P1_1:Q0R2Z0".into()))
             .await
             .unwrap();
         let host_state = wait_for_move_state(&mut host_tab).await;
@@ -855,7 +899,7 @@ mod tests {
         let (mut join_tab, recovered_state, recovered_actions) =
             reconnect_session(address, "tab_join_456", &join_match_id).await;
         assert_eq!(recovered_state, join_state);
-        assert_eq!(recovered_actions, vec!["M:UNIT_P1_1:Q0R0Z0"]);
+        assert_eq!(recovered_actions, vec!["M:UNIT_P1_1:Q0R2Z0"]);
 
         join_tab
             .send(Message::Text(
@@ -868,7 +912,7 @@ mod tests {
         assert_eq!(replayed_state, recovered_state);
         assert_eq!(
             receive_text(&mut join_tab).await,
-            r#"ACTION_LOG:["M:UNIT_P1_1:Q0R0Z0"]"#
+            r#"ACTION_LOG:["M:UNIT_P1_1:Q0R2Z0"]"#
         );
         assert!(
             receive_text(&mut join_tab)
@@ -880,17 +924,11 @@ mod tests {
             .send(Message::Text("HARD_RESET_SESSION".into()))
             .await
             .unwrap();
-        let mut reset_state = None;
         let mut reset_confirmed = false;
         timeout(Duration::from_secs(10), async {
             while !reset_confirmed {
                 let message = receive_text(&mut join_tab).await;
-                if message.starts_with('{') {
-                    reset_state = Some(
-                        serde_json::from_str::<Value>(&message)
-                            .expect("reset response was not a match snapshot"),
-                    );
-                } else if message == "P2P_RESET" {
+                if message == "P2P_RESET" {
                     reset_confirmed = true;
                 }
             }
@@ -898,16 +936,35 @@ mod tests {
         .await
         .expect("second tab did not receive reset confirmation");
 
-        let reset_state = reset_state.unwrap();
-        assert_eq!(reset_state["context"]["match_id"], join_match_id);
+        assert!(!hex_game_core::engine::match_exists(&join_match_id));
+        assert!(
+            !MANAGED_SESSIONS
+                .lock()
+                .unwrap()
+                .contains_key("tab_join_456")
+        );
         let host_state: Value =
             serde_json::from_str(&super::get_current_state(&host_match_id).unwrap()).unwrap();
         assert_eq!(host_state["entities"]["UNIT_P1_1"]["spatial"]["q"], 0);
-        assert_eq!(host_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 0);
-        assert_eq!(reset_state["entities"]["UNIT_P1_1"]["spatial"]["q"], -1);
+        assert_eq!(host_state["entities"]["UNIT_P1_1"]["spatial"]["r"], 2);
+
+        let (mut reused_tab, reused_state) = connect_session(address, "tab_join_456").await;
+        assert_eq!(reused_state["context"]["match_id"], join_match_id);
+        assert!(hex_game_core::engine::match_exists(&join_match_id));
+        reused_tab.send(Message::Text("HOST".into())).await.unwrap();
+        assert!(
+            receive_text(&mut reused_tab)
+                .await
+                .starts_with("HOST_ALLOCATED:")
+        );
+        reused_tab
+            .send(Message::Text("RESET".into()))
+            .await
+            .unwrap();
+        assert_eq!(receive_text(&mut reused_tab).await, "P2P_RESET");
+        assert!(!hex_game_core::engine::match_exists(&join_match_id));
 
         host_tab.send(Message::Close(None)).await.unwrap();
-        join_tab.send(Message::Close(None)).await.unwrap();
         server.await.unwrap();
     }
 }

@@ -579,6 +579,7 @@ export default function HexGameCockpit() {
   const [recoverySession, setRecoverySession] = useState<RecoverySession | null>(
     readRecoverySession,
   );
+  const [recoveryDismissed, setRecoveryDismissed] = useState(false);
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const reconnectAttempts = useRef(0);
   const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
@@ -628,6 +629,7 @@ export default function HexGameCockpit() {
       window.sessionStorage.setItem(ACTIVE_MATCH_ID_STORAGE_KEY, matchId);
       window.sessionStorage.setItem(CACHED_MANAGER_ID_STORAGE_KEY, managerId);
       setRecoverySession({ matchId, managerId });
+      setRecoveryDismissed(false);
     };
     const clearActiveSession = () => {
       activeMatchId = null;
@@ -658,7 +660,7 @@ export default function HexGameCockpit() {
           gatewaySocket.send(
             activeMatchId
               ? `RECONNECT_SESSION:${activeMatchId}:${managerId}`
-              : `SESSION_ID:${managerId}`,
+              : `SESSION_ID:${managerId}:${MOCK_MAP_JSON}`,
           );
           setConnection("connected");
           setNotice(
@@ -772,7 +774,6 @@ export default function HexGameCockpit() {
       gatewaySocket.onclose = () => {
         if (cancelled) return;
         setConnection("offline");
-        setSocket((activeSocket) => activeSocket === gatewaySocket ? null : activeSocket);
         const storedSession = readRecoverySession();
         if (storedSession) setRecoverySession(storedSession);
         setNotice(
@@ -1009,6 +1010,7 @@ export default function HexGameCockpit() {
       return;
     }
     setRecoverySession(cachedSession);
+    setRecoveryDismissed(false);
     setNotice(`Rebinding to match ${cachedSession.matchId}…`);
     if (mode !== "network") {
       setMode("network");
@@ -1067,6 +1069,7 @@ export default function HexGameCockpit() {
     window.sessionStorage.removeItem(ACTIVE_MATCH_ID_STORAGE_KEY);
     window.sessionStorage.removeItem(CACHED_MANAGER_ID_STORAGE_KEY);
     setRecoverySession(null);
+    setRecoveryDismissed(false);
     setLocalNodeId(null);
     setLocalMatchId(null);
     setRemoteNodeId(null);
@@ -1081,6 +1084,13 @@ export default function HexGameCockpit() {
     return labels.includes("P1") || labels.includes("Player_1");
   }).length;
   const playerTwoCount = units.length - playerOneCount;
+  const storedRecoverySession = recoverySession ? readRecoverySession() : null;
+  const showRecoveryBanner =
+    mode === "network" &&
+    !recoveryDismissed &&
+    !!storedRecoverySession &&
+    storedRecoverySession.matchId === recoverySession?.matchId &&
+    socket?.readyState === WebSocket.CLOSED;
 
   return (
     <main style={styles.page}>
@@ -1130,7 +1140,7 @@ export default function HexGameCockpit() {
         </div>
       </header>
 
-      {recoverySession && (
+      {showRecoveryBanner && recoverySession && (
         <aside
           role="alert"
           style={{
@@ -1162,6 +1172,23 @@ export default function HexGameCockpit() {
             }}
           >
             🔌 Attempt Graceful Reconnection
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss disconnect notification"
+            onClick={() => setRecoveryDismissed(true)}
+            style={{
+              padding: "4px 8px",
+              border: 0,
+              borderRadius: 6,
+              background: "transparent",
+              color: "#7c2d12",
+              cursor: "pointer",
+              fontSize: 18,
+              fontWeight: 700,
+            }}
+          >
+            ×
           </button>
         </aside>
       )}
