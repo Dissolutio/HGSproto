@@ -7,6 +7,7 @@ import init, {
   wasm_initialize_match,
   wasm_load_mod_profiles,
   wasm_process_token_for_match,
+  wasm_reset_match,
 } from "./wasm/hex_game_core";
 
 type Position = { q: number; r: number; z: number };
@@ -58,6 +59,12 @@ const SOCKET_URL = "ws://127.0.0.1:8080";
 const WASM_MATCH_ID = "wasm_sandbox";
 const HEX_RADIUS = 1;
 const PILLAR_HEIGHT = 0.42;
+
+const formatNodeId = (id: string | null | undefined) => {
+  if (!id) return "None";
+  if (id.length <= 8) return id;
+  return `${id.substring(0, 4)}...${id.substring(id.length - 4)}`;
+};
 
 function mockStarterUnit(id: string, labels: string[], life: number) {
   return {
@@ -544,8 +551,9 @@ export default function HexGameCockpit() {
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [modProfileText, setModProfileText] = useState("");
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
-  const [networkNodeId, setNetworkNodeId] = useState("");
-  const [remoteNodeId, setRemoteNodeId] = useState("");
+  const [localNodeId, setLocalNodeId] = useState<string | null>(null);
+  const [remoteNodeId, setRemoteNodeId] = useState<string | null>(null);
+  const [joinNodeId, setJoinNodeId] = useState("");
   const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
@@ -587,21 +595,59 @@ export default function HexGameCockpit() {
         setNotice("Live engine stream connected");
       }
     };
+    const requestInitialMapSnapshotFromCore = () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        setNotice("Host key allocated, but the engine stream is not ready for a map snapshot");
+        return;
+      }
+      try {
+        ws.send("GET_STATE");
+        setNotice("Host key allocated; requesting the initial map snapshot");
+      } catch (error) {
+        setNotice(`Initial map snapshot request failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
     ws.onmessage = (event) => {
       if (cancelled) return;
       const message = String(event.data);
-      if (message.startsWith("P2P_HOSTED:") || message.startsWith("P2P_JOINED:")) {
-        const [eventName, nodeId] = message.split(":", 2);
-        setNetworkNodeId(nodeId ?? "");
-        setNotice(eventName === "P2P_HOSTED" ? "Iroh host is ready; share your Node ID" : "Joined and synchronized with the host");
+      if (message.startsWith("HOST_ALLOCATED:") || message.startsWith("P2P_HOSTED:")) {
+        const prefix = message.startsWith("HOST_ALLOCATED:")
+          ? "HOST_ALLOCATED:"
+          : "P2P_HOSTED:";
+        const allocatedId = message.slice(prefix.length);
+        if (!allocatedId) {
+          setNotice("Host allocation response did not include a Node ID");
+          return;
+        }
+        setLocalNodeId(allocatedId);
+        setRemoteNodeId(null);
+        requestInitialMapSnapshotFromCore();
         return;
       }
-      if (message === "P2P_CONNECTED") {
+      if (message.startsWith("P2P_JOINED:")) {
+        const [, localId, remoteId] = message.split(":", 3);
+        setLocalNodeId(localId || null);
+        setRemoteNodeId(remoteId || null);
+        setNotice("Joined and synchronized with the host");
+        return;
+      }
+      if (message.startsWith("P2P_CONNECTED:")) {
+        setRemoteNodeId(message.slice("P2P_CONNECTED:".length) || null);
         setNotice("Peer connected; action-token synchronization is active");
         return;
       }
       if (message.startsWith("P2P_DISCONNECTED:")) {
+        setRemoteNodeId(null);
         setNotice(`Peer disconnected: ${message.slice("P2P_DISCONNECTED:".length)}`);
+        return;
+      }
+      if (message === "P2P_RESET") {
+        setLocalNodeId(null);
+        setRemoteNodeId(null);
+        setJoinNodeId("");
+        setSelectedUnitId(null);
+        setInspectedEntity(null);
+        setNotice("Gateway session reset; fresh sandbox state loaded");
         return;
       }
       if (message.startsWith("E:")) {
@@ -821,12 +867,57 @@ export default function HexGameCockpit() {
   const handleHostMatch = () => sendNetworkControl("HOST");
 
   const handleJoinMatch = () => {
-    const hostNodeId = remoteNodeId.trim();
+    const hostNodeId = joinNodeId.trim();
     if (!hostNodeId) {
       setNotice("Enter the host's Iroh Node ID");
       return;
     }
     sendNetworkControl(`JOIN:${hostNodeId}`);
+  };
+
+  const triggerFreshMapSnapshotLoad = (gatewayResetRequested: boolean) => {
+    if (mode === "network") {
+      if (gatewayResetRequested) {
+        setGameState(null);
+        setNotice("Gateway reset requested; loading a fresh sandbox snapshot");
+        return;
+      }
+    }
+    void (async () => {
+      try {
+        await init();
+        wasm_reset_match(WASM_MATCH_ID, MOCK_MAP_JSON);
+        setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
+        if (mode === "network") {
+          setMode("wasm");
+          setNotice("Native gateway unavailable; local WASM sandbox refreshed");
+        } else {
+          setNotice("Fresh sandbox map loaded");
+        }
+        setConnection("ready");
+      } catch (error) {
+        setConnection("offline");
+        setNotice(`Sandbox reset failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
+  };
+
+  const handleDisconnectAndReset = () => {
+    let gatewayResetRequested = false;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send("DISCONNECT_SESSION_TOKEN");
+        gatewayResetRequested = true;
+      } catch (error) {
+        setNotice(`Gateway reset request failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    setLocalNodeId(null);
+    setRemoteNodeId(null);
+    setJoinNodeId("");
+    setSelectedUnitId(null);
+    setInspectedEntity(null);
+    triggerFreshMapSnapshotLoad(gatewayResetRequested);
   };
 
   const playerOneCount = units.filter((unit) => {
@@ -986,21 +1077,47 @@ export default function HexGameCockpit() {
             <p style={styles.networkPortalHelp}>
               Host or join through the local native gateway. Iroh handles encrypted peer transport and relay discovery; browser traffic reaches it over this local WebSocket.
             </p>
+            <table style={styles.networkStatusTable}>
+              <tbody>
+                <tr>
+                  <th style={styles.networkStatusLabel}>Your Node ID:</th>
+                  <td style={styles.networkStatusValue}>
+                    {localNodeId
+                      ? formatNodeId(localNodeId)
+                      : <>None <em>(Click Host or Join to allocate key)</em></>}
+                  </td>
+                </tr>
+                <tr>
+                  <th style={styles.networkStatusLabel}>Opponent Node ID:</th>
+                  <td style={styles.networkStatusValue}>
+                    {remoteNodeId ? formatNodeId(remoteNodeId) : "Waiting for peer..."}
+                  </td>
+                </tr>
+                <tr>
+                  <th style={styles.networkStatusLabel}>Active Connection Transport:</th>
+                  <td style={styles.networkStatusValue}>
+                    {mode === "network" && connection === "connected"
+                      ? "Local Gateway WebSocket (Port 8080)"
+                      : "WASM Sandbox"}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
             <button
               type="button"
               onClick={handleHostMatch}
-              disabled={mode !== "network" || !socket || socket.readyState !== WebSocket.OPEN || !!networkNodeId}
+              disabled={mode !== "network" || !socket || socket.readyState !== WebSocket.OPEN || !!localNodeId}
               style={styles.networkButton}
             >
               Host Match
             </button>
-            {networkNodeId && (
+            {localNodeId && (
               <label style={styles.modLoaderLabel} htmlFor="local-iroh-node-id">
                 Your Iroh connection string / Node ID
                 <input
                   id="local-iroh-node-id"
                   readOnly
-                  value={networkNodeId}
+                  value={localNodeId}
                   onFocus={(event) => event.currentTarget.select()}
                   style={styles.networkInput}
                 />
@@ -1010,8 +1127,8 @@ export default function HexGameCockpit() {
               Host Node ID
               <input
                 id="remote-iroh-node-id"
-                value={remoteNodeId}
-                onChange={(event) => setRemoteNodeId(event.target.value)}
+                value={joinNodeId}
+                onChange={(event) => setJoinNodeId(event.target.value)}
                 placeholder="Paste the host's Iroh Node ID"
                 style={styles.networkInput}
               />
@@ -1023,6 +1140,23 @@ export default function HexGameCockpit() {
               style={styles.networkButton}
             >
               Join Match
+            </button>
+            <button
+              type="button"
+              onClick={handleDisconnectAndReset}
+              style={{
+                marginTop: 12,
+                width: "100%",
+                padding: 6,
+                background: "#dc2626",
+                color: "#fff",
+                border: "none",
+                borderRadius: 4,
+                cursor: "pointer",
+                fontWeight: "bold",
+              }}
+            >
+              🛑 Leave Match &amp; Reset Gateway
             </button>
           </details>
         </aside>
@@ -1180,6 +1314,25 @@ const styles: Record<string, CSSProperties> = {
     borderTop: "1px solid #4d6860",
   },
   networkPortalHelp: { margin: "8px 0", color: "#9aac9e", fontSize: 10, lineHeight: 1.45 },
+  networkStatusTable: {
+    width: "100%",
+    margin: "8px 0",
+    borderCollapse: "collapse",
+    fontSize: 10,
+  },
+  networkStatusLabel: {
+    padding: "4px 8px 4px 0",
+    color: "#9aac9e",
+    fontWeight: 500,
+    textAlign: "left",
+    verticalAlign: "top",
+  },
+  networkStatusValue: {
+    padding: "4px 0",
+    color: "#e5efe8",
+    overflowWrap: "anywhere",
+    textAlign: "left",
+  },
   networkInput: {
     display: "block",
     width: "100%",

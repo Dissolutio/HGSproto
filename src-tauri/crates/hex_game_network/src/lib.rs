@@ -37,6 +37,7 @@ impl From<String> for NetworkError {
 pub struct MatchSession {
     pub local_node_id: String,
     pub is_host: bool,
+    remote_node_id: Arc<RwLock<Option<String>>>,
     endpoint: Endpoint,
     connection: Arc<RwLock<Option<Connection>>>,
     connection_ready: Arc<Notify>,
@@ -93,7 +94,7 @@ impl NetworkManager {
     pub async fn accept_peer(&self) -> Result<(), String> {
         let session = self.active_session().await?;
         session
-            .accept_peer_for_match(Some(&self.match_id))
+            .accept_peer_for_match(&self.match_id)
             .await
             .map_err(|error| error.to_string())
     }
@@ -119,8 +120,27 @@ impl NetworkManager {
         Ok(())
     }
 
+    pub async fn disconnect_session(&self) -> Result<(), String> {
+        let session = self.session.write().await.take();
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.mark_disconnected().await;
+        if session.is_host {
+            engine::release_player_session(&self.match_id, "Player_1");
+        }
+        session
+            .close()
+            .await
+            .map_err(|error| format!("Could not close Iroh session: {error}"))
+    }
+
     pub async fn peer_connected(&self) -> Result<bool, String> {
         Ok(self.active_session().await?.has_active_connection().await)
+    }
+
+    pub async fn remote_node_id(&self) -> Result<Option<String>, String> {
+        Ok(self.active_session().await?.connected_peer_node_id().await)
     }
 
     pub async fn active_session(&self) -> Result<Arc<MatchSession>, String> {
@@ -151,6 +171,7 @@ impl MatchSession {
         Ok(Self {
             local_node_id,
             is_host: true,
+            remote_node_id: Arc::new(RwLock::new(None)),
             endpoint,
             connection: Arc::new(RwLock::new(None)),
             connection_ready: Arc::new(Notify::new()),
@@ -182,6 +203,7 @@ impl MatchSession {
         Ok(Self {
             local_node_id: endpoint.node_id().to_string(),
             is_host: false,
+            remote_node_id: Arc::new(RwLock::new(Some(target_host_id.to_string()))),
             endpoint,
             connection: Arc::new(RwLock::new(Some(connection))),
             connection_ready: Arc::new(Notify::new()),
@@ -191,13 +213,14 @@ impl MatchSession {
 
     /// Wait for the first peer to complete the match protocol handshake.
     pub async fn accept_peer(&self) -> Result<(), NetworkError> {
-        self.accept_peer_for_match(None).await
+        self.accept_peer_impl(None).await
     }
 
-    async fn accept_peer_for_match(
-        &self,
-        expected_match_id: Option<&str>,
-    ) -> Result<(), NetworkError> {
+    pub async fn accept_peer_for_match(&self, expected_match_id: &str) -> Result<(), NetworkError> {
+        self.accept_peer_impl(Some(expected_match_id)).await
+    }
+
+    async fn accept_peer_impl(&self, expected_match_id: Option<&str>) -> Result<(), NetworkError> {
         if !self.is_host {
             return Err(NetworkError("Only the host can accept a peer".into()));
         }
@@ -212,6 +235,11 @@ impl MatchSession {
             };
             match connecting.await {
                 Ok(connection) => {
+                    let remote_node_id = iroh::endpoint::get_remote_node_id(&connection)
+                        .map_err(|error| {
+                            NetworkError(format!("Could not read peer Node ID: {error}"))
+                        })?
+                        .to_string();
                     let auth = match receive_packet(&connection, 1024).await {
                         Ok(auth) => auth,
                         Err(_) => continue,
@@ -245,6 +273,7 @@ impl MatchSession {
                     }
 
                     *self.connection.write().await = Some(connection);
+                    *self.remote_node_id.write().await = Some(remote_node_id);
                     self.connection_ready.notify_one();
                     *self
                         .player_session
@@ -306,6 +335,7 @@ impl MatchSession {
             .map_err(|error| NetworkError(error.to_string()))?;
         let snapshot = authenticate_connection(&connection, match_id, player_tag).await?;
         *self.connection.write().await = Some(connection);
+        *self.remote_node_id.write().await = Some(target_host_id.to_string());
         *self
             .player_session
             .lock()
@@ -322,6 +352,18 @@ impl MatchSession {
             }
         }
         *self.connection.write().await = None;
+        *self.remote_node_id.write().await = None;
+    }
+
+    pub async fn close(&self) -> Result<(), NetworkError> {
+        self.endpoint
+            .close()
+            .await
+            .map_err(|error| NetworkError(format!("Failed to close Iroh endpoint: {error}")))?;
+        if let Ok(mut local_addrs) = LOCAL_NODE_ADDRS.lock() {
+            local_addrs.remove(&self.local_node_id);
+        }
+        Ok(())
     }
 
     pub async fn wait_for_connection(&self) {
@@ -343,6 +385,14 @@ impl MatchSession {
 
     async fn has_active_connection(&self) -> bool {
         self.connection.read().await.is_some()
+    }
+
+    pub async fn connected_peer_node_id(&self) -> Option<String> {
+        self.remote_node_id.read().await.clone()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.endpoint.is_closed()
     }
 
     /// Broadcast an action barcode token out over a single-use unidirectional stream

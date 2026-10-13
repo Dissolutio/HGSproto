@@ -41,6 +41,15 @@ async fn network_manager_host_join_and_action_token_sync() {
         .expect("host authentication timed out")
         .expect("host accept task panicked")
         .expect("host rejected the client");
+    assert_eq!(
+        client.remote_node_id().await.unwrap().as_deref(),
+        Some(host_node_id.as_str())
+    );
+    let client_node_id = client.active_session().await.unwrap().local_node_id.clone();
+    assert_eq!(
+        host.remote_node_id().await.unwrap().as_deref(),
+        Some(client_node_id.as_str())
+    );
 
     let token = "M:UNIT_P2_1:Q1R0Z0";
     client.send_action_token(token).await.unwrap();
@@ -53,9 +62,10 @@ async fn network_manager_host_join_and_action_token_sync() {
 
     let state = current_state(&match_id);
     assert_eq!(state["entities"]["UNIT_P2_1"]["spatial"]["q"], 1);
-    client.mark_disconnected().await.unwrap();
-    host.mark_disconnected().await.unwrap();
-    release_player_session(&match_id, "Player_1");
+    client.disconnect_session().await.unwrap();
+    host.disconnect_session().await.unwrap();
+    assert!(client.active_session().await.is_err());
+    assert!(host.active_session().await.is_err());
 }
 
 #[tokio::test]

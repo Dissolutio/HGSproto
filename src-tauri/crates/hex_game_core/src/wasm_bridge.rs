@@ -16,6 +16,12 @@ fn initialize_match(match_id: String, json_map_data: &str) -> Result<(), String>
 }
 
 #[wasm_bindgen]
+pub fn wasm_reset_match(match_id: String, json_map_data: String) -> Result<(), JsValue> {
+    engine::try_reset_from_hexoscape_with_registry(match_id, &json_map_data, &MOD_REGISTRY)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
 pub fn wasm_load_mod_profiles(profiles_json: String) -> Result<u32, JsValue> {
     let profiles: serde_json::Value = serde_json::from_str(&profiles_json)
         .map_err(|error| JsValue::from_str(&format!("Invalid mod profile JSON: {error}")))?;
@@ -69,7 +75,7 @@ fn error_json(message: &str) -> String {
 mod tests {
     use super::{
         initialize_match, wasm_get_current_state, wasm_initialize_match, wasm_load_mod_profiles,
-        wasm_process_token_for_match,
+        wasm_process_token_for_match, wasm_reset_match,
     };
 
     #[test]
@@ -143,5 +149,31 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
         assert_eq!(state["entities"]["CUSTOM_UNIT"]["visual_primitive"], "CUBE");
+    }
+
+    #[test]
+    fn wasm_reset_replaces_existing_match_snapshot() {
+        let match_id = format!("wasm_reset_test_{}", std::process::id());
+        let map_json = r#"{
+            "hexMap": {},
+            "boardPieces": [{
+                "uid": "g7",
+                "inventoryID": "g7",
+                "altitude": 0,
+                "rotation": 0,
+                "pieceCoords": {"q": 0, "r": 0, "s": 0}
+            }]
+        }"#;
+        wasm_initialize_match(match_id.clone(), map_json.to_string()).unwrap();
+        let initial_state: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
+        let initial_position = initial_state["entities"]["UNIT_P1_1"]["spatial"].clone();
+        crate::engine::process_action(&match_id, "M:UNIT_P1_1:Q0R2Z0").unwrap();
+
+        wasm_reset_match(match_id.clone(), map_json.to_string()).unwrap();
+
+        let state: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
+        assert_eq!(state["entities"]["UNIT_P1_1"]["spatial"], initial_position);
     }
 }

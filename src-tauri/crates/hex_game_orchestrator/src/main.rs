@@ -7,7 +7,7 @@ use hex_game_core::engine::{match_exists, rebind_player_session, release_player_
 use hex_game_core::ffi::{
     hgs_free_string, hgs_get_current_state, hgs_initialize_test_match, hgs_process_token_for_match,
 };
-use hex_game_network::NetworkManager;
+use hex_game_network::{MatchSession, NetworkManager};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -100,12 +100,18 @@ async fn serve_websocket(
                     Message::Text(command) if command == "HOST" => {
                         match start_host_session(Arc::clone(&manager), state_updates.clone()).await {
                             Ok(node_id) => {
-                                let _ = state_updates.send(format!("P2P_HOSTED:{node_id}"));
+                                websocket_sink
+                                    .send(Message::Text(format!("HOST_ALLOCATED:{node_id}").into()))
+                                    .await?;
                             }
                             Err(error) => {
                                 let _ = state_updates.send(format!("E:{error}"));
                             }
                         }
+                    }
+                    Message::Text(command) if command == "GET_STATE" => {
+                        let state = get_current_state(MATCH_ID)?;
+                        websocket_sink.send(Message::Text(state.into())).await?;
                     }
                     Message::Text(command) if command.starts_with("JOIN:") => {
                         let remote_node_id = command["JOIN:".len()..].trim();
@@ -114,9 +120,27 @@ async fn serve_websocket(
                             remote_node_id,
                             state_updates.clone(),
                         ).await {
-                            Ok(node_id) => {
+                            Ok((local_node_id, remote_node_id)) => {
                                 publish_current_state(MATCH_ID, &state_updates);
-                                let _ = state_updates.send(format!("P2P_JOINED:{node_id}"));
+                                let _ = state_updates.send(format!(
+                                    "P2P_JOINED:{local_node_id}:{remote_node_id}"
+                                ));
+                            }
+                            Err(error) => {
+                                let _ = state_updates.send(format!("E:{error}"));
+                            }
+                        }
+                    }
+                    Message::Text(command) if command == "DISCONNECT_SESSION_TOKEN" => {
+                        let disconnect_result = manager.disconnect_session().await;
+                        hex_game_core::engine::store_match(
+                            MATCH_ID.to_string(),
+                            hex_game_core::engine::generate_test_sandbox(MATCH_ID.to_string()),
+                        );
+                        publish_current_state(MATCH_ID, &state_updates);
+                        match disconnect_result {
+                            Ok(()) => {
+                                let _ = state_updates.send("P2P_RESET".to_string());
                             }
                             Err(error) => {
                                 let _ = state_updates.send(format!("E:{error}"));
@@ -184,7 +208,12 @@ async fn start_host_session(
     rebind_player_session(MATCH_ID, "Player_1")?;
     match manager.host_match().await {
         Ok(node_id) => {
-            tokio::spawn(run_host_peer_loop(manager, state_updates));
+            let session = manager.active_session().await?;
+            tokio::spawn(run_host_peer_loop(
+                session,
+                MATCH_ID.to_string(),
+                state_updates,
+            ));
             Ok(node_id)
         }
         Err(error) => {
@@ -198,32 +227,45 @@ async fn start_join_session(
     manager: Arc<NetworkManager>,
     remote_node_id: &str,
     state_updates: broadcast::Sender<String>,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     if remote_node_id.is_empty() {
         return Err("Enter the host's Iroh Node ID".to_string());
     }
     manager.join_match(remote_node_id).await?;
     let joined = manager.active_session().await?;
     let local_node_id = joined.local_node_id.clone();
-    tokio::spawn(run_join_peer_loop(manager, state_updates));
-    Ok(local_node_id)
+    let peer_node_id = manager
+        .remote_node_id()
+        .await?
+        .ok_or_else(|| "Joined session has no remote Node ID".to_string())?;
+    tokio::spawn(run_join_peer_loop(joined, state_updates));
+    Ok((local_node_id, peer_node_id))
 }
 
 async fn run_host_peer_loop(
-    manager: Arc<NetworkManager>,
+    session: Arc<MatchSession>,
+    match_id: String,
     state_updates: broadcast::Sender<String>,
 ) {
     loop {
-        if let Err(error) = manager.accept_peer().await {
+        if let Err(error) = session.accept_peer_for_match(&match_id).await {
+            if session.is_closed() {
+                return;
+            }
             let _ = state_updates.send(format!("E:Could not accept peer: {error}"));
             return;
         }
-        let _ = state_updates.send("P2P_CONNECTED".to_string());
+        if let Some(remote_node_id) = session.connected_peer_node_id().await {
+            let _ = state_updates.send(format!("P2P_CONNECTED:{remote_node_id}"));
+        }
         loop {
-            match manager.read_next_action_token().await {
+            match session.read_next_action_token().await {
                 Ok(token) => apply_peer_action(&token, &state_updates),
                 Err(error) => {
-                    let _ = manager.mark_disconnected().await;
+                    session.mark_disconnected().await;
+                    if session.is_closed() {
+                        return;
+                    }
                     let _ = state_updates.send(format!("P2P_DISCONNECTED:{error}"));
                     break;
                 }
@@ -232,15 +274,12 @@ async fn run_host_peer_loop(
     }
 }
 
-async fn run_join_peer_loop(
-    manager: Arc<NetworkManager>,
-    state_updates: broadcast::Sender<String>,
-) {
+async fn run_join_peer_loop(session: Arc<MatchSession>, state_updates: broadcast::Sender<String>) {
     loop {
-        match manager.read_next_action_token().await {
+        match session.read_next_action_token().await {
             Ok(token) => apply_peer_action(&token, &state_updates),
             Err(error) => {
-                let _ = manager.mark_disconnected().await;
+                session.mark_disconnected().await;
                 let _ = state_updates.send(format!("P2P_DISCONNECTED:{error}"));
                 break;
             }

@@ -126,7 +126,7 @@ pub fn get_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Vec<(i32,
 }
 
 pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
-    let _ = try_initialize_map_file(match_id, map_file, None);
+    let _ = try_initialize_map_file(match_id, map_file, None, false);
 }
 
 pub fn try_initialize_from_hexoscape_with_registry(
@@ -136,13 +136,24 @@ pub fn try_initialize_from_hexoscape_with_registry(
 ) -> Result<(), String> {
     let map_file: HexoscapeMapFile = serde_json::from_str(map_json)
         .map_err(|error| format!("Invalid Hexoscape map JSON: {error}"))?;
-    try_initialize_map_file(match_id, map_file, Some(registry))
+    try_initialize_map_file(match_id, map_file, Some(registry), false)
+}
+
+pub fn try_reset_from_hexoscape_with_registry(
+    match_id: String,
+    map_json: &str,
+    registry: &ModRegistry,
+) -> Result<(), String> {
+    let map_file: HexoscapeMapFile = serde_json::from_str(map_json)
+        .map_err(|error| format!("Invalid Hexoscape map JSON: {error}"))?;
+    try_initialize_map_file(match_id, map_file, Some(registry), true)
 }
 
 fn try_initialize_map_file(
     match_id: String,
     map_file: HexoscapeMapFile,
     registry: Option<&ModRegistry>,
+    replace_existing: bool,
 ) -> Result<(), String> {
     let mut game_state = GameState {
         context: MatchContext {
@@ -252,7 +263,13 @@ fn try_initialize_map_file(
     let mut matches = ACTIVE_MATCHES
         .lock()
         .map_err(|_| "Match registry is unavailable".to_string())?;
-    matches.entry(match_id).or_insert(game_state);
+    if replace_existing {
+        release_player_session(&match_id, "Player_1");
+        release_player_session(&match_id, "Player_2");
+        matches.insert(match_id, game_state);
+    } else {
+        matches.entry(match_id).or_insert(game_state);
+    }
     Ok(())
 }
 
