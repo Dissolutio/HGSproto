@@ -105,7 +105,9 @@ async fn serve_websocket(
                                     .await?;
                             }
                             Err(error) => {
-                                let _ = state_updates.send(format!("E:{error}"));
+                                websocket_sink
+                                    .send(Message::Text(format!("E:{error}").into()))
+                                    .await?;
                             }
                         }
                     }
@@ -127,7 +129,9 @@ async fn serve_websocket(
                                 ));
                             }
                             Err(error) => {
-                                let _ = state_updates.send(format!("E:{error}"));
+                                websocket_sink
+                                    .send(Message::Text(format!("E:{error}").into()))
+                                    .await?;
                             }
                         }
                     }
@@ -143,7 +147,9 @@ async fn serve_websocket(
                                 let _ = state_updates.send("P2P_RESET".to_string());
                             }
                             Err(error) => {
-                                let _ = state_updates.send(format!("E:{error}"));
+                                websocket_sink
+                                    .send(Message::Text(format!("E:{error}").into()))
+                                    .await?;
                             }
                         }
                     }
@@ -154,27 +160,37 @@ async fn serve_websocket(
                                 match manager.peer_connected().await {
                                     Ok(true) => {
                                         if let Err(error) = manager.send_action_token(&command).await {
-                                            let _ = state_updates.send(format!("E:Network send failed: {error}"));
+                                            websocket_sink
+                                                .send(Message::Text(format!("E:Network send failed: {error}").into()))
+                                                .await?;
                                         }
                                     }
                                     Ok(false) => {}
                                     Err(error) => {
-                                        let _ = state_updates.send(format!("E:{error}"));
+                                        websocket_sink
+                                            .send(Message::Text(format!("E:{error}").into()))
+                                            .await?;
                                     }
                                 }
                             }
                             Ok(result) => {
-                                let _ = state_updates.send(format!("E:{result}"));
+                                websocket_sink
+                                    .send(Message::Text(format!("E:{result}").into()))
+                                    .await?;
                             }
                             Err(error) => {
-                                let _ = state_updates.send(format!("E:{error}"));
+                                websocket_sink
+                                    .send(Message::Text(format!("E:{error}").into()))
+                                    .await?;
                             }
                         }
                     }
                     Message::Text(_) => {
-                        let _ = state_updates.send(
-                            "E:Expected HOST, JOIN:<node-id>, or an M:/A: action token".to_string(),
-                        );
+                        websocket_sink
+                            .send(Message::Text(
+                                "E:Expected HOST, JOIN:<node-id>, or an M:/A: action token".into(),
+                            ))
+                            .await?;
                     }
                     Message::Close(_) => break,
                     Message::Ping(payload) => websocket_sink.send(Message::Pong(payload)).await?,
