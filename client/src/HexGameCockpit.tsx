@@ -3,6 +3,7 @@ import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber"
 import { OrbitControls, Stats } from "@react-three/drei";
 import * as THREE from "three";
 import init, {
+  wasm_deploy_profile_unit,
   wasm_get_current_state,
   wasm_initialize_match,
   wasm_load_mod_profiles,
@@ -53,7 +54,10 @@ type ModProfileSummary = {
   modId: string;
   displayName: string;
   visualPrimitive: string;
+  currentHealth: number;
+  maxHealth: number;
 };
+type PlayerSeat = "P1" | "P2";
 
 const SOCKET_URL = "ws://127.0.0.1:8080";
 const WASM_MATCH_ID = "wasm_sandbox";
@@ -184,6 +188,32 @@ function parseState(serializedState: string): EngineState {
   const parsed = JSON.parse(serializedState) as EngineState | { error?: string };
   if ("error" in parsed && parsed.error) throw new Error(parsed.error);
   return parsed as EngineState;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function profileHealth(profile: Record<string, unknown>) {
+  const components = isRecord(profile.components) ? profile.components : null;
+  const destructible = components?.destructible;
+  const data =
+    isRecord(destructible) && isRecord(destructible.data)
+      ? destructible.data
+      : destructible;
+  const currentHealth = isRecord(data) ? data.current_life : undefined;
+  const maxHealth = isRecord(data) ? data.max_life : undefined;
+  if (
+    typeof currentHealth !== "number" ||
+    !Number.isInteger(currentHealth) ||
+    typeof maxHealth !== "number" ||
+    !Number.isInteger(maxHealth) ||
+    currentHealth < 1 ||
+    maxHealth < currentHealth
+  ) {
+    throw new Error("Each unit profile needs valid destructible current_life and max_life values");
+  }
+  return { currentHealth, maxHealth };
 }
 
 function injectGoliath(entity: EngineEntity): EngineEntity {
@@ -572,6 +602,10 @@ export default function HexGameCockpit() {
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [modProfileText, setModProfileText] = useState("");
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
+  const [selectedModId, setSelectedModId] = useState("");
+  const [deploymentSeat, setDeploymentSeat] = useState<PlayerSeat>("P1");
+  const [deploymentSlotId, setDeploymentSlotId] = useState("UNIT_P1_1");
+  const [startingHealth, setStartingHealth] = useState("");
   const [localNodeId, setLocalNodeId] = useState<string | null>(null);
   const [localMatchId, setLocalMatchId] = useState<string | null>(null);
   const [remoteNodeId, setRemoteNodeId] = useState<string | null>(null);
@@ -851,6 +885,16 @@ export default function HexGameCockpit() {
     () => entities.filter((entity) => unitLabels(entity).includes("Unit")),
     [entities],
   );
+  const deploymentSlots = useMemo(
+    () =>
+      units
+        .filter((unit) => unitLabels(unit).includes(deploymentSeat))
+        .sort((left, right) => left.id.localeCompare(right.id)),
+    [units, deploymentSeat],
+  );
+  const deploymentSlot =
+    deploymentSlots.find((unit) => unit.id === deploymentSlotId) ?? deploymentSlots[0] ?? null;
+  const selectedProfile = loadedModProfiles.find((profile) => profile.modId === selectedModId);
 
   const findEntityAtCoordinate = (q: number, r: number, z: number) =>
     units.find(
@@ -955,16 +999,62 @@ export default function HexGameCockpit() {
             typeof record.visual_primitive === "string"
               ? record.visual_primitive
               : "Unknown primitive",
+          ...profileHealth(record),
         };
       });
       const loadedCount = wasm_load_mod_profiles(modProfileText);
-      setLoadedModProfiles(summaries);
+      setLoadedModProfiles((current) => [...current, ...summaries]);
+      setSelectedModId(summaries[0]?.modId ?? "");
+      setStartingHealth(summaries[0]?.currentHealth.toString() ?? "");
       setNotice(
         `Loaded ${loadedCount} community mod profile${loadedCount === 1 ? "" : "s"}`,
       );
     } catch (error) {
       setNotice(
         `Mod profile load failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+
+  const handleDeployProfile = () => {
+    if (mode !== "wasm" || connection !== "ready") {
+      setNotice("Switch to Autonomous Sandbox Mode before deploying a profile");
+      return;
+    }
+    if (!selectedProfile || !deploymentSlot) {
+      setNotice("Select a loaded unit profile and a roster slot first");
+      return;
+    }
+    const life = Number(startingHealth);
+    if (
+      !Number.isInteger(life) ||
+      life < 1 ||
+      life > selectedProfile.maxHealth
+    ) {
+      setNotice(`Starting health must be a whole number from 1 to ${selectedProfile.maxHealth}`);
+      return;
+    }
+
+    try {
+      const displayName = wasm_deploy_profile_unit(
+        WASM_MATCH_ID,
+        deploymentSlot.id,
+        selectedProfile.modId,
+        deploymentSeat,
+        life,
+      );
+      const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
+      setGameState(state);
+      setInspectedEntity(
+        entitiesFromState(state).find((entity) => entity.id === deploymentSlot.id) ?? null,
+      );
+      setSelectedUnitId(null);
+      setNotice(
+        `Deployed ${displayName} in ${deploymentSlot.id} for ${deploymentSeat} at ${life}/${selectedProfile.maxHealth} HP`,
+      );
+    } catch (error) {
+      setNotice(
+        `Unit deployment failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   };
@@ -1328,6 +1418,98 @@ export default function HexGameCockpit() {
             >
               Load Mod Profile
             </button>
+            {loadedModProfiles.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                <label style={styles.modLoaderLabel} htmlFor="profile-to-deploy">
+                  Unit profile
+                </label>
+                <select
+                  id="profile-to-deploy"
+                  aria-label="Unit profile to deploy"
+                  value={selectedProfile?.modId ?? ""}
+                  onChange={(event) => {
+                    const profile = loadedModProfiles.find(
+                      (item) => item.modId === event.target.value,
+                    );
+                    setSelectedModId(event.target.value);
+                    if (profile) setStartingHealth(profile.currentHealth.toString());
+                  }}
+                  style={styles.networkInput}
+                >
+                  {loadedModProfiles.map((profile) => (
+                    <option key={profile.modId} value={profile.modId}>
+                      {profile.displayName} · {profile.modId}
+                    </option>
+                  ))}
+                </select>
+                <label style={styles.modLoaderLabel} htmlFor="profile-deployment-seat">
+                  Player seat
+                </label>
+                <select
+                  id="profile-deployment-seat"
+                  aria-label="Player seat for profile deployment"
+                  value={deploymentSeat}
+                  onChange={(event) => {
+                    const seat = event.target.value;
+                    if (seat === "P1" || seat === "P2") {
+                      setDeploymentSeat(seat);
+                      setDeploymentSlotId("");
+                    }
+                  }}
+                  style={styles.networkInput}
+                >
+                  <option value="P1">P1</option>
+                  <option value="P2">P2</option>
+                </select>
+                <label style={styles.modLoaderLabel} htmlFor="profile-deployment-slot">
+                  Roster slot to replace
+                </label>
+                <select
+                  id="profile-deployment-slot"
+                  aria-label="Roster slot to replace"
+                  value={deploymentSlot?.id ?? ""}
+                  onChange={(event) => setDeploymentSlotId(event.target.value)}
+                  disabled={deploymentSlots.length === 0}
+                  style={styles.networkInput}
+                >
+                  {deploymentSlots.map((unit) => (
+                    <option key={unit.id} value={unit.id}>
+                      {unit.id}{unit.display_name ? ` · ${unit.display_name}` : ""}
+                    </option>
+                  ))}
+                </select>
+                <label style={styles.modLoaderLabel} htmlFor="profile-starting-health">
+                  Starting health (max {selectedProfile?.maxHealth ?? "—"})
+                </label>
+                <input
+                  id="profile-starting-health"
+                  aria-label="Starting health"
+                  type="number"
+                  min={1}
+                  max={selectedProfile?.maxHealth}
+                  step={1}
+                  value={startingHealth}
+                  onChange={(event) => setStartingHealth(event.target.value)}
+                  style={styles.networkInput}
+                />
+                <button
+                  type="button"
+                  onClick={handleDeployProfile}
+                  disabled={
+                    mode !== "wasm" ||
+                    connection !== "ready" ||
+                    !selectedProfile ||
+                    !deploymentSlot
+                  }
+                  style={styles.modProfileButton}
+                >
+                  Deploy Profile into Roster Slot
+                </button>
+                <p role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
+                  The Rust core replaces the selected unit in place and owns its health, tags, and visual.
+                </p>
+              </div>
+            )}
             {import.meta.env.DEV && (
               <>
                 <p role="note" style={{ margin: "8px 0 0", color: "#92400e", fontSize: 12 }}>

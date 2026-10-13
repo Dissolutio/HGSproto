@@ -44,6 +44,25 @@ pub fn wasm_load_mod_profiles(profiles_json: String) -> Result<u32, JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn wasm_deploy_profile_unit(
+    match_id: String,
+    slot_unit_id: String,
+    mod_id: String,
+    seat: String,
+    starting_life: i32,
+) -> Result<String, JsValue> {
+    engine::deploy_profile_unit(
+        &match_id,
+        &slot_unit_id,
+        &mod_id,
+        &seat,
+        starting_life,
+        &MOD_REGISTRY,
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
 pub fn wasm_get_current_state(match_id: String) -> String {
     let matches = match engine::ACTIVE_MATCHES.lock() {
         Ok(matches) => matches,
@@ -74,8 +93,8 @@ fn error_json(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        initialize_match, wasm_get_current_state, wasm_initialize_match, wasm_load_mod_profiles,
-        wasm_process_token_for_match, wasm_reset_match,
+        initialize_match, wasm_deploy_profile_unit, wasm_get_current_state, wasm_initialize_match,
+        wasm_load_mod_profiles, wasm_process_token_for_match, wasm_reset_match,
     };
 
     #[test]
@@ -121,7 +140,10 @@ mod tests {
                 "mod_id": "{mod_id}",
                 "display_name": "WASM Unit",
                 "visual_primitive": "CUBE",
-                "components": {{"tags": ["Unit"]}}
+                "components": {{
+                    "destructible": {{"current_life": 5, "max_life": 5}},
+                    "tags": ["Unit"]
+                }}
             }}"#
         );
 
@@ -149,6 +171,65 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
         assert_eq!(state["entities"]["CUSTOM_UNIT"]["visual_primitive"], "CUBE");
+    }
+
+    #[test]
+    fn wasm_profile_deployment_updates_the_authoritative_match_snapshot() {
+        let mod_id = format!("com.example.wasm_deploy_{}", std::process::id());
+        let profile = format!(
+            r#"[{{
+                "schema_version": 1,
+                "mod_id": "{mod_id}",
+                "display_name": "WASM Goliath",
+                "visual_primitive": "CUBE",
+                "components": {{
+                    "destructible": {{"current_life": 12, "max_life": 12}},
+                    "tags": ["Unit", "Heavy"]
+                }}
+            }}]"#
+        );
+        assert_eq!(wasm_load_mod_profiles(profile).unwrap(), 1);
+
+        let match_id = format!("wasm_deploy_match_{}", std::process::id());
+        let map_json = r#"{
+            "hexMap": {},
+            "boardPieces": [{
+                "uid": "g7",
+                "inventoryID": "g7",
+                "altitude": 0,
+                "rotation": 0,
+                "pieceCoords": {"q": 0, "r": 0, "s": 0}
+            }]
+        }"#;
+        wasm_initialize_match(match_id.clone(), map_json.to_string()).unwrap();
+        wasm_deploy_profile_unit(
+            match_id.clone(),
+            "UNIT_P1_1".to_string(),
+            mod_id.clone(),
+            "P1".to_string(),
+            12,
+        )
+        .unwrap();
+        wasm_deploy_profile_unit(
+            match_id.clone(),
+            "UNIT_P2_1".to_string(),
+            mod_id,
+            "P2".to_string(),
+            12,
+        )
+        .unwrap();
+
+        crate::engine::process_action(&match_id, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
+        let state: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["current_life"],
+            12
+        );
+        assert_eq!(
+            state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
+            9
+        );
     }
 
     #[test]

@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "build:wasm": "wasm-pack build ../src-tauri/crates/hex_game_core --target web --out-dir ../../../client/src/wasm --out-name hex_game_core --release",
+    "dev": "npm run build:wasm && vite",
+    "build": "npm run build:wasm && tsc && vite build",
     "preview": "vite preview",
     "tauri": "cd .. && tauri"
   },

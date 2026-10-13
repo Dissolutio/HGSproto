@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnitTemplate {
     pub schema_version: u32,
     pub mod_id: String,
@@ -25,6 +26,9 @@ impl ModRegistry {
     pub fn load_batch(&self, batch_json: &str) -> Result<u32, String> {
         let profiles: Vec<Value> = serde_json::from_str(batch_json)
             .map_err(|error| format!("invalid profile batch JSON: {error}"))?;
+        if profiles.is_empty() {
+            return Err("profile batch must include at least one unit profile".to_string());
+        }
 
         let mut parsed_templates = Vec::with_capacity(profiles.len());
         let mut batch_ids = HashSet::with_capacity(profiles.len());
@@ -74,6 +78,15 @@ impl ModRegistry {
         );
         Ok(loaded_count)
     }
+
+    pub fn get_template(&self, mod_id: &str) -> Result<UnitTemplate, String> {
+        self.templates
+            .read()
+            .map_err(|_| "mod registry read lock is poisoned".to_string())?
+            .get(mod_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown mod_id '{mod_id}'"))
+    }
 }
 
 fn validate_template(template: &UnitTemplate) -> Result<(), String> {
@@ -96,17 +109,37 @@ fn validate_template(template: &UnitTemplate) -> Result<(), String> {
         return Err("visual_primitive must not be empty".to_string());
     }
 
-    if let Some(Component::Destructible {
+    if template
+        .components
+        .keys()
+        .any(|key| !matches!(key.as_str(), "destructible" | "tags"))
+    {
+        return Err("unit profiles support only destructible and tags components".to_string());
+    }
+    let Some(Component::Destructible {
         current_life,
         max_life,
     }) = template.components.get("destructible")
-    {
-        if !(1..=i32::MAX).contains(max_life) {
-            return Err("destructible.max_life must be within 1..=i32::MAX".to_string());
-        }
-        if !(0..=*max_life).contains(current_life) {
-            return Err("destructible.current_life must be within 0..=max_life".to_string());
-        }
+    else {
+        return Err("unit profiles require a destructible component".to_string());
+    };
+    if !(1..=i32::MAX).contains(max_life) {
+        return Err("destructible.max_life must be within 1..=i32::MAX".to_string());
+    }
+    if !(1..=*max_life).contains(current_life) {
+        return Err("destructible.current_life must be within 1..=max_life".to_string());
+    }
+    let Some(Component::Tags { labels }) = template.components.get("tags") else {
+        return Err("unit profiles require a tags component".to_string());
+    };
+    if !labels.iter().any(|label| label == "Unit") {
+        return Err("tags must include the 'Unit' label".to_string());
+    }
+    if labels.iter().any(|label| label.trim().is_empty()) {
+        return Err("tag labels must not be empty".to_string());
+    }
+    if labels.iter().collect::<HashSet<_>>().len() != labels.len() {
+        return Err("tag labels must not contain duplicates".to_string());
     }
     Ok(())
 }
@@ -152,25 +185,18 @@ where
 }
 
 fn parse_profile_component(name: &str, value: Value) -> Result<Component, String> {
-    if let Ok(component) = serde_json::from_value::<Component>(value.clone()) {
-        if component_matches_key(name, &component) {
-            return Ok(component);
-        }
-        return Err(format!(
-            "component key '{name}' does not match its tagged component type"
-        ));
-    }
-
     match name {
-        "destructible" => serde_json::from_value::<DestructibleProfile>(value)
-            .map(|profile| Component::Destructible {
-                current_life: profile.current_life,
-                max_life: profile.max_life,
+        "destructible" => {
+            let data = tagged_component_data(&value, "Destructible", "destructible")?;
+            reject_unknown_fields(data, &["current_life", "max_life"], "destructible")?;
+            Ok(Component::Destructible {
+                current_life: profile_integer(data, "current_life", "destructible")?,
+                max_life: profile_integer(data, "max_life", "destructible")?,
             })
-            .map_err(|error| format!("invalid destructible component: {error}")),
+        }
         "tags" => {
-            let labels = match value {
-                Value::Array(labels) => labels
+            let labels = if let Some(labels) = value.as_array() {
+                labels
                     .into_iter()
                     .map(|label| {
                         label
@@ -178,46 +204,86 @@ fn parse_profile_component(name: &str, value: Value) -> Result<Component, String
                             .map(str::to_owned)
                             .ok_or_else(|| "tags entries must be strings".to_string())
                     })
-                    .collect::<Result<Vec<_>, _>>()?,
-                Value::Object(_) => {
-                    serde_json::from_value::<TagsProfile>(value)
-                        .map_err(|error| format!("invalid tags component: {error}"))?
-                        .labels
-                }
-                _ => return Err("tags must be an array of strings".to_string()),
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                let data = tagged_component_data(&value, "Tags", "tags")?;
+                reject_unknown_fields(data, &["labels"], "tags")?;
+                data.get("labels")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "tags.labels must be an array of strings".to_string())?
+                    .iter()
+                    .map(|label| {
+                        label
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| "tags entries must be strings".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
             };
             Ok(Component::Tags { labels })
         }
-        _ => Err(format!("unsupported component '{name}'")),
+        _ => Err(format!("unsupported unit component '{name}'")),
     }
 }
 
-fn component_matches_key(name: &str, component: &Component) -> bool {
-    matches!(
-        (name, component),
-        ("terrain", Component::Terrain { .. })
-            | ("terrain_type", Component::TerrainType { .. })
-            | ("life_points", Component::LifePoints { .. })
-            | ("destructible", Component::Destructible { .. })
-            | ("tags", Component::Tags { .. })
-    )
+fn tagged_component_data<'a>(
+    value: &'a Value,
+    expected_type: &str,
+    component_name: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{component_name} must be an object"))?;
+    if object.contains_key("type") {
+        reject_unknown_fields(object, &["type", "data"], component_name)?;
+        let actual_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{component_name}.type must be a string"))?;
+        if actual_type != expected_type {
+            return Err(format!(
+                "{component_name} tagged type must be '{expected_type}'"
+            ));
+        }
+        return object
+            .get("data")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{component_name}.data must be an object"));
+    }
+    Ok(object)
 }
 
-#[derive(Deserialize)]
-struct DestructibleProfile {
-    current_life: i32,
-    max_life: i32,
+fn reject_unknown_fields(
+    object: &serde_json::Map<String, Value>,
+    allowed_fields: &[&str],
+    object_name: &str,
+) -> Result<(), String> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return Err(format!("unsupported {object_name} field '{field}'"));
+    }
+    Ok(())
 }
 
-#[derive(Deserialize)]
-struct TagsProfile {
-    labels: Vec<String>,
+fn profile_integer(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    object_name: &str,
+) -> Result<i32, String> {
+    object
+        .get(key)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| format!("{object_name}.{key} must be a 32-bit integer"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ModRegistry, UnitTemplate};
     use crate::models::Component;
+    use serde_json::Value;
 
     const VALID_PROFILE: &str = r#"{
         "schema_version": 1,
@@ -273,6 +339,52 @@ mod tests {
         let templates = registry.templates.read().unwrap();
         assert_eq!(templates.len(), 1);
         assert!(templates.contains_key("com.community.heavy_mech"));
+    }
+
+    #[test]
+    fn unit_profile_schema_rejects_unsupported_and_invalid_fields() {
+        let mut profiles = Vec::new();
+
+        let mut profile: Value = serde_json::from_str(VALID_PROFILE).unwrap();
+        profile["movement_speed"] = Value::from(4);
+        profiles.push((profile, "unknown field `movement_speed`"));
+
+        let mut profile: Value = serde_json::from_str(VALID_PROFILE).unwrap();
+        profile["components"]["destructible"]["movement_speed"] = Value::from(4);
+        profiles.push((profile, "unsupported destructible field 'movement_speed'"));
+
+        let mut profile: Value = serde_json::from_str(VALID_PROFILE).unwrap();
+        profile["components"]["destructible"]["current_life"] = Value::from(0);
+        profiles.push((
+            profile,
+            "destructible.current_life must be within 1..=max_life",
+        ));
+
+        let mut profile: Value = serde_json::from_str(VALID_PROFILE).unwrap();
+        profile["components"]["tags"] = serde_json::json!(["Heavy"]);
+        profiles.push((profile, "tags must include the 'Unit' label"));
+
+        let mut profile: Value = serde_json::from_str(VALID_PROFILE).unwrap();
+        profile["components"]["movement"] = serde_json::json!({"speed": 4});
+        profiles.push((profile, "unsupported unit component 'movement'"));
+
+        for (profile, expected_error) in profiles {
+            let registry = ModRegistry::default();
+            let error = registry
+                .load_batch(&serde_json::to_string(&vec![profile]).unwrap())
+                .unwrap_err();
+            assert!(
+                error.contains(expected_error),
+                "expected {expected_error:?} in {error:?}"
+            );
+            assert!(registry.templates.read().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_profile_batch_is_rejected() {
+        let error = ModRegistry::default().load_batch("[]").unwrap_err();
+        assert!(error.contains("at least one unit profile"));
     }
 
     #[test]

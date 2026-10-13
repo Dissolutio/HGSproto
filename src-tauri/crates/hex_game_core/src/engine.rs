@@ -36,6 +36,8 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
                 spatial: SpatialPosition { q: *q, r: *r, z: 0 },
                 components,
                 visual_primitive: None,
+                display_name: None,
+                mod_id: None,
             },
         );
     }
@@ -47,6 +49,8 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
             spatial: SpatialPosition { q, r, z: 0 },
             components: unit.components,
             visual_primitive: None,
+            display_name: None,
+            mod_id: None,
         };
         entities.insert(entity.id.clone(), entity);
     }
@@ -200,6 +204,8 @@ fn try_initialize_map_file(
                     },
                 )]),
                 visual_primitive: None,
+                display_name: None,
+                mod_id: None,
             };
             game_state.entities.insert(entity_id, entity);
         }
@@ -229,8 +235,15 @@ fn try_initialize_map_file(
     let starter_units = starter_units
         .into_iter()
         .map(|unit| {
-            let (components, visual_primitive) = starter_unit_components(&unit, registry)?;
-            Ok((unit.id, components, visual_primitive))
+            let (components, visual_primitive, display_name) =
+                starter_unit_components(&unit, registry)?;
+            Ok((
+                unit.id,
+                unit.mod_id,
+                components,
+                visual_primitive,
+                display_name,
+            ))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let unit_count = starter_units.len();
@@ -257,7 +270,7 @@ fn try_initialize_map_file(
         spawn_positions
     };
 
-    for ((unit_id, components, visual_primitive), spatial) in
+    for ((unit_id, mod_id, components, visual_primitive, display_name), spatial) in
         starter_units.into_iter().zip(selected_spawns)
     {
         let entity = Entity {
@@ -265,6 +278,8 @@ fn try_initialize_map_file(
             spatial,
             components,
             visual_primitive,
+            display_name,
+            mod_id,
         };
         game_state.entities.insert(entity.id.clone(), entity);
     }
@@ -285,9 +300,9 @@ fn try_initialize_map_file(
 fn starter_unit_components(
     unit: &StarterUnitDefinition,
     registry: Option<&ModRegistry>,
-) -> Result<(HashMap<String, Component>, Option<String>), String> {
+) -> Result<(HashMap<String, Component>, Option<String>, Option<String>), String> {
     let Some(mod_id) = unit.mod_id.as_deref() else {
-        return Ok((unit.components.clone(), None));
+        return Ok((unit.components.clone(), None, None));
     };
     let registry = registry.ok_or_else(|| {
         format!(
@@ -295,15 +310,12 @@ fn starter_unit_components(
             unit.id
         )
     })?;
-    let templates = registry
-        .templates
-        .read()
-        .map_err(|_| "mod registry read lock is poisoned".to_string())?;
-    let template = templates.get(mod_id).ok_or_else(|| {
-        format!(
-            "Starter unit '{}' references unknown mod_id '{mod_id}'",
-            unit.id
-        )
+    let template = registry.get_template(mod_id).map_err(|error| {
+        if error.starts_with("unknown mod_id") {
+            format!("Starter unit '{}' references {error}", unit.id)
+        } else {
+            error
+        }
     })?;
     let seat = starter_unit_seat(unit)?;
     let mut components = HashMap::new();
@@ -320,7 +332,81 @@ fn starter_unit_components(
     labels.retain(|label| label != "P1" && label != "P2");
     labels.push(seat.to_string());
     components.insert("tags".to_string(), Component::Tags { labels });
-    Ok((components, Some(template.visual_primitive.clone())))
+    Ok((
+        components,
+        Some(template.visual_primitive),
+        Some(template.display_name),
+    ))
+}
+
+pub fn deploy_profile_unit(
+    match_id: &str,
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    starting_life: i32,
+    registry: &ModRegistry,
+) -> Result<String, String> {
+    if !matches!(seat, "P1" | "P2") {
+        return Err("seat must be 'P1' or 'P2'".to_string());
+    }
+
+    let starter = StarterUnitDefinition {
+        id: slot_unit_id.to_string(),
+        mod_id: Some(mod_id.to_string()),
+        seat: Some(seat.to_string()),
+        components: HashMap::new(),
+    };
+    let (mut components, visual_primitive, display_name) =
+        starter_unit_components(&starter, Some(registry))?;
+    let Component::Destructible {
+        current_life,
+        max_life,
+    } = components
+        .get_mut("destructible")
+        .ok_or_else(|| format!("Profile '{mod_id}' has no destructible component"))?
+    else {
+        return Err(format!(
+            "Profile '{mod_id}' has an invalid destructible component"
+        ));
+    };
+    if !(1..=*max_life).contains(&starting_life) {
+        return Err(format!("starting health must be within 1..={max_life}"));
+    }
+    *current_life = starting_life;
+
+    let mut matches = ACTIVE_MATCHES
+        .lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    let state = matches
+        .get_mut(match_id)
+        .ok_or_else(|| format!("Unknown match: {match_id}"))?;
+    let existing = state
+        .entities
+        .get(slot_unit_id)
+        .ok_or_else(|| format!("Unknown roster unit: {slot_unit_id}"))?;
+    if !is_unit(existing) {
+        return Err(format!("Roster slot is not a unit: {slot_unit_id}"));
+    }
+    let has_requested_seat = existing.components.values().any(
+        |component| matches!(component, Component::Tags { labels } if labels.iter().any(|label| label == seat)),
+    );
+    if !has_requested_seat {
+        return Err(format!(
+            "Roster unit '{slot_unit_id}' does not belong to seat '{seat}'"
+        ));
+    }
+
+    let deployed = Entity {
+        id: slot_unit_id.to_string(),
+        spatial: existing.spatial.clone(),
+        components,
+        visual_primitive,
+        display_name: display_name.clone(),
+        mod_id: Some(mod_id.to_string()),
+    };
+    state.entities.insert(slot_unit_id.to_string(), deployed);
+    Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
 }
 
 fn starter_unit_seat(unit: &StarterUnitDefinition) -> Result<&'static str, String> {
@@ -710,6 +796,8 @@ mod tests {
 
         let matches = ACTIVE_MATCHES.lock().unwrap();
         let entity = &matches[&match_id].entities["CUSTOM_UNIT"];
+        assert_eq!(entity.display_name.as_deref(), Some("Custom Unit"));
+        assert_eq!(entity.mod_id.as_deref(), Some("com.example.unit"));
         assert!(matches!(
             entity.components.get("destructible"),
             Some(Component::Destructible {
@@ -723,6 +811,190 @@ mod tests {
                 if labels.iter().any(|label| label == "Custom")
                     && labels.iter().any(|label| label == "P2")
                     && !labels.iter().any(|label| label == "P1")
+        ));
+    }
+
+    #[test]
+    fn profile_deployment_replaces_slots_with_independent_authoritative_entities() {
+        let match_id = format!("profile_deployment_test_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry
+            .load_batch(
+                r#"[{
+                    "schema_version": 1,
+                    "mod_id": "com.example.goliath",
+                    "display_name": "Goliath",
+                    "visual_primitive": "CUBE",
+                    "components": {
+                        "destructible": {"current_life": 12, "max_life": 12},
+                        "tags": ["Unit", "Heavy"]
+                    }
+                }]"#,
+            )
+            .unwrap();
+        let map_json = r#"{
+            "hexMap": {},
+            "boardPieces": [{
+                "uid": "g7",
+                "inventoryID": "g7",
+                "altitude": 0,
+                "rotation": 0,
+                "pieceCoords": {"q": 0, "r": 0, "s": 0}
+            }]
+        }"#;
+        try_initialize_from_hexoscape_with_registry(match_id.clone(), map_json, &registry).unwrap();
+
+        let first_position = {
+            let matches = ACTIVE_MATCHES.lock().unwrap();
+            matches[&match_id].entities["UNIT_P1_1"].spatial.clone()
+        };
+        assert_eq!(
+            deploy_profile_unit(
+                &match_id,
+                "UNIT_P1_1",
+                "com.example.goliath",
+                "P1",
+                12,
+                &registry,
+            )
+            .unwrap(),
+            "Goliath"
+        );
+        deploy_profile_unit(
+            &match_id,
+            "UNIT_P2_1",
+            "com.example.goliath",
+            "P2",
+            12,
+            &registry,
+        )
+        .unwrap();
+
+        let before_invalid_deploy = {
+            let matches = ACTIVE_MATCHES.lock().unwrap();
+            serde_json::to_value(&matches[&match_id]).unwrap()
+        };
+        assert!(
+            deploy_profile_unit(
+                &match_id,
+                "UNIT_P1_1",
+                "com.unknown.profile",
+                "P1",
+                12,
+                &registry,
+            )
+            .unwrap_err()
+            .contains("unknown mod_id")
+        );
+        assert!(
+            deploy_profile_unit(
+                &match_id,
+                "UNIT_P1_1",
+                "com.example.goliath",
+                "P2",
+                12,
+                &registry,
+            )
+            .unwrap_err()
+            .contains("does not belong to seat")
+        );
+        assert!(
+            deploy_profile_unit(
+                &match_id,
+                "UNIT_P1_1",
+                "com.example.goliath",
+                "P1",
+                13,
+                &registry,
+            )
+            .unwrap_err()
+            .contains("starting health must be within 1..=12")
+        );
+        let missing_match_id = format!("{match_id}_missing");
+        assert!(
+            deploy_profile_unit(
+                &missing_match_id,
+                "UNIT_P1_1",
+                "com.example.goliath",
+                "P1",
+                12,
+                &registry,
+            )
+            .unwrap_err()
+            .contains("Unknown match")
+        );
+        assert!(!match_exists(&missing_match_id));
+        assert_eq!(
+            serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap(),
+            before_invalid_deploy
+        );
+
+        let open_hex = {
+            let matches = ACTIVE_MATCHES.lock().unwrap();
+            let state = &matches[&match_id];
+            state
+                .entities
+                .values()
+                .filter(|entity| {
+                    entity.components.values().any(|component| {
+                        matches!(
+                            component,
+                            Component::Terrain { .. } | Component::TerrainType { .. }
+                        )
+                    })
+                })
+                .map(|entity| entity.spatial.clone())
+                .find(|position| {
+                    !state.entities.values().any(|entity| {
+                        is_unit(entity)
+                            && entity.spatial.q == position.q
+                            && entity.spatial.r == position.r
+                            && entity.spatial.z == position.z
+                    })
+                })
+                .unwrap()
+        };
+        process_action(
+            &match_id,
+            &format!("M:UNIT_P1_1:Q{}R{}Z{}", open_hex.q, open_hex.r, open_hex.z),
+        )
+        .unwrap();
+        process_action(&match_id, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        let player_one = &matches[&match_id].entities["UNIT_P1_1"];
+        let player_two = &matches[&match_id].entities["UNIT_P2_1"];
+        assert_eq!(player_one.spatial.q, open_hex.q);
+        assert_eq!(player_one.spatial.r, open_hex.r);
+        assert_ne!(
+            (player_one.spatial.q, player_one.spatial.r),
+            (first_position.q, first_position.r)
+        );
+        assert_eq!(player_one.display_name.as_deref(), Some("Goliath"));
+        assert_eq!(player_one.mod_id.as_deref(), Some("com.example.goliath"));
+        assert!(matches!(
+            player_one.components.get("destructible"),
+            Some(Component::Destructible {
+                current_life: 12,
+                max_life: 12
+            })
+        ));
+        assert!(matches!(
+            player_two.components.get("destructible"),
+            Some(Component::Destructible {
+                current_life: 9,
+                max_life: 12
+            })
+        ));
+        assert!(matches!(
+            registry
+                .get_template("com.example.goliath")
+                .unwrap()
+                .components
+                .get("destructible"),
+            Some(Component::Destructible {
+                current_life: 12,
+                max_life: 12
+            })
         ));
     }
 

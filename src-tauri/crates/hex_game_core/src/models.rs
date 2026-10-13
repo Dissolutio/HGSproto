@@ -40,6 +40,10 @@ pub struct Entity {
     pub components: HashMap<String, Component>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_primitive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

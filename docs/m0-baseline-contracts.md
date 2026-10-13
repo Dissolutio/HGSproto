@@ -22,6 +22,8 @@ npm --prefix client run build
 
 All commands passed. The web build emits Vite's existing advisory that its main
 JavaScript chunk exceeds 500 kB; it is not a build failure.
+The client `build` and `dev` scripts regenerate the ignored WASM package first;
+`wasm-pack` and the `wasm32-unknown-unknown` Rust target are required.
 
 ### Recovery characterization
 
@@ -55,16 +57,23 @@ batch. The top-level profile keys are:
 | `mod_id` | Required lowercase ASCII domain-style identifier, with at least two dot-separated labels. Labels contain lowercase letters, digits, `_` or `-`, and start/end with an alphanumeric character. |
 | `display_name` | Required non-empty string. |
 | `visual_primitive` | Required non-empty string. |
-| `components` | Required object keyed by component name. Currently supported: `terrain`, `terrain_type`, `life_points`, `destructible`, and `tags`. |
+| `components` | Required object containing only the supported unit components `destructible` and `tags`. Both are required. |
 
 For profile convenience, `destructible` accepts `{ "current_life": integer,
 "max_life": integer }`; `tags` accepts an array of strings or
 `{ "labels": [...] }`. Components may also use the core's tagged serde form
 `{ "type": "Destructible", "data": { ... } }` (with a component type matching
 its key). Destructible life must satisfy `max_life >= 1` and
-`0 <= current_life <= max_life`. Each profile is limited to 64 KiB, and
-duplicate `mod_id` values in a batch or already loaded registry are rejected.
-Batch loading is atomic: a validation failure loads none of that batch.
+`1 <= current_life <= max_life`. Tags must include `Unit`; empty and duplicate
+labels are rejected. Unknown top-level, component, and component-data fields
+are rejected. Movement speed/range is not implemented by the current referee,
+so `movement_speed` and other unsupported mechanics are rejected rather than
+ignored. Unknown non-empty visual primitive names are retained and rendered
+using the existing cube fallback.
+
+Each profile is limited to 64 KiB, and duplicate `mod_id` values in a batch or
+already loaded registry are rejected. Batch loading is atomic: a validation
+failure loads none of that batch.
 
 Example:
 
@@ -84,8 +93,36 @@ Example:
 The current match snapshot is a JSON `GameState` object with `context`
 (`match_id`, `active_player`, `turn_phase`) and `entities`. Each entity has
 `id`, `spatial` (`q`, `r`, `z`), `components`, and optional
-`visual_primitive`. The Rust/WASM snapshot is authoritative; presentation-only
-React edits do not update it.
+`visual_primitive`, `display_name`, and `mod_id`. The Rust/WASM snapshot is
+authoritative; presentation-only React edits do not update it.
+
+### Creator deployment
+
+After a profile is imported, the local creator controls select its definition,
+a P1/P2 seat, a roster slot belonging to that seat, and a starting health value
+from 1 through the profile's maximum. Deployment replaces that unit in the
+authoritative Rust/WASM snapshot, retaining its entity ID and board coordinate
+while cloning the profile's components and visual metadata. Seat tags are
+normalized by the core. Replacing two different slots with the same profile
+creates independent health components; damaging one does not alter the other
+or the registry template. An unknown profile, wrong-seat slot, or invalid
+health value fails without changing the snapshot.
+
+This is roster/setup replacement, not an additive spawn or a new movement
+rule. Current movement still checks unit identity, board membership, and
+occupancy; profiles cannot define movement speed or footprint behavior.
+
+For a browser smoke check, start `npm --prefix client run dev`, import the
+example profile, and deploy it to `UNIT_P1_1` at 12 health. Deploy it again to
+`UNIT_P2_1`; both entities should show 12/12 HP and retain their own seat tags.
+Try importing a profile with a `movement_speed` field; the visible validation
+error should leave both deployed entities unchanged.
+
+On 2026-10-13, this flow was exercised in the integrated browser: the Goliath
+profile loaded, two roster slots deployed at 12/12 HP with the correct seat
+tags and `display_name`, and a `movement_speed` profile was rejected with a
+visible Rust validation diagnostic. The board remained at 6 units and both
+custom health overlays stayed at 12/12 after the rejected import.
 
 ## Action tokens
 
