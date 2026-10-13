@@ -886,7 +886,9 @@ export default function HexGameCockpit() {
       gatewaySocket.onerror = () => {
         if (!cancelled) {
           setIsPeerConnected(false);
-          setNotice("WebSocket error; retaining session details and retrying");
+          setNotice(
+            `Cannot reach the local WebSocket gateway at ${SOCKET_URL}. Start it with "cargo run -p hex_game_orchestrator" from the repository root. Retrying automatically.`,
+          );
         }
       };
       gatewaySocket.onclose = () => {
@@ -899,8 +901,8 @@ export default function HexGameCockpit() {
         if (storedSession) setRecoverySession(storedSession);
         setNotice(
           storedSession
-            ? "Unexpected disconnect; preserving match details and retrying…"
-            : "Engine stream disconnected; retrying…",
+            ? `Local gateway disconnected; preserving match details and retrying. If it is not running, start it with "cargo run -p hex_game_orchestrator" from the repository root.`
+            : `Local WebSocket gateway is unavailable at ${SOCKET_URL}. Start it with "cargo run -p hex_game_orchestrator" from the repository root. Retrying automatically.`,
         );
         const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempts.current, 5));
         reconnectAttempts.current += 1;
@@ -1812,7 +1814,7 @@ export default function HexGameCockpit() {
           <details style={styles.networkPortal}>
             <summary style={styles.modLoaderSummary}>🌐 Multiplayer Connection Portal</summary>
             <p style={styles.networkPortalHelp}>
-              Host or join through the local native gateway. Iroh handles encrypted peer transport and relay discovery; browser traffic reaches it over this local WebSocket.
+              Host or join through the local native gateway. Iroh handles encrypted peer transport and relay discovery; browser traffic reaches it over this local WebSocket. If it is unavailable, start it with "cargo run -p hex_game_orchestrator" from the repository root.
             </p>
             <table style={styles.networkStatusTable}>
               <tbody>
