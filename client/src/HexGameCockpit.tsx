@@ -65,6 +65,11 @@ type ModProfileSummary = {
 };
 type PlayerSeat = "P1" | "P2";
 
+const PLAYER_COLORS: Record<PlayerSeat, string> = {
+  P1: "#3b82f6",
+  P2: "#ef4444",
+};
+
 const SOCKET_URL = "ws://127.0.0.1:8080";
 const WASM_MATCH_ID = "wasm_sandbox";
 const TAB_ID_STORAGE_KEY = "hexgamesim.tab-id";
@@ -437,7 +442,7 @@ function UnitMarker({ entity, selected, onSelect }: UnitMarkerProps) {
   const worldY = entity.spatial.z * 0.5 + PILLAR_HEIGHT + 0.08;
   const visualPrimitive = entity.visual_primitive?.trim().toUpperCase();
   const isSphere = visualPrimitive === "SPHERE";
-  const unitColor = playerOne ? "#3b82f6" : "#ef4444";
+  const unitColor = playerOne ? PLAYER_COLORS.P1 : PLAYER_COLORS.P2;
 
   return (
     <>
@@ -612,6 +617,7 @@ export default function HexGameCockpit() {
   const [selectedModId, setSelectedModId] = useState("");
   const [deploymentSeat, setDeploymentSeat] = useState<PlayerSeat>("P1");
   const [deploymentSlotId, setDeploymentSlotId] = useState("UNIT_P1_1");
+  const [localSeat, setLocalSeat] = useState<PlayerSeat | null>(null);
   const [startingHealth, setStartingHealth] = useState("");
   const [localNodeId, setLocalNodeId] = useState<string | null>(null);
   const [localMatchId, setLocalMatchId] = useState<string | null>(null);
@@ -743,6 +749,7 @@ export default function HexGameCockpit() {
           }
           setLocalNodeId(allocatedId);
           setLocalMatchId(matchId || null);
+          setLocalSeat("P1");
           if (matchId) persistActiveSession(matchId);
           setRemoteNodeId(null);
           setIsPeerConnected(false);
@@ -753,6 +760,7 @@ export default function HexGameCockpit() {
           const [, localId, remoteId] = message.split(":", 3);
           setLocalNodeId(localId || null);
           setRemoteNodeId(remoteId || null);
+          setLocalSeat("P2");
           setIsPeerConnected(!!remoteId);
           setLocalMatchId(null);
           persistActiveSession(`browser_${managerId}`);
@@ -790,6 +798,7 @@ export default function HexGameCockpit() {
           setRemoteNodeId(remoteId || null);
           setIsPeerConnected(!!remoteId);
           setLocalMatchId(role === "HOST" ? matchId || null : null);
+          setLocalSeat(role === "HOST" ? "P1" : role === "JOIN" ? "P2" : null);
           setConnection("connected");
           setRecoverySession(null);
           reconnectAttempts.current = 0;
@@ -802,6 +811,7 @@ export default function HexGameCockpit() {
           clearActiveSession();
           setLocalNodeId(null);
           setLocalMatchId(null);
+          setLocalSeat(null);
           setRemoteNodeId(null);
           setIsPeerConnected(false);
           setJoinNodeId("");
@@ -814,6 +824,7 @@ export default function HexGameCockpit() {
           clearActiveSession();
           setLocalNodeId(null);
           setLocalMatchId(null);
+          setLocalSeat(null);
           setRemoteNodeId(null);
           setIsPeerConnected(false);
           setNotice("The previous match session expired; reconnecting with a fresh session");
@@ -994,6 +1005,7 @@ export default function HexGameCockpit() {
     setAttackTargeting(false);
     setInspectedEntity(null);
     setGameState(null);
+    setLocalSeat(null);
     setMode(nextMode);
   };
 
@@ -1214,6 +1226,7 @@ export default function HexGameCockpit() {
     setRecoveryDismissed(false);
     setLocalNodeId(null);
     setLocalMatchId(null);
+    setLocalSeat(null);
     setRemoteNodeId(null);
     setIsPeerConnected(false);
     setJoinNodeId("");
@@ -1375,6 +1388,27 @@ export default function HexGameCockpit() {
 
       <section style={styles.toolbar} aria-live="polite">
         <span style={styles.notice}>{notice}</span>
+        {mode === "network" && (
+          <span
+            role="status"
+            aria-live="polite"
+            style={{
+              ...styles.playerIdentity,
+              borderColor: localSeat ? PLAYER_COLORS[localSeat] : "#a8b7ae",
+            }}
+          >
+            <span
+              aria-hidden="true"
+              style={{
+                ...styles.playerColorDot,
+                background: localSeat ? PLAYER_COLORS[localSeat] : "#94a3b8",
+              }}
+            />
+            {localSeat
+              ? `You are Player ${localSeat === "P1" ? "1" : "2"} (${localSeat})`
+              : "Your player seat is awaiting host/join"}
+          </span>
+        )}
         <span style={styles.counts}>{terrain.length} hexes <i /> {units.length} units</span>
       </section>
 
@@ -1708,8 +1742,8 @@ export default function HexGameCockpit() {
       </section>
 
       <footer style={styles.footer}>
-        <span><b style={{ color: "#58a9e8" }}>P1</b> Player 1 · {playerOneCount}</span>
-        <span><b style={{ color: "#f07868" }}>P2</b> Player 2 · {playerTwoCount}</span>
+        <span><b style={{ color: PLAYER_COLORS.P1 }}>P1</b> Player 1 · {playerOneCount}</span>
+        <span><b style={{ color: PLAYER_COLORS.P2 }}>P2</b> Player 2 · {playerTwoCount}</span>
         <span style={styles.hint}>
           {selectedUnitId ? `Selected: ${selectedUnitId} · ${ruleHint}` : ruleHint}
         </span>
@@ -1772,7 +1806,7 @@ const styles: Record<string, CSSProperties> = {
   connection: { display: "flex", alignItems: "center", gap: 9, color: "#3f5a51", fontSize: 13, textTransform: "capitalize" },
   statusDot: { width: 9, height: 9, borderRadius: "50%", display: "inline-block" },
   matchId: { borderLeft: "1px solid #bcc9bf", paddingLeft: 12, fontFamily: "ui-monospace, monospace", color: "#75847c" },
-  toolbar: { maxWidth: 1240, margin: "0 auto", minHeight: 52, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 },
+  toolbar: { maxWidth: 1240, margin: "0 auto", minHeight: 52, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 },
   rulesBar: {
     maxWidth: 1240,
     margin: "0 auto 12px",
@@ -1801,6 +1835,20 @@ const styles: Record<string, CSSProperties> = {
   },
   ruleHint: { flexBasis: "100%", color: "#416158" },
   notice: { color: "#416158", fontSize: 13, overflowWrap: "anywhere" },
+  playerIdentity: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "7px 10px",
+    border: "1px solid",
+    borderRadius: 999,
+    background: "#f7faf5",
+    color: "#18302d",
+    fontSize: 12,
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  },
+  playerColorDot: { width: 10, height: 10, borderRadius: "50%", flexShrink: 0 },
   counts: { color: "#587168", fontSize: 12, whiteSpace: "nowrap" },
   boardFrame: {
     position: "relative",
