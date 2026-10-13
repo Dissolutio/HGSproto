@@ -2,6 +2,17 @@
 
 This template should help get you started developing with Tauri, React and Typescript in Vite.
 
+## Client structure
+
+- `src/HexGameCockpit.tsx` composes the page from game UI components.
+- `src/game/hooks/useGameRuntime.ts` owns WASM and WebSocket session lifecycle,
+  referee actions, turn/selection state, and runtime notifications.
+- `src/game/components/` contains the 3D board, turn HUD, inspector, profile
+  controls, and network portal. These components receive state and callbacks
+  rather than accessing the engine directly.
+- `src/game/model.ts`, `constants.ts`, and `types.ts` centralize game-state
+  normalization, shared configuration, and feature types.
+
 ## Turn HUD and attack controls
 
 - The permanent turn HUD shows your seat and color (P1 blue, P2 red), the active

@@ -218,9 +218,7 @@ in one tab and the host/join checks in two tabs.
 4. Leave/reset the session; confirm the session returns to a fresh board. In
    the host tab, host again and reconnect the second tab with the new ticket to
    verify the session can be established again.
-5. Confirm gateway or browser-console errors are visible and actionable. The
-   developer Goliath demo, when running Vite in development mode, is explicitly
-   presentation-only and must not be used as proof of a core-state mutation.
+5. Confirm gateway or browser-console errors are visible and actionable.
 
 ### Recorded browser smoke
 
