@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::sync::{
-    Arc, LazyLock, Mutex,
+    Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ struct ManagedSession {
     map_json: String,
     manager: Arc<NetworkManager>,
     state_updates: broadcast::Sender<String>,
+    peer_session: Mutex<Option<Weak<ManagedSession>>>,
     action_log: Mutex<Vec<String>>,
     connected: AtomicBool,
     disconnected_at: Mutex<Option<Instant>>,
@@ -54,11 +55,33 @@ impl ManagedSession {
     }
 
     fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::Release);
         match self.disconnected_at.lock() {
             Ok(mut disconnected_at) => *disconnected_at = Some(Instant::now()),
             Err(_) => eprintln!("Session {} recovery state is poisoned", self.manager_id),
         }
-        self.connected.store(false, Ordering::Release);
+    }
+
+    fn set_peer_session(&self, peer: &Arc<ManagedSession>) -> Result<(), String> {
+        *self
+            .peer_session
+            .lock()
+            .map_err(|_| "Peer session link is unavailable".to_string())? =
+            Some(Arc::downgrade(peer));
+        Ok(())
+    }
+
+    fn notify_peer_state(&self, token: &str) -> Result<(), String> {
+        let peer = self
+            .peer_session
+            .lock()
+            .map_err(|_| "Peer session link is unavailable".to_string())?
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(peer) = peer {
+            let _ = peer.state_updates.send(token.to_string());
+        }
+        Ok(())
     }
 
     fn is_expired(&self, now: Instant) -> Result<bool, String> {
@@ -141,6 +164,7 @@ fn get_or_create_session(
         map_json: map_json.to_string(),
         manager: Arc::new(NetworkManager::new(match_id)),
         state_updates,
+        peer_session: Mutex::new(None),
         action_log: Mutex::new(Vec::new()),
         connected: AtomicBool::new(true),
         disconnected_at: Mutex::new(None),
@@ -218,6 +242,24 @@ async fn reconnected_event(session: &ManagedSession) -> Result<String, String> {
         "P2P_RECONNECTED:{}:{}:{}:{role}",
         session.match_id, active_session.local_node_id, remote_node_id
     ))
+}
+
+async fn notify_peer_recovered(session: &ManagedSession) {
+    match session.manager.peer_connected().await {
+        Ok(true) => {
+            if let Err(error) = session.notify_peer_state("PEER_RECOVERED") {
+                eprintln!(
+                    "Could not notify peer after session {} recovered: {error}",
+                    session.manager_id
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "Could not inspect peer state after session {} recovered: {error}",
+            session.manager_id
+        ),
+    }
 }
 
 fn process_token(match_id: &str, token: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -330,6 +372,7 @@ async fn serve_websocket(stream: TcpStream) -> Result<(), Box<dyn Error + Send +
             websocket_sink
                 .send(Message::Text(reconnected_event.into()))
                 .await?;
+            notify_peer_recovered(&session).await;
         }
         loop {
             tokio::select! {
@@ -463,6 +506,7 @@ async fn serve_websocket(stream: TcpStream) -> Result<(), Box<dyn Error + Send +
                                         reconnected_event.into(),
                                     ))
                                     .await?;
+                                notify_peer_recovered(&session).await;
                             }
                             _ => {
                                 websocket_sink
@@ -537,6 +581,13 @@ async fn serve_websocket(stream: TcpStream) -> Result<(), Box<dyn Error + Send +
     }
     .await;
     session.mark_disconnected();
+    let _ = session.state_updates.send("PEER_DISCONNECTED".to_string());
+    if let Err(error) = session.notify_peer_state("PEER_DISCONNECTED") {
+        eprintln!(
+            "Could not notify peer after session {} disconnected: {error}",
+            session.manager_id
+        );
+    }
     connection_result
 }
 
@@ -567,10 +618,20 @@ async fn start_join_session(
     if remote_node_id.is_empty() {
         return Err("Enter the host's connection ticket".to_string());
     }
+    let peer_session = MANAGED_SESSIONS
+        .lock()
+        .map_err(|_| "Network session registry is unavailable".to_string())?
+        .values()
+        .find(|candidate| candidate.match_id == remote_match_id)
+        .cloned();
     session
         .manager
         .join_match_for_match(remote_node_id, remote_match_id)
         .await?;
+    if let Some(peer_session) = peer_session {
+        session.set_peer_session(&peer_session)?;
+        peer_session.set_peer_session(&session)?;
+    }
     let joined = session.manager.active_session().await?;
     let local_node_id = joined.local_node_id.clone();
     let peer_node_id = session
@@ -900,6 +961,8 @@ mod tests {
             reconnect_session(address, "tab_join_456", &join_match_id).await;
         assert_eq!(recovered_state, join_state);
         assert_eq!(recovered_actions, vec!["M:UNIT_P1_1:Q0R2Z0"]);
+        assert_eq!(receive_text(&mut host_tab).await, "PEER_DISCONNECTED");
+        assert_eq!(receive_text(&mut host_tab).await, "PEER_RECOVERED");
 
         join_tab
             .send(Message::Text(
@@ -919,6 +982,7 @@ mod tests {
                 .await
                 .starts_with(&format!("P2P_RECONNECTED:{join_match_id}:"))
         );
+        assert_eq!(receive_text(&mut host_tab).await, "PEER_RECOVERED");
 
         join_tab
             .send(Message::Text("HARD_RESET_SESSION".into()))

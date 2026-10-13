@@ -575,6 +575,7 @@ export default function HexGameCockpit() {
   const [localNodeId, setLocalNodeId] = useState<string | null>(null);
   const [localMatchId, setLocalMatchId] = useState<string | null>(null);
   const [remoteNodeId, setRemoteNodeId] = useState<string | null>(null);
+  const [isPeerConnected, setIsPeerConnected] = useState<boolean>(false);
   const [joinNodeId, setJoinNodeId] = useState("");
   const [recoverySession, setRecoverySession] = useState<RecoverySession | null>(
     readRecoverySession,
@@ -592,6 +593,7 @@ export default function HexGameCockpit() {
     if (mode === "wasm") {
       setSocket(null);
       setConnection("connecting");
+      setIsPeerConnected(false);
       setNotice("Loading local WebAssembly engine");
       void (async () => {
         try {
@@ -676,6 +678,19 @@ export default function HexGameCockpit() {
       gatewaySocket.onmessage = (event) => {
         if (cancelled) return;
         const message = String(event.data);
+        if (message === "PEER_DISCONNECTED" || message.startsWith("PEER_DISCONNECTED:")) {
+          setIsPeerConnected(false);
+          return;
+        }
+        if (
+          message === "PEER_CONNECTED" ||
+          message.startsWith("PEER_CONNECTED:") ||
+          message === "PEER_RECOVERED" ||
+          message.startsWith("PEER_RECOVERED:")
+        ) {
+          setIsPeerConnected(true);
+          return;
+        }
         if (message.startsWith("HOST_ALLOCATED:") || message.startsWith("P2P_HOSTED:")) {
           const prefix = message.startsWith("HOST_ALLOCATED:")
             ? "HOST_ALLOCATED:"
@@ -689,6 +704,7 @@ export default function HexGameCockpit() {
           setLocalMatchId(matchId || null);
           if (matchId) persistActiveSession(matchId);
           setRemoteNodeId(null);
+          setIsPeerConnected(false);
           requestInitialMapSnapshotFromCore();
           return;
         }
@@ -696,6 +712,7 @@ export default function HexGameCockpit() {
           const [, localId, remoteId] = message.split(":", 3);
           setLocalNodeId(localId || null);
           setRemoteNodeId(remoteId || null);
+          setIsPeerConnected(!!remoteId);
           setLocalMatchId(null);
           persistActiveSession(`browser_${managerId}`);
           setNotice("Joined and synchronized with the host");
@@ -703,11 +720,13 @@ export default function HexGameCockpit() {
         }
         if (message.startsWith("P2P_CONNECTED:")) {
           setRemoteNodeId(message.slice("P2P_CONNECTED:".length) || null);
+          setIsPeerConnected(true);
           setNotice("Peer connected; action-token synchronization is active");
           return;
         }
         if (message.startsWith("P2P_DISCONNECTED:")) {
           setRemoteNodeId(null);
+          setIsPeerConnected(false);
           setNotice(`Peer disconnected: ${message.slice("P2P_DISCONNECTED:".length)}`);
           return;
         }
@@ -728,6 +747,7 @@ export default function HexGameCockpit() {
           if (matchId) persistActiveSession(matchId);
           setLocalNodeId(localId || null);
           setRemoteNodeId(remoteId || null);
+          setIsPeerConnected(!!remoteId);
           setLocalMatchId(role === "HOST" ? matchId || null : null);
           setConnection("connected");
           setRecoverySession(null);
@@ -742,6 +762,7 @@ export default function HexGameCockpit() {
           setLocalNodeId(null);
           setLocalMatchId(null);
           setRemoteNodeId(null);
+          setIsPeerConnected(false);
           setJoinNodeId("");
           setSelectedUnitId(null);
           setInspectedEntity(null);
@@ -753,6 +774,7 @@ export default function HexGameCockpit() {
           setLocalNodeId(null);
           setLocalMatchId(null);
           setRemoteNodeId(null);
+          setIsPeerConnected(false);
           setNotice("The previous match session expired; reconnecting with a fresh session");
           gatewaySocket.close();
           return;
@@ -769,11 +791,15 @@ export default function HexGameCockpit() {
         }
       };
       gatewaySocket.onerror = () => {
-        if (!cancelled) setNotice("WebSocket error; retaining session details and retrying");
+        if (!cancelled) {
+          setIsPeerConnected(false);
+          setNotice("WebSocket error; retaining session details and retrying");
+        }
       };
       gatewaySocket.onclose = () => {
         if (cancelled) return;
         setConnection("offline");
+        setIsPeerConnected(false);
         const storedSession = readRecoverySession();
         if (storedSession) setRecoverySession(storedSession);
         setNotice(
@@ -795,8 +821,15 @@ export default function HexGameCockpit() {
     } else {
       setNotice("Opening local engine stream");
     }
+    const handleWindowClose = () => {
+      const activeSocket = ws;
+      if (!activeSocket || activeSocket.readyState !== WebSocket.OPEN) return;
+      activeSocket.close();
+    };
+    window.addEventListener("beforeunload", handleWindowClose);
     connect();
     return () => {
+      window.removeEventListener("beforeunload", handleWindowClose);
       cancelled = true;
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       ws?.close();
@@ -1073,6 +1106,7 @@ export default function HexGameCockpit() {
     setLocalNodeId(null);
     setLocalMatchId(null);
     setRemoteNodeId(null);
+    setIsPeerConnected(false);
     setJoinNodeId("");
     setSelectedUnitId(null);
     setInspectedEntity(null);
@@ -1121,22 +1155,50 @@ export default function HexGameCockpit() {
           <p style={styles.kicker}>HEXGAMESIM / {mode === "network" ? "LIVE SESSION" : "LOCAL SIMULATION"}</p>
           <h1 style={styles.title}>Tactical board</h1>
         </div>
-        <div style={styles.connection}>
-          <span
-            style={{
-              ...styles.statusDot,
-              background:
-                connection === "connected" || connection === "ready"
-                  ? "#70d6a4"
-                  : connection === "connecting"
-                    ? "#edbd62"
-                    : "#ef7777",
-            }}
-          />
-          <span>{connection}</span>
-          <span style={styles.matchId}>
-            {gameState?.context?.match_id ?? (mode === "wasm" ? WASM_MATCH_ID : "waiting for state")}
-          </span>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 18, flexWrap: "wrap" }}>
+          <div style={styles.connection}>
+            <span
+              style={{
+                ...styles.statusDot,
+                background:
+                  connection === "connected" || connection === "ready"
+                    ? "#70d6a4"
+                    : connection === "connecting"
+                      ? "#edbd62"
+                      : "#ef7777",
+              }}
+            />
+            <span>{connection}</span>
+            <span style={styles.matchId}>
+              {gameState?.context?.match_id ?? (mode === "wasm" ? WASM_MATCH_ID : "waiting for state")}
+            </span>
+          </div>
+          <div
+            style={{ ...styles.connection, textTransform: "none" }}
+            role="status"
+            aria-live="polite"
+            aria-label={isPeerConnected ? "Peer connected" : "Peer disconnected"}
+          >
+            <span>👤 Peer Status:</span>
+            {isPeerConnected && (
+              <style>
+                {`@keyframes peer-connection-pulse {
+                  0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.65); }
+                  50% { box-shadow: 0 0 0 5px rgba(34, 197, 94, 0); }
+                }`}
+              </style>
+            )}
+            <span
+              style={{
+                ...styles.statusDot,
+                background: isPeerConnected ? "#22c55e" : "#ef4444",
+                animation: isPeerConnected
+                  ? "peer-connection-pulse 1.4s ease-in-out infinite"
+                  : undefined,
+              }}
+            />
+            <span>{isPeerConnected ? "Connected" : "(Disconnected)"}</span>
+          </div>
         </div>
       </header>
 
