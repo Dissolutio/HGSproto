@@ -981,6 +981,65 @@ fn parse_spatial_position(value: &str) -> Result<SpatialPosition, String> {
 }
 
 #[cfg(test)]
+mod wb_non_shipping_flow_fixture {
+    use super::*;
+    use crate::flow::FlowDefinition;
+
+    // Approved technical fixture only; no product initializer accepts this definition.
+    static REVERSED_REFERENCE_FIXTURE: LazyLock<FlowDefinition> = LazyLock::new(|| {
+        let mut definition = REFERENCE_FLOW.clone();
+        definition.phases[0].seats.reverse();
+        definition
+    });
+
+    #[test]
+    fn reversed_order_fixture_proves_seat_and_step_schedule_is_data_driven() {
+        let mut state = generate_test_sandbox("wb_non_shipping_reversed".into());
+        state.context.active_player = REVERSED_REFERENCE_FIXTURE.phases[0].seats[0].clone();
+        let mut flow = MatchFlow::from_context(&REVERSED_REFERENCE_FIXTURE, &state.context).unwrap();
+        assert!(crate::flow::validate_definition(
+            &serde_json::to_string(&*REVERSED_REFERENCE_FIXTURE).unwrap()).is_err());
+        assert!(apply_referee_action(&mut state, &mut flow, "P1", "S").is_err());
+        for (seat, token, expected_seat, step) in [
+            ("P2", "S", "P2", TurnPhase::Attack),
+            ("P2", "S", "P2", TurnPhase::End),
+            ("P2", "E", "P1", TurnPhase::Movement),
+            ("P1", "S", "P1", TurnPhase::Attack),
+            ("P1", "S", "P1", TurnPhase::End),
+            ("P1", "E", "P2", TurnPhase::Movement),
+        ] {
+            apply_referee_action(&mut state, &mut flow, seat, token).unwrap();
+            assert_eq!(state.context.active_player, expected_seat);
+            assert_eq!(state.context.turn_phase, step);
+        }
+    }
+
+    #[test]
+    fn winning_attack_finishes_cursor_without_handover() {
+        let mut state = generate_test_sandbox("wb_winning_cursor".into());
+        state.entities.retain(|id, _| !matches!(id.as_str(), "UNIT_P2_2" | "HERO_P2"));
+        if let Some(Component::Destructible { current_life, .. }) =
+            state.entities.get_mut("UNIT_P2_1").unwrap().components.get_mut("destructible")
+        {
+            *current_life = 1;
+        }
+        state.context.turn_phase = TurnPhase::Attack;
+        let mut flow = MatchFlow::reference(&state.context).unwrap();
+        apply_referee_action(&mut state, &mut flow, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
+        assert_eq!(state.context.winner.as_deref(), Some("P1"));
+        assert_eq!(state.context.active_player, "P1");
+        assert_eq!(state.context.turn_phase, TurnPhase::Finished);
+        assert!(flow.cursor.finished);
+        assert_eq!(flow.cursor.seat_index, 0);
+        let before = serde_json::to_value(&state).unwrap();
+        let before_flow = flow.clone();
+        assert!(apply_referee_action(&mut state, &mut flow, "P1", "E").is_err());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        assert_eq!(flow, before_flow);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::MatchContext;
