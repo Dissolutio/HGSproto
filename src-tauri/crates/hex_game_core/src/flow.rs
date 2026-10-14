@@ -30,6 +30,21 @@ pub struct TurnStep {
     pub allow_skip: bool,
 }
 
+impl FlowDefinition {
+    pub(crate) fn initial_turn_step(&self) -> TurnPhase {
+        public_turn_step(&self.phases[0].steps[0].id)
+    }
+}
+
+fn public_turn_step(id: &str) -> TurnPhase {
+    match id {
+        "movement" => TurnPhase::Movement,
+        "attack" => TurnPhase::Attack,
+        "end" => TurnPhase::End,
+        _ => unreachable!("validated reference step"),
+    }
+}
+
 pub const MAX_FLOW_BYTES: usize = 1024;
 pub const MAX_IDENTIFIER_BYTES: usize = "reference_first_accepted_action".len();
 pub const MAX_PHASES: usize = 1;
@@ -168,12 +183,7 @@ impl MatchFlow {
         context.turn_phase = if self.cursor.finished {
             TurnPhase::Finished
         } else {
-            match phase.steps[self.cursor.step_index].id.as_str() {
-                "movement" => TurnPhase::Movement,
-                "attack" => TurnPhase::Attack,
-                "end" => TurnPhase::End,
-                _ => unreachable!("validated reference step"),
-            }
+            public_turn_step(&phase.steps[self.cursor.step_index].id)
         };
     }
 

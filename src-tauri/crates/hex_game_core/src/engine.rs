@@ -66,7 +66,7 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
         context: MatchContext {
             match_id,
             active_player: REFERENCE_FLOW.phases[0].seats[0].clone(),
-            turn_phase: TurnPhase::Movement,
+            turn_phase: REFERENCE_FLOW.initial_turn_step(),
             setup_locked: false,
             winner: None,
         },
@@ -217,7 +217,7 @@ fn try_initialize_map_file(
         context: MatchContext {
             match_id: match_id.clone(),
             active_player: REFERENCE_FLOW.phases[0].seats[0].clone(),
-            turn_phase: TurnPhase::Movement,
+            turn_phase: REFERENCE_FLOW.initial_turn_step(),
             setup_locked: false,
             winner: None,
         },
