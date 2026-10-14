@@ -43,3 +43,32 @@ and public turn phase, including legacy seat/phase aliases. Movement, Attack,
 End, and Finished continuation fixtures preserve health, setup lock, and winner.
 No action effects are replayed. The existing restore-time elimination check is
 retained for compatibility with the existing suite.
+
+## Additive read-only action queries
+
+Rust `query_actions(match_id, seat, candidate)` returns a typed query. WASM
+`wasm_query_actions(match_id, acting_seat, candidate_token)` and native C
+`hgs_query_actions(match_id, acting_seat, candidate_token)` return equivalent JSON.
+All three C strings are required and the returned string must be released with
+`hgs_free_string`. An empty bridge candidate requests step availability only.
+
+The four action entries distinguish `available_in_step` from argument legality:
+move/attack require arguments. A supplied full candidate gets an exact `legal`
+result by executing the same core validators against private clones, never
+committing entities, roster locks, outcomes, or flow changes. This avoids
+unbounded target/action-tree enumeration. Candidate tokens are limited to 1,024
+bytes, matching the existing native action transport cap; oversized requests
+fail explicitly. Query state copying scales with the already loaded match.
+
+Stable snake_case reason codes are `unknown_seat`, `finished`, `not_your_turn`,
+`wrong_step`, `malformed_action`, `unknown_entity`, `not_a_unit`, `wrong_owner`,
+`out_of_range`, `off_board`, `occupied`, `invalid_target`, and `invalid_state`.
+Infrastructure errors use `{"error":"diagnostic"}` in bridge JSON. Existing
+action APIs still return their existing text messages and VALID_STEP/E grammar.
+
+The query includes the complete reference flow definition/version/cursor.
+No UI, WebSocket opcode, or peer protocol is wired to it under WB. The gateway
+and native peer receiver still share the same core execution validator and
+neither schedules turns. M4 must add authenticated remote query routing and a
+confirmed state revision before treating a query as current across the network;
+it does not reserve a move or grant authority.

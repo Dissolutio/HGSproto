@@ -161,6 +161,30 @@ pub unsafe extern "C" fn hgs_free_string(ptr: *mut c_char) {
     }
 }
 
+/// Returns read-only action availability and optional candidate legality as JSON.
+/// An empty candidate string requests step permissions only.
+///
+/// # Safety
+/// Arguments must be valid null-terminated UTF-8 strings. Free the result with hgs_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hgs_query_actions(
+    c_match_id: *const c_char,
+    c_acting_seat: *const c_char,
+    c_candidate_token: *const c_char,
+) -> *mut c_char {
+    if c_match_id.is_null() || c_acting_seat.is_null() || c_candidate_token.is_null() {
+        return CString::new(crate::query::error_json("INVALID_ARGUMENT")).unwrap().into_raw();
+    }
+    let inputs = unsafe {
+        [CStr::from_ptr(c_match_id), CStr::from_ptr(c_acting_seat), CStr::from_ptr(c_candidate_token)]
+    };
+    let result = match (inputs[0].to_str(), inputs[1].to_str(), inputs[2].to_str()) {
+        (Ok(match_id), Ok(seat), Ok(token)) => crate::query::query_json(match_id, seat, token),
+        _ => crate::query::error_json("INVALID_UTF8"),
+    };
+    CString::new(result).unwrap().into_raw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

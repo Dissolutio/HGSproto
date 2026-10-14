@@ -1,5 +1,6 @@
 use crate::flow::{MatchFlow, REFERENCE_FLOW};
 use crate::mod_registry::ModRegistry;
+use crate::query::{ActionAvailability, ActionKind, ActionQuery, CandidateLegality, ReasonCode, Rejection};
 use crate::models::{
     Component, Entity, GameState, HexoscapeMapFile, MatchContext, SpatialPosition,
     StarterUnitDefinition, TurnPhase,
@@ -654,7 +655,42 @@ pub fn process_action(match_id: &str, acting_seat: &str, action: &str) -> Result
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     let flow = flows.get_mut(match_id)
         .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
-    apply_referee_action(state, flow, acting_seat, action)
+    apply_referee_action(state, flow, acting_seat, action).map_err(|error| error.message)
+}
+
+/// Reports step permissions and validates a supplied candidate without committing effects.
+pub fn query_actions(match_id: &str, seat: &str, candidate: Option<&str>) -> Result<ActionQuery, String> {
+    if candidate.is_some_and(|token| token.len() > crate::query::MAX_QUERY_TOKEN_BYTES) {
+        return Err("Action query candidate exceeds 1024 bytes".into());
+    }
+    let matches = ACTIVE_MATCHES.lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    let state = matches.get(match_id).ok_or_else(|| format!("Unknown match: {match_id}"))?;
+    let flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let flow = flows.get(match_id).ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    let actor = normalize_seat(seat)
+        .map_err(|message| Rejection::new(ReasonCode::UnknownSeat, message));
+    let actions = [ActionKind::Move, ActionKind::Attack, ActionKind::Skip, ActionKind::EndTurn]
+        .into_iter().map(|kind| {
+            let result = actor.as_ref().map_err(Clone::clone)
+                .and_then(|seat| validate_action_context(state, flow, seat, Some(kind)));
+            ActionAvailability {
+                action: kind,
+                available_in_step: result.is_ok(),
+                requires_arguments: matches!(kind, ActionKind::Move | ActionKind::Attack),
+                rejection: result.err(),
+            }
+        }).collect();
+    let candidate = candidate.map(|token| {
+        let result = actor.as_ref().map_err(Clone::clone).and_then(|seat| {
+            apply_referee_action(&mut state.clone(), &mut flow.clone(), seat, token)
+        });
+        CandidateLegality { token: token.into(), legal: result.is_ok(), rejection: result.err() }
+    });
+    Ok(ActionQuery {
+        query_schema_version: 1, seat: seat.into(), flow: flow.clone(), actions, candidate,
+    })
 }
 
 fn normalize_seat(seat: &str) -> Result<&'static str, String> {
@@ -695,31 +731,53 @@ fn hex_distance(left: &SpatialPosition, right: &SpatialPosition) -> i64 {
     (dq + dr + ds) / 2
 }
 
+fn validate_action_context(
+    state: &GameState,
+    flow: &MatchFlow,
+    acting_seat: &str,
+    kind: Option<ActionKind>,
+) -> Result<(), Rejection> {
+    if state.context.turn_phase == TurnPhase::Finished || state.context.winner.is_some() {
+        return Err(Rejection::new(ReasonCode::Finished, "Match is finished"));
+    }
+    let active_seat = normalize_seat(&state.context.active_player).map_err(|_| {
+        Rejection::new(ReasonCode::InvalidState, format!(
+            "Match has an invalid active seat: {}",
+            state.context.active_player
+        ))
+    })?;
+    if active_seat != acting_seat {
+        return Err(Rejection::new(ReasonCode::NotYourTurn, format!(
+            "Out-of-turn action: {acting_seat} cannot act while {} is active",
+            active_seat
+        )));
+    }
+    if MatchFlow::from_context(flow.definition, &state.context)
+        .map_err(|message| Rejection::new(ReasonCode::InvalidState, message))?.cursor != flow.cursor {
+        return Err(Rejection::new(ReasonCode::InvalidState, "Match flow cursor disagrees with the public turn state"));
+    }
+    let step = &flow.definition.phases[0].steps[flow.cursor.step_index];
+    if !kind.is_some_and(|kind| kind.action_id() == step.action ||
+        (kind == ActionKind::Skip && step.allow_skip))
+    {
+        let message = match state.context.turn_phase {
+            TurnPhase::Movement => "Movement phase accepts M: or S (skip movement)",
+            TurnPhase::Attack => "Attack phase accepts A:attacker:target or S (skip attack)",
+            _ => "End phase accepts only E (end turn)",
+        };
+        return Err(Rejection::new(ReasonCode::WrongStep, message));
+    }
+    Ok(())
+}
+
 fn apply_referee_action(
     state: &mut GameState,
     flow: &mut MatchFlow,
     acting_seat: &str,
     action: &str,
-) -> Result<(), String> {
-    if state.context.turn_phase == TurnPhase::Finished || state.context.winner.is_some() {
-        return Err("Match is finished".to_string());
-    }
-    let active_seat = normalize_seat(&state.context.active_player).map_err(|_| {
-        format!(
-            "Match has an invalid active seat: {}",
-            state.context.active_player
-        )
-    })?;
-    if active_seat != acting_seat {
-        return Err(format!(
-            "Out-of-turn action: {acting_seat} cannot act while {} is active",
-            active_seat
-        ));
-    }
-    if MatchFlow::from_context(flow.definition, &state.context)?.cursor != flow.cursor {
-        return Err("Match flow cursor disagrees with the public turn state".into());
-    }
-    let next = flow.advance()?;
+) -> Result<(), Rejection> {
+    validate_action_context(state, flow, acting_seat, ActionKind::from_token(action))?;
+    let next = flow.advance().map_err(|message| Rejection::new(ReasonCode::InvalidState, message))?;
     let step = &flow.definition.phases[0].steps[flow.cursor.step_index];
     match step.action.as_str() {
         "move" => {
@@ -727,27 +785,27 @@ fn apply_referee_action(
                 let (entity_id, destination) = action
                     .strip_prefix("M:")
                     .and_then(|payload| payload.split_once(':'))
-                    .ok_or_else(|| "Movement phase accepts M: or S (skip movement)".to_string())?;
+                    .ok_or_else(|| Rejection::new(ReasonCode::MalformedAction, "Movement phase accepts M: or S (skip movement)"))?;
                 if entity_id.is_empty() || destination.is_empty() || destination.contains(':') {
-                    return Err("Invalid movement action token".to_string());
+                    return Err(Rejection::new(ReasonCode::MalformedAction, "Invalid movement action token"));
                 }
-                let position = parse_spatial_position(destination)?;
+                let position = parse_spatial_position(destination)
+                    .map_err(|message| Rejection::new(ReasonCode::MalformedAction, message))?;
                 let entity = state
                     .entities
                     .get(entity_id)
-                    .ok_or_else(|| format!("Unknown entity: {entity_id}"))?;
+                    .ok_or_else(|| Rejection::new(ReasonCode::UnknownEntity, format!("Unknown entity: {entity_id}")))?;
                 if !is_unit(entity) {
-                    return Err(format!("Entity is not a movable unit: {entity_id}"));
+                    return Err(Rejection::new(ReasonCode::NotAUnit, format!("Entity is not a movable unit: {entity_id}")));
                 }
-                if unit_seat(entity)? != acting_seat {
-                    return Err(format!(
+                if unit_seat(entity).map_err(|message| Rejection::new(ReasonCode::WrongOwner, message))? != acting_seat {
+                    return Err(Rejection::new(ReasonCode::WrongOwner, format!(
                         "Unit {entity_id} does not belong to active seat {acting_seat}"
-                    ));
+                    )));
                 }
                 if entity.spatial.z != position.z || hex_distance(&entity.spatial, &position) != 1 {
-                    return Err(
-                        "Movement must be exactly one adjacent hex on the same level".into(),
-                    );
+                    return Err(Rejection::new(ReasonCode::OutOfRange,
+                        "Movement must be exactly one adjacent hex on the same level"));
                 }
                 let is_board_hex = state.entities.values().any(|entity| {
                     entity.spatial.q == position.q
@@ -761,7 +819,7 @@ fn apply_referee_action(
                         })
                 });
                 if !is_board_hex {
-                    return Err("Destination is not a board hex".into());
+                    return Err(Rejection::new(ReasonCode::OffBoard, "Destination is not a board hex"));
                 }
                 let is_occupied = state.entities.iter().any(|(id, entity)| {
                     id != entity_id
@@ -771,57 +829,58 @@ fn apply_referee_action(
                         && entity.spatial.z == position.z
                 });
                 if is_occupied {
-                    return Err("Destination tile is already occupied by a unit".into());
+                    return Err(Rejection::new(ReasonCode::Occupied, "Destination tile is already occupied by a unit"));
                 }
                 state
                     .entities
                     .get_mut(entity_id)
-                    .ok_or_else(|| format!("Unknown entity: {entity_id}"))?
+                    .ok_or_else(|| Rejection::new(ReasonCode::UnknownEntity, format!("Unknown entity: {entity_id}")))?
                     .spatial = position;
             }
         }
         "attack" => {
             if action != "S" || !step.allow_skip {
-                let (attacker_id, target_id) = parse_attack_action(action)?;
+                let (attacker_id, target_id) = parse_attack_action(action)
+                    .map_err(|message| Rejection::new(ReasonCode::MalformedAction, message))?;
                 let attacker = state
                     .entities
                     .get(attacker_id)
-                    .ok_or_else(|| format!("Unknown attacker: {attacker_id}"))?;
+                    .ok_or_else(|| Rejection::new(ReasonCode::UnknownEntity, format!("Unknown attacker: {attacker_id}")))?;
                 if !is_unit(attacker) {
-                    return Err(format!("Entity is not an attacking unit: {attacker_id}"));
+                    return Err(Rejection::new(ReasonCode::NotAUnit, format!("Entity is not an attacking unit: {attacker_id}")));
                 }
-                if unit_seat(attacker)? != acting_seat {
-                    return Err(format!(
+                if unit_seat(attacker).map_err(|message| Rejection::new(ReasonCode::WrongOwner, message))? != acting_seat {
+                    return Err(Rejection::new(ReasonCode::WrongOwner, format!(
                         "Attacker {attacker_id} does not belong to active seat {acting_seat}"
-                    ));
+                    )));
                 }
                 let target = state
                     .entities
                     .get(target_id)
-                    .ok_or_else(|| format!("Unknown target: {target_id}"))?;
+                    .ok_or_else(|| Rejection::new(ReasonCode::UnknownEntity, format!("Unknown target: {target_id}")))?;
                 if !is_unit(target) {
-                    return Err(format!("Target is not an enemy unit: {target_id}"));
+                    return Err(Rejection::new(ReasonCode::InvalidTarget, format!("Target is not an enemy unit: {target_id}")));
                 }
-                let target_seat = unit_seat(target)?;
+                let target_seat = unit_seat(target).map_err(|message| Rejection::new(ReasonCode::WrongOwner, message))?;
                 if target_seat == acting_seat {
-                    return Err(format!("Target {target_id} belongs to the attacking seat"));
+                    return Err(Rejection::new(ReasonCode::WrongOwner, format!("Target {target_id} belongs to the attacking seat")));
                 }
                 if attacker.spatial.z != target.spatial.z
                     || hex_distance(&attacker.spatial, &target.spatial) != 1
                 {
-                    return Err("Attacks require an adjacent enemy on the same level".into());
+                    return Err(Rejection::new(ReasonCode::OutOfRange, "Attacks require an adjacent enemy on the same level"));
                 }
                 if !target
                     .components
                     .values()
                     .any(|component| matches!(component, Component::Destructible { .. }))
                 {
-                    return Err(format!("Target is not destructible: {target_id}"));
+                    return Err(Rejection::new(ReasonCode::InvalidTarget, format!("Target is not destructible: {target_id}")));
                 }
                 let target = state
                     .entities
                     .get_mut(target_id)
-                    .ok_or_else(|| format!("Unknown target: {target_id}"))?;
+                    .ok_or_else(|| Rejection::new(ReasonCode::UnknownEntity, format!("Unknown target: {target_id}")))?;
                 let destructible = target
                     .components
                     .values_mut()
@@ -838,10 +897,10 @@ fn apply_referee_action(
         }
         "end_turn" => {
             if action != "E" {
-                return Err("End phase accepts only E (end turn)".into());
+                return Err(Rejection::new(ReasonCode::WrongStep, "End phase accepts only E (end turn)"));
             }
         }
-        _ => return Err("Unsupported flow action".into()),
+        _ => return Err(Rejection::new(ReasonCode::InvalidState, "Unsupported flow action")),
     }
 
     flow.cursor = next;
