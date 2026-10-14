@@ -521,11 +521,7 @@ pub fn match_exists(match_id: &str) -> bool {
 }
 
 #[cfg(test)]
-fn apply_sandbox_action(state: &mut GameState, action: &str) -> Result<(), String> {
-    if action.starts_with("A:") {
-        return apply_attack(state, action);
-    }
-
+fn apply_sandbox_move(state: &mut GameState, action: &str) -> Result<(), String> {
     let (entity_id, destination) = action
         .strip_prefix("M:")
         .and_then(|payload| payload.split_once(':'))
@@ -575,59 +571,6 @@ fn apply_sandbox_action(state: &mut GameState, action: &str) -> Result<(), Strin
         .ok_or_else(|| format!("Unknown entity: {entity_id}"))?;
 
     entity.spatial = position;
-    Ok(())
-}
-
-#[cfg(test)]
-fn apply_attack(state: &mut GameState, action: &str) -> Result<(), String> {
-    let payload = action
-        .strip_prefix("A:")
-        .ok_or_else(|| "Invalid attack token".to_string())?;
-    let mut fields = payload.split(':');
-    let attacker_id = fields.next().unwrap_or_default();
-    let target_id = fields.next().unwrap_or_default();
-    let damage = fields.next().unwrap_or_default();
-    if attacker_id.is_empty()
-        || target_id.is_empty()
-        || damage.is_empty()
-        || fields.next().is_some()
-    {
-        return Err("Invalid attack token".into());
-    }
-
-    let damage: i32 = damage
-        .parse()
-        .map_err(|_| "Invalid attack damage".to_string())?;
-    if damage <= 0 {
-        return Err("Attack damage must be positive".into());
-    }
-
-    let attacker = state
-        .entities
-        .get(attacker_id)
-        .ok_or_else(|| format!("Unknown attacker: {attacker_id}"))?;
-    if !is_unit(attacker) {
-        return Err(format!("Entity is not an attacking unit: {attacker_id}"));
-    }
-
-    let target = state
-        .entities
-        .get_mut(target_id)
-        .ok_or_else(|| format!("Unknown target: {target_id}"))?;
-    let destructible = target
-        .components
-        .values_mut()
-        .find_map(|component| match component {
-            Component::Destructible { current_life, .. } => Some(current_life),
-            _ => None,
-        })
-        .ok_or_else(|| format!("Target is not destructible: {target_id}"))?;
-    *destructible = destructible.saturating_sub(REFEREE_ATTACK_DAMAGE);
-    let target_destroyed = *destructible <= 0;
-
-    if target_destroyed {
-        state.entities.remove(target_id);
-    }
     Ok(())
 }
 
@@ -916,8 +859,6 @@ mod tests {
     use super::*;
     use crate::models::MatchContext;
     use std::collections::HashMap;
-
-    const REFEREE_ATTACK_DAMAGE: i32 = 1;
 
     #[test]
     fn test_sandbox_contains_seven_hexes_and_six_units() {
@@ -1347,7 +1288,7 @@ mod tests {
             occupied_unit_position.q, occupied_unit_position.r, occupied_unit_position.z
         );
         let mut state_for_move = state.clone();
-        assert!(apply_sandbox_action(&mut state_for_move, &token).is_err());
+        assert!(apply_sandbox_move(&mut state_for_move, &token).is_err());
         assert_eq!(
             (
                 state_for_move.entities["UNIT_P1_1"].spatial.q,
@@ -1387,7 +1328,7 @@ mod tests {
             free_terrain_position.q, free_terrain_position.r, free_terrain_position.z
         );
         let mut state_for_legal_move = state.clone();
-        apply_sandbox_action(&mut state_for_legal_move, &legal_move).unwrap();
+        apply_sandbox_move(&mut state_for_legal_move, &legal_move).unwrap();
         assert_eq!(
             (
                 state_for_legal_move.entities["UNIT_P1_1"].spatial.q,
@@ -1441,41 +1382,42 @@ mod tests {
     #[test]
     fn move_action_updates_unit_position_on_board() {
         let mut state = generate_test_sandbox("test".to_string());
-        apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q0R0Z0").unwrap();
+        apply_sandbox_move(&mut state, "M:UNIT_P1_1:Q0R0Z0").unwrap();
 
         let position = &state.entities["UNIT_P1_1"].spatial;
         assert_eq!((position.q, position.r, position.z), (0, 0, 0));
     }
 
     #[test]
-    fn test_combat_attack_deducts_life_and_destroys_unit() {
-        let mut state = generate_test_sandbox("combat_test".to_string());
+    fn referee_attack_deducts_one_life_and_destroys_unit() {
+        let match_id = format!("combat_test_{}", std::process::id());
+        let state = generate_test_sandbox(match_id.clone());
+        let mut snapshot = serde_json::to_value(state).unwrap();
+        snapshot["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"] =
+            serde_json::json!(1);
+        restore_match_snapshot(&match_id, &snapshot.to_string()).unwrap();
 
-        apply_sandbox_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:2").unwrap();
-        assert!(matches!(
-            state.entities["UNIT_P2_1"].components.get("destructible"),
-            Some(Component::Destructible {
-                current_life: 2,
-                max_life: 4
-            })
-        ));
-
-        apply_sandbox_action(&mut state, "A:UNIT_P1_1:UNIT_P2_1:3").unwrap();
-        assert!(!state.entities.contains_key("UNIT_P2_1"));
+        process_action(&match_id, "P1", "M:UNIT_P1_1:Q0R0Z0").unwrap();
+        process_action(&match_id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        assert!(
+            !ACTIVE_MATCHES.lock().unwrap()[&match_id]
+                .entities
+                .contains_key("UNIT_P2_1")
+        );
     }
 
     #[test]
     fn move_action_allows_unit_to_remain_on_its_current_hex() {
         let mut state = generate_test_sandbox("test".to_string());
-        apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q-1R0Z0").unwrap();
+        apply_sandbox_move(&mut state, "M:UNIT_P1_1:Q-1R0Z0").unwrap();
     }
 
     #[test]
     fn move_action_rejects_occupied_or_off_board_destinations() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q-1R1Z0").is_err());
-        assert!(apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q9R9Z0").is_err());
+        assert!(apply_sandbox_move(&mut state, "M:UNIT_P1_1:Q-1R1Z0").is_err());
+        assert!(apply_sandbox_move(&mut state, "M:UNIT_P1_1:Q9R9Z0").is_err());
         assert_eq!(state.entities["UNIT_P1_1"].spatial.q, -1);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.r, 0);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.z, 0);
@@ -1485,8 +1427,8 @@ mod tests {
     fn move_action_rejects_malformed_extra_token_segments_without_mutation() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_sandbox_action(&mut state, "M:UNIT_P1_1:Q0R0Z0:extra").is_err());
-        assert!(apply_sandbox_action(&mut state, "M::Q0R0Z0").is_err());
+        assert!(apply_sandbox_move(&mut state, "M:UNIT_P1_1:Q0R0Z0:extra").is_err());
+        assert!(apply_sandbox_move(&mut state, "M::Q0R0Z0").is_err());
         assert_eq!(state.entities["UNIT_P1_1"].spatial.q, -1);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.r, 0);
         assert_eq!(state.entities["UNIT_P1_1"].spatial.z, 0);
@@ -1496,7 +1438,7 @@ mod tests {
     fn move_action_rejects_non_unit_entities() {
         let mut state = generate_test_sandbox("test".to_string());
 
-        assert!(apply_sandbox_action(&mut state, "M:HEX_0:Q0R0Z0").is_err());
+        assert!(apply_sandbox_move(&mut state, "M:HEX_0:Q0R0Z0").is_err());
         assert_eq!(state.entities["HEX_0"].spatial.q, 0);
         assert_eq!(state.entities["HEX_0"].spatial.r, 0);
     }
@@ -1514,7 +1456,7 @@ mod tests {
             entities: HashMap::new(),
         };
 
-        assert!(apply_sandbox_action(&mut state, "M:missing:Q0R2Z1").is_err());
+        assert!(apply_sandbox_move(&mut state, "M:missing:Q0R2Z1").is_err());
     }
 
     #[test]
