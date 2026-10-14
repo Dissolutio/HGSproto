@@ -88,6 +88,11 @@ pub fn wasm_process_token_for_match(
     }
 }
 
+#[wasm_bindgen]
+pub fn wasm_query_actions(match_id: String, acting_seat: String, candidate_token: String) -> String {
+    crate::query::query_json(&match_id, &acting_seat, &candidate_token)
+}
+
 fn error_json(message: &str) -> String {
     let escaped =
         serde_json::to_string(message).unwrap_or_else(|_| "\"Unknown error\"".to_string());

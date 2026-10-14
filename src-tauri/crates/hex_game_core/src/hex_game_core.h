@@ -26,6 +26,13 @@ extern "C" {
     char* hgs_process_token(const char* c_token);
 
     // 5. Safely cleans up the string pointers returned by Rust to ensure Unreal doesn't leak memory
+    // Read-only JSON query; empty candidate requests step permissions only.
+    char* hgs_query_actions(
+        const char* c_match_id,
+        const char* c_acting_seat,
+        const char* c_candidate_token
+    );
+
     void hgs_free_string(char* ptr);
 
 #ifdef __cplusplus

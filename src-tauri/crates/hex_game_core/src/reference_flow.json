@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "reference",
+  "initial_phase": "play",
+  "phases": [{
+    "id": "play",
+    "order": "cycle",
+    "seats": ["P1", "P2"],
+    "steps": [
+      {"id": "movement", "action": "move", "allow_skip": true},
+      {"id": "attack", "action": "attack", "allow_skip": true},
+      {"id": "end", "action": "end_turn", "allow_skip": false}
+    ]
+  }],
+  "roster_lock_policy": "reference_first_accepted_action",
+  "game_end_policy": "reference_elimination"
+}
