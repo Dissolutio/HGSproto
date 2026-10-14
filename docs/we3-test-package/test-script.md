@@ -12,6 +12,27 @@ host…** at 120 seconds, record `still pending at 120s` as an observation cutof
 not as a product-enforced timeout. Keep the pending log and do not retry that
 attempt. Record route/stage from each local log without inferring a cause.
 
+## Stop rules
+
+- If the first three attempts of any scenario fail in the same way, stop that
+  scenario, keep the logs and worksheet rows, and report to the PM before
+  continuing.
+- If any step cannot be carried out as written, stop and report instead of
+  improvising.
+- Never retry a failed or pending attempt.
+
+## Session plan
+
+- **Session 1:** Scenario A, including the five gateway restarts; then B; then
+  G1, G2, and G3.
+- **Session 2:** C2; then D; then F; then C1.
+- **Scenario E** is optional and is run only if a third network pairing is
+  actually available.
+
+At the start of each session, repeat the **Before the first attempt**
+checklist. Record the local time of day and the commit (`git rev-parse HEAD`)
+on both machines.
+
 ## Before the first attempt
 
 - [ ] Confirm the phone's Wi-Fi is off, so its hotspot is using cellular data.
@@ -80,10 +101,11 @@ attempt. Record route/stage from each local log without inferring a cause.
    any disagreement, rejected action, delay, or visible error and attach the
    corresponding log names.
 
-## C1. Browser reload recovery — at least 20 attempts
+## C1. Browser reload recovery — at least 5 attempts
 
 This checks recovery of the **browser-to-local-gateway link**. It does not drop
 the guest gateway's peer connection or test a replacement peer.
+C1 is deliberately small because it tests only the browser-to-gateway link.
 
 1. Start and join a fresh match. Record both boards, active seat, positions,
    health, and accepted-action evidence.
@@ -93,11 +115,15 @@ the guest gateway's peer connection or test a replacement peer.
    Record the browser-to-gateway result and whether the peer connection and
    match state remain intact. A transient peer-status notice alone does not
    establish that a new peer connection was made.
-4. Repeat for at least 20 attempts, using a fresh match each time and the
+4. Repeat for at least 5 attempts, using a fresh match each time and the
    Scenario A reset procedure between attempts. Do not retry an individual
    failed or pending attempt.
 
 ## C2. Guest peer replacement — at least 20 attempts
+
+This scenario is based on code reading and has not been run. If the host
+refuses the replacement guest or the join fails the same way on the first three
+attempts, apply the stop rules.
 
 This requires an actual guest gateway shutdown and a new **Join Match**. A
 browser reload alone is not a peer replacement. The replacement gateway has a
@@ -205,7 +231,8 @@ stage; label unknown values as unknown. Keep the route-classification sample
 time caveat explicit: route changes are timestamped when first observed by the
 one-second sampler, not at the exact underlying transition. Report C1
 browser-to-gateway recovery separately from C2 replacement-peer attempts; do
-not count C1 as peer reconnection evidence.
+not count C1 as peer reconnection evidence. If C1 has fewer than 20 attempts,
+report its results as an observation, not a rate.
 
 Compare the cross-network sample with the existing single-machine default-mode
 recovery measurements, explicitly stating their sample sizes and that the

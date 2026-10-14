@@ -23,6 +23,7 @@ is identified.
 | Node and npm versions | | |
 | wasm-pack version | | |
 | Test commit (`git rev-parse HEAD`) | | |
+| Session start date/time (local) | | |
 | Network type/provider (name only; no addresses) | Home broadband provider/router name: | Phone hotspot cellular carrier name: |
 | VPN or tunnel active? (must be no) | No / explain: | No / explain: |
 | Phone Wi-Fi off; hotspot using cellular? | N/A | Yes / no |
@@ -48,6 +49,9 @@ For Scenario B, copy this small turn checklist for each turn:
 
 | C1 attempt | Host idle or action just accepted | Browser reloaded in same tab/origin? | Seconds until browser-to-gateway recovery or cutoff | Peer status before/after | Seat, positions, health, and action state agree? | Host/guest log filenames |
 |---|---|---|---:|---|---|---|
+| | | | | | | |
+| | | | | | | |
+| | | | | | | |
 | | | | | | | |
 | | | | | | | |
 
