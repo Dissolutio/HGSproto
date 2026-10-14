@@ -236,6 +236,7 @@ async fn connect_with_connection_diagnostics(
                     }
                     last_route = Some(observation.route);
                 }
+                diagnostics.route_pending(attempt, stage, observation);
                 report_at += std::time::Duration::from_secs(1);
             }
         }

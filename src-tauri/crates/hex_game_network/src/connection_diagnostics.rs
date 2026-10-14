@@ -125,6 +125,22 @@ impl ConnectionDiagnostics {
         );
     }
 
+    pub(crate) fn route_pending(
+        &self,
+        attempt: &DiagnosticAttempt,
+        stage: &'static str,
+        observation: RouteObservation,
+    ) {
+        self.write_attempt(
+            attempt,
+            stage,
+            "still_waiting",
+            "pending",
+            observation.route,
+            Some(observation),
+        );
+    }
+
     pub(crate) fn route_change(
         &self,
         attempt: &DiagnosticAttempt,
