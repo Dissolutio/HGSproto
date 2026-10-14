@@ -622,7 +622,7 @@ fn apply_attack(state: &mut GameState, action: &str) -> Result<(), String> {
             _ => None,
         })
         .ok_or_else(|| format!("Target is not destructible: {target_id}"))?;
-    *destructible = destructible.saturating_sub(damage);
+    *destructible = destructible.saturating_sub(REFEREE_ATTACK_DAMAGE);
     let target_destroyed = *destructible <= 0;
 
     if target_destroyed {
@@ -810,14 +810,6 @@ fn apply_referee_action(
                 {
                     return Err(format!("Target is not destructible: {target_id}"));
                 }
-                let damage = attacker
-                    .components
-                    .values()
-                    .find_map(|component| match component {
-                        Component::Destructible { max_life, .. } => Some((max_life / 4).max(1)),
-                        _ => None,
-                    })
-                    .unwrap_or(1);
                 let target = state
                     .entities
                     .get_mut(target_id)
@@ -924,6 +916,8 @@ mod tests {
     use super::*;
     use crate::models::MatchContext;
     use std::collections::HashMap;
+
+    const REFEREE_ATTACK_DAMAGE: i32 = 1;
 
     #[test]
     fn test_sandbox_contains_seven_hexes_and_six_units() {
@@ -1609,17 +1603,85 @@ mod tests {
     }
 
     #[test]
-    fn referee_uses_attacker_max_life_to_calculate_damage() {
-        let match_id = format!("referee_scaled_damage_test_{}", std::process::id());
+    fn referee_attacks_deal_fixed_one_damage_regardless_of_attacker_health() {
+        let match_id = format!("referee_fixed_damage_test_{}", std::process::id());
         store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
 
-        process_action(&match_id, "P1", "M:HERO_P1:Q0R0Z0").unwrap();
+        process_action(&match_id, "P1", "S").unwrap();
         process_action(&match_id, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
 
         let state = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
         assert_eq!(
             state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
-            2
+            3
+        );
+
+        process_action(&match_id, "P1", "E").unwrap();
+        process_action(&match_id, "P2", "S").unwrap();
+        process_action(&match_id, "P2", "S").unwrap();
+        process_action(&match_id, "P2", "E").unwrap();
+        process_action(&match_id, "P1", "M:UNIT_P1_2:Q0R0Z0").unwrap();
+        process_action(&match_id, "P1", "A:UNIT_P1_2:UNIT_P2_2").unwrap();
+
+        let state = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P2_2"]["components"]["destructible"]["data"]["current_life"],
+            3
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_restores_health_and_seat_then_continues_with_fixed_damage() {
+        let match_id = format!("legacy_snapshot_fixed_damage_test_{}", std::process::id());
+        let mut state = generate_test_sandbox(match_id.clone());
+        let target = state.entities.get_mut("UNIT_P1_1").unwrap();
+        target.components.insert(
+            "destructible".to_string(),
+            Component::Destructible {
+                current_life: 6,
+                max_life: 12,
+            },
+        );
+        let mut snapshot = serde_json::to_value(state).unwrap();
+        let context = snapshot["context"].as_object_mut().unwrap();
+        context.remove("setup_locked");
+        context.remove("winner");
+        context.insert(
+            "active_player".to_string(),
+            serde_json::Value::String("Player_2".to_string()),
+        );
+        context.insert(
+            "turn_phase".to_string(),
+            serde_json::Value::String("Attack".to_string()),
+        );
+
+        restore_match_snapshot(&match_id, &snapshot.to_string()).unwrap();
+        let restored = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(restored["context"]["active_player"], "Player_2");
+        assert_eq!(restored["context"]["turn_phase"], "attack");
+        assert_eq!(
+            restored["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["current_life"],
+            6
+        );
+        assert_eq!(
+            restored["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["max_life"],
+            12
+        );
+        assert_eq!(
+            restored["entities"]["UNIT_P1_1"]["components"]["tags"]["data"]["labels"],
+            serde_json::json!(["Unit", "P1"])
+        );
+
+        process_action(&match_id, "P2", "A:HERO_P2:UNIT_P1_1").unwrap();
+        let continued = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
+        assert_eq!(continued["context"]["active_player"], "Player_2");
+        assert_eq!(
+            continued["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["current_life"],
+            5
+        );
+        assert_eq!(
+            continued["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["max_life"],
+            12
         );
     }
 

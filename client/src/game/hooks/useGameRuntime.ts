@@ -24,7 +24,6 @@ import {
   parseState,
   profileHealth,
   terrainFromEntities,
-  unitAttackDamage,
   unitLabels,
   unitSeat,
 } from "../model";
@@ -745,8 +744,8 @@ export function useGameRuntime() {
       ? "Move one friendly unit one adjacent hex, or skip movement"
       : gameState?.context?.turn_phase === "attack"
         ? selectedUnit
-          ? `Attack one adjacent enemy for ${unitAttackDamage(selectedUnit)} damage, or skip attack`
-          : "Select a friendly unit to attack (damage scales with max health), or skip attack"
+          ? "Attack one adjacent enemy for 1 damage, or skip attack"
+          : "Select a friendly unit to attack for 1 damage, or skip attack"
         : gameState?.context?.turn_phase === "end"
           ? "End the turn to activate the other seat"
           : "Referee state unavailable";

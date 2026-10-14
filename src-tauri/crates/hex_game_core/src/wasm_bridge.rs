@@ -136,6 +136,34 @@ mod tests {
     }
 
     #[test]
+    fn wasm_attack_uses_fixed_damage_for_high_health_attacker() {
+        let match_id = format!("wasm_fixed_damage_test_{}", std::process::id());
+        crate::engine::store_match(
+            match_id.clone(),
+            crate::engine::generate_test_sandbox(match_id.clone()),
+        );
+
+        assert_eq!(
+            wasm_process_token_for_match(match_id.clone(), "P1".into(), "S".into()),
+            "VALID_STEP:S"
+        );
+        assert_eq!(
+            wasm_process_token_for_match(
+                match_id.clone(),
+                "P1".into(),
+                "A:HERO_P1:UNIT_P2_1".into(),
+            ),
+            "VALID_STEP:A:HERO_P1:UNIT_P2_1"
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
+            3
+        );
+    }
+
+    #[test]
     fn wasm_initializer_reports_invalid_map_data() {
         let error = initialize_match("invalid_map".to_string(), "not json").unwrap_err();
         assert!(error.contains("Invalid Hexoscape map JSON"));

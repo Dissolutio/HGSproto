@@ -15,7 +15,7 @@ export default function HexGameCockpit() {
     },
     view: {
       terrain, units, deploymentSlots, deploymentSlot, selectedProfile, activeSeat,
-      turnPhase, winner, playerSeat, isYourTurn, canAct, selectedUnit, attackTargetIds,
+      turnPhase, winner, playerSeat, isYourTurn, canAct, attackTargetIds,
       playerOneCount, playerTwoCount, ruleHint, showRecoveryBanner, healthLabelElements,
     },
     profiles: {
@@ -53,7 +53,6 @@ export default function HexGameCockpit() {
         actionPending={actionPending}
         canAct={canAct}
         selectedUnitId={selectedUnitId}
-        selectedUnit={selectedUnit}
         attackTargetCount={attackTargetIds.size}
         ruleHint={ruleHint}
         endTurnPending={!!endTurnAfterSkip}

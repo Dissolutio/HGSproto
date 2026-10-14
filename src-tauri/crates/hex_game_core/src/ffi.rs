@@ -194,6 +194,43 @@ mod tests {
     }
 
     #[test]
+    fn native_ffi_attack_uses_fixed_damage_for_high_health_attacker() {
+        let match_id = format!("native_ffi_fixed_damage_{}", std::process::id());
+        engine::store_match(
+            match_id.clone(),
+            engine::generate_test_sandbox(match_id.clone()),
+        );
+        let match_id_c = CString::new(match_id.clone()).unwrap();
+        let seat_c = CString::new("P1").unwrap();
+
+        for token in ["S", "A:HERO_P1:UNIT_P2_1"] {
+            let token_c = CString::new(token).unwrap();
+            let result_ptr = unsafe {
+                hgs_process_token_for_match_as(
+                    match_id_c.as_ptr(),
+                    seat_c.as_ptr(),
+                    token_c.as_ptr(),
+                )
+            };
+            let result = unsafe { CStr::from_ptr(result_ptr) }
+                .to_str()
+                .unwrap()
+                .to_owned();
+            unsafe { hgs_free_string(result_ptr) };
+            assert_eq!(result, format!("VALID_STEP:{token}"));
+        }
+
+        let state_ptr = unsafe { hgs_get_current_state(match_id_c.as_ptr()) };
+        let state: serde_json::Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(state_ptr) }.to_str().unwrap()).unwrap();
+        unsafe { hgs_free_string(state_ptr) };
+        assert_eq!(
+            state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
+            3
+        );
+    }
+
+    #[test]
     fn test_match_initialization_and_query_pipeline() {
         let raw_match_id = CString::new("test_match_123").unwrap();
         let sample_json_layout = CString::new(

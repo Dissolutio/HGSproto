@@ -25,8 +25,8 @@ This template should help get you started developing with Tauri, React and Types
   on the same level receive red hex rings, glowing markers, and red TARGET
   health labels. Click a highlighted enemy (or its occupied hex) to attack.
   Friendly units and out-of-range enemies are never attack targets.
-- Attack damage scales with maximum health: every 4 health grants 1 damage
-  (minimum 1), so the default 8-health Hero deals 2 damage.
+- Every legal attack deals exactly 1 damage, regardless of the attacker's
+  health. The Rust core defines this value; clients cannot supply damage.
 - Click the selected unit again, use **Cancel selection**, press **Escape**, or
   right-click the board to deselect. Inspection remains available while waiting.
 - **Skip movement** enters attack. **Skip Attack / End Turn** skips attack and
@@ -48,7 +48,7 @@ Run `npm run dev` from this directory and use the URL printed by Vite.
    the phase becomes end, and End Turn hands over to P2/Red in movement.
 5. Skip movement, then Skip Attack / End Turn. Confirm P1/Blue receives movement
    without any additional damage. An 8-health Hero attack should reduce a target
-   by 2 health.
+   by exactly 1 health.
 6. With two native network clients, verify the inactive seat sees Waiting for
    Opponent and disabled actions. Confirm skip/handover waits for the referee,
    and rejected actions or a disconnect do not cause an extra end-turn action.

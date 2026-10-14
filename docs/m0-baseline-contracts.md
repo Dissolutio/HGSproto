@@ -133,10 +133,10 @@ The M2 reference game alternates P1 and P2. Each turn proceeds through
 Movement, Attack, and End phases. In Movement, the active seat may move one
 friendly unit exactly one adjacent board hex at the same height, or skip the
 phase. A successful move or skip advances to Attack. In Attack, the active
-seat may damage one adjacent enemy unit at the same height. Damage is the
-attacker's maximum health divided by four, rounded down and with a minimum of
-one (so 4-health units deal 1 and 8-health units deal 2), or the seat may skip.
-A successful attack or skip advances to End.
+seat may damage one adjacent enemy unit at the same height for exactly one
+point, regardless of the attacker's health, or the seat may skip. The Rust core
+owns the damage value; clients cannot supply it. A successful attack or skip
+advances to End.
 Only the active seat may act, and it may control only units with its matching
 seat tag. The End action rotates the active seat and starts the next Movement
 phase.
@@ -164,9 +164,9 @@ peer stream:
 
 Movement coordinates are signed integers. The core checks the acting seat,
 phase, unit ownership, one-hex movement distance, board membership, height, and
-occupancy. Attacks require an adjacent enemy unit at the same height; damage
-is determined by the attacker's maximum health and a supplied damage field is
-rejected. An action request must include the acting seat when submitted through
+occupancy. Attacks require an adjacent enemy unit at the same height and deal
+exactly one core-defined damage; a supplied damage field is rejected. An action
+request must include the acting seat when submitted through
 the C/WASM API; the native gateway binds local actions to its host/join seat and
 assigns peer actions the opposite seat. Action processing returns
 `VALID_STEP:<original-token>` on success. The WASM bridge and native WebSocket
@@ -179,6 +179,10 @@ updated to 7/8. It also exercised skip-movement, skip-attack, and end-turn
 controls to confirm the P1/P2 phase rotation. A second browser check imported
 and deployed a 5/5 profile before play, then confirmed that the deployment
 control disables after the first accepted phase action.
+
+WD 1.0 browser verification imported and deployed a 12/12 P1 attacker, then
+attacked the 8/8 P2 hero. The attack reduced the hero to 7/8, and both its
+health overlay and inspector reported 7/8.
 
 ## Native WebSocket session protocol
 

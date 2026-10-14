@@ -246,8 +246,7 @@ fn spawn_peer_reader(manager: Arc<NetworkManager>, match_id: String, host: bool)
                             || token.starts_with("A:")
                             || matches!(token.as_str(), "S" | "E") =>
                     {
-                        let acting_seat = if host { "P2" } else { "P1" };
-                        if let Err(error) = engine::process_action(&match_id, acting_seat, &token) {
+                        if let Err(error) = apply_peer_action(&match_id, host, &token) {
                             eprintln!("Native peer sent an invalid action: {error}");
                         }
                     }
@@ -266,6 +265,41 @@ fn spawn_peer_reader(manager: Arc<NetworkManager>, match_id: String, host: bool)
     });
 }
 
+fn apply_peer_action(match_id: &str, host: bool, token: &str) -> Result<(), String> {
+    let acting_seat = if host { "P2" } else { "P1" };
+    engine::process_action(match_id, acting_seat, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_peer_action;
+    use hex_game_core::engine::{self, ACTIVE_MATCHES};
+    use hex_game_core::models::TurnPhase;
+
+    #[test]
+    fn native_peer_receiver_uses_fixed_damage_for_high_health_attacker() {
+        let match_id = format!("native_peer_fixed_damage_{}", std::process::id());
+        let mut state = engine::generate_test_sandbox(match_id.clone());
+        state.context.active_player = "P2".to_string();
+        state.context.turn_phase = TurnPhase::Attack;
+        engine::store_match(match_id.clone(), state);
+
+        apply_peer_action(&match_id, true, "A:HERO_P2:UNIT_P1_1").unwrap();
+
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        let restored = &matches[&match_id];
+        let target = &restored.entities["UNIT_P1_1"];
+        assert!(matches!(
+            target.components["destructible"],
+            hex_game_core::models::Component::Destructible {
+                current_life: 3,
+                max_life: 4
+            }
+        ));
+        assert_eq!(restored.context.active_player, "P2");
+        assert_eq!(restored.context.turn_phase, TurnPhase::End);
+    }
+}
 /// Frees a string allocated by `hgs_native_host_match`.
 ///
 /// # Safety

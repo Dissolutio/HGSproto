@@ -69,11 +69,6 @@ export function unitHealth(entity: EngineEntity): { currentLife: number; maxLife
   return { currentLife, maxLife };
 }
 
-export function unitAttackDamage(entity: EngineEntity): number {
-  const health = unitHealth(entity);
-  return health ? Math.max(1, Math.floor(health.maxLife / 4)) : 1;
-}
-
 export function entitiesFromState(state: EngineState | null): RenderEntity[] {
   if (!state?.entities) return [];
   const entries = Array.isArray(state.entities)

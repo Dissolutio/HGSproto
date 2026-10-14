@@ -1,6 +1,5 @@
-import type { ConnectionState, Mode, PlayerSeat, RecoverySession, RenderEntity } from "../types";
+import type { ConnectionState, Mode, PlayerSeat, RecoverySession } from "../types";
 import { PLAYER_COLORS, WASM_MATCH_ID } from "../constants";
-import { unitAttackDamage } from "../model";
 
 type GameHudProps = {
   mode: Mode;
@@ -24,7 +23,6 @@ type GameHudProps = {
   actionPending: boolean;
   canAct: boolean;
   selectedUnitId: string | null;
-  selectedUnit?: RenderEntity;
   attackTargetCount: number;
   ruleHint: string;
   endTurnPending: boolean;
@@ -55,7 +53,6 @@ export function GameHud({
   actionPending,
   canAct,
   selectedUnitId,
-  selectedUnit,
   attackTargetCount,
   ruleHint,
   endTurnPending,
@@ -63,8 +60,6 @@ export function GameHud({
   onSkipMovement,
   onEndTurn,
 }: GameHudProps) {
-  const selectedAttackDamage = selectedUnit ? unitAttackDamage(selectedUnit) : 1;
-
   return (
     <>
       <nav style={styles.modeBar} aria-label="Simulation mode">
@@ -223,7 +218,7 @@ export function GameHud({
         <span style={styles.ruleHint}>
           {turnPhase === "attack" && selectedUnitId
             ? attackTargetCount
-              ? `${attackTargetCount} valid target(s): click a red highlighted enemy to attack for ${selectedAttackDamage} damage.`
+              ? `${attackTargetCount} valid target(s): click a red highlighted enemy to attack for 1 damage.`
               : "No adjacent enemies on the same level. Select another friendly unit or skip attack."
             : ruleHint}
           {" "}Right-click the board or press Escape to cancel selection.

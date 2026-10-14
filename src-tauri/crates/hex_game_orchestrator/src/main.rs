@@ -898,6 +898,25 @@ mod tests {
         .expect("timed out waiting for the synchronized move snapshot")
     }
 
+    async fn wait_for_snapshot(
+        socket: &mut TestSocket,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Value {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let message = receive_text(socket).await;
+                let Ok(state) = serde_json::from_str::<Value>(&message) else {
+                    continue;
+                };
+                if matches(&state) {
+                    return state;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the expected match snapshot")
+    }
+
     #[tokio::test]
     async fn websocket_sessions_isolate_host_join_and_reset_between_tabs() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1026,6 +1045,49 @@ mod tests {
                 .starts_with(&format!("P2P_RECONNECTED:{join_match_id}:"))
         );
         assert_eq!(receive_text(&mut host_tab).await, "PEER_RECOVERED");
+
+        host_tab
+            .send(Message::Text("A:UNIT_P1_1:HERO_P2".into()))
+            .await
+            .unwrap();
+        let host_attack_state = wait_for_snapshot(&mut host_tab, |state| {
+            state["entities"]["HERO_P2"]["components"]["destructible"]["data"]["current_life"]
+                == 7
+        })
+        .await;
+        assert_eq!(
+            host_attack_state["entities"]["HERO_P2"]["components"]["destructible"]["data"]
+                ["current_life"],
+            7
+        );
+        host_tab.send(Message::Text("E".into())).await.unwrap();
+        let p2_movement_state = wait_for_snapshot(&mut host_tab, |state| {
+            state["context"]["active_player"] == "P2"
+                && state["context"]["turn_phase"] == "movement"
+        })
+        .await;
+        assert_eq!(p2_movement_state["context"]["active_player"], "P2");
+
+        join_tab.send(Message::Text("S".into())).await.unwrap();
+        wait_for_snapshot(&mut join_tab, |state| {
+            state["context"]["active_player"] == "P2"
+                && state["context"]["turn_phase"] == "attack"
+        })
+        .await;
+        join_tab
+            .send(Message::Text("A:HERO_P2:UNIT_P1_1".into()))
+            .await
+            .unwrap();
+        let peer_attack_state = wait_for_snapshot(&mut host_tab, |state| {
+            state["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["current_life"]
+                == 3
+        })
+        .await;
+        assert_eq!(
+            peer_attack_state["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]
+                ["current_life"],
+            3
+        );
 
         join_tab
             .send(Message::Text("HARD_RESET_SESSION".into()))
