@@ -7,7 +7,7 @@ use hex_game_core::ffi::{
     hgs_free_string, hgs_get_current_state, hgs_initialize_test_match,
     hgs_process_token_for_match_as,
 };
-use hex_game_network::{MatchSession, NetworkManager};
+use hex_game_network::{MatchSession, NetworkManager, RecoveryTestRoute};
 use tokio::time::{sleep, timeout};
 
 const MATCH_ID: &str = "p2p_auto_match";
@@ -72,15 +72,40 @@ async fn network_manager_host_join_and_action_token_sync() {
 
 #[tokio::test]
 async fn network_simulation_auth_sync_disconnect_and_recovery() {
+    run_recovery_scenario(RecoveryTestRoute::Default).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit route variant; run with --ignored --exact"]
+async fn network_simulation_recovery_direct_only() {
+    run_recovery_scenario(RecoveryTestRoute::DirectOnly).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Iroh compiled with DEV_RELAY_ONLY=1"]
+async fn network_simulation_recovery_relay_only() {
+    assert!(
+        option_env!("DEV_RELAY_ONLY").is_some(),
+        "rerun Cargo with DEV_RELAY_ONLY=1 to activate Iroh relay-only mode"
+    );
+    run_recovery_scenario(RecoveryTestRoute::RelayOnly).await;
+}
+
+async fn run_recovery_scenario(route: RecoveryTestRoute) {
+    let run_id = std::env::var("HGS_RECOVERY_RUN").unwrap_or_else(|_| "unlabeled".into());
+    eprintln!("[WE-2 variant] run={run_id} route={route:?}");
     initialize_test_match(MATCH_ID);
     assert!(match_exists(MATCH_ID));
     rebind_player_session(MATCH_ID, "Player_1").unwrap();
 
     let host = Arc::new(
-        timeout(NETWORK_TIMEOUT, MatchSession::host_match())
-            .await
-            .expect("host endpoint startup timed out")
-            .expect("host endpoint startup failed"),
+        timeout(
+            NETWORK_TIMEOUT,
+            MatchSession::host_match_for_recovery_test(route),
+        )
+        .await
+        .expect("host endpoint startup timed out")
+        .expect("host endpoint startup failed"),
     );
     let host_node_id = host.local_node_id.clone();
     let host_accept = {
@@ -88,10 +113,13 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
         tokio::spawn(async move { host.accept_peer().await })
     };
 
-    let client = timeout(NETWORK_TIMEOUT, MatchSession::join_match(&host_node_id))
-        .await
-        .expect("client connection timed out")
-        .expect("client connection failed");
+    let client = timeout(
+        NETWORK_TIMEOUT,
+        MatchSession::join_match_for_recovery_test(&host_node_id, route, "initial"),
+    )
+    .await
+    .expect("client connection timed out")
+    .expect("client connection failed");
     let client_snapshot = timeout(
         NETWORK_TIMEOUT,
         client.authenticate_player(MATCH_ID, "Player_2"),
@@ -179,10 +207,13 @@ async fn network_simulation_auth_sync_disconnect_and_recovery() {
         let host = Arc::clone(&host);
         tokio::spawn(async move { host.accept_peer().await })
     };
-    let reconnected_client = timeout(NETWORK_TIMEOUT, MatchSession::join_match(&host_node_id))
-        .await
-        .expect("replacement client connection timed out")
-        .expect("replacement client connection failed");
+    let reconnected_client = timeout(
+        NETWORK_TIMEOUT,
+        MatchSession::join_match_for_recovery_test(&host_node_id, route, "replacement"),
+    )
+    .await
+    .expect("replacement client connection timed out")
+    .expect("replacement client connection failed");
     let restored_snapshot = timeout(
         NETWORK_TIMEOUT,
         reconnected_client.authenticate_player(MATCH_ID, "Player_2"),

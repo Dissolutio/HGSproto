@@ -10,12 +10,179 @@ use hex_game_core::{
     engine,
     ffi::{hgs_free_string, hgs_get_current_state},
 };
-use iroh::{Endpoint, NodeAddr, NodeId, endpoint::Connection};
+use iroh::{
+    Endpoint, NodeAddr, NodeId, RelayMode,
+    endpoint::{Connection, ControlMsg},
+};
 use tokio::sync::{Notify, RwLock};
 
 const MATCH_ALPN: &[u8] = b"hexgamesim/match/0";
 static LOCAL_NODE_ADDRS: LazyLock<Mutex<HashMap<String, NodeAddr>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointRoute {
+    Default,
+    DirectOnly,
+    #[cfg(feature = "recovery-diagnostics")]
+    RelayOnly,
+}
+
+#[cfg(feature = "recovery-diagnostics")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryTestRoute {
+    Default,
+    DirectOnly,
+    RelayOnly,
+}
+
+#[cfg(feature = "recovery-diagnostics")]
+impl From<RecoveryTestRoute> for EndpointRoute {
+    fn from(route: RecoveryTestRoute) -> Self {
+        match route {
+            RecoveryTestRoute::Default => Self::Default,
+            RecoveryTestRoute::DirectOnly => Self::DirectOnly,
+            RecoveryTestRoute::RelayOnly => Self::RelayOnly,
+        }
+    }
+}
+
+fn endpoint_builder(route: EndpointRoute) -> iroh::endpoint::Builder {
+    match route {
+        EndpointRoute::Default => Endpoint::builder()
+            .discovery_n0()
+            .alpns(vec![MATCH_ALPN.to_vec()]),
+        EndpointRoute::DirectOnly => Endpoint::builder()
+            .relay_mode(RelayMode::Disabled)
+            .clear_discovery()
+            .alpns(vec![MATCH_ALPN.to_vec()]),
+        #[cfg(feature = "recovery-diagnostics")]
+        EndpointRoute::RelayOnly => Endpoint::builder()
+            .relay_mode(RelayMode::Default)
+            .clear_discovery()
+            .alpns(vec![MATCH_ALPN.to_vec()]),
+    }
+}
+
+fn restrict_node_addr(node_addr: NodeAddr, route: EndpointRoute) -> Result<NodeAddr, NetworkError> {
+    match route {
+        EndpointRoute::Default => Ok(node_addr),
+        EndpointRoute::DirectOnly => {
+            let addresses: Vec<_> = node_addr.direct_addresses().copied().collect();
+            if addresses.is_empty() {
+                return Err(NetworkError(
+                    "Direct-only recovery test has no advertised direct addresses".into(),
+                ));
+            }
+            Ok(NodeAddr::new(node_addr.node_id).with_direct_addresses(addresses))
+        }
+        #[cfg(feature = "recovery-diagnostics")]
+        EndpointRoute::RelayOnly => {
+            let relay_url = node_addr
+                .relay_url()
+                .cloned()
+                .ok_or_else(|| NetworkError("Relay-only recovery test has no relay URL".into()))?;
+            Ok(NodeAddr::new(node_addr.node_id).with_relay_url(relay_url))
+        }
+    }
+}
+
+#[cfg(feature = "recovery-diagnostics")]
+fn route_name(route: EndpointRoute) -> &'static str {
+    match route {
+        EndpointRoute::Default => "default-known-issue",
+        EndpointRoute::DirectOnly => "direct-only",
+        EndpointRoute::RelayOnly => "relay-only",
+    }
+}
+
+#[cfg(feature = "recovery-diagnostics")]
+async fn connect_with_recovery_diagnostics(
+    endpoint: &Endpoint,
+    target_addr: NodeAddr,
+    target_node_id: NodeId,
+    route: EndpointRoute,
+    stage: &'static str,
+) -> Result<Connection, NetworkError> {
+    eprintln!(
+        "[WE-2 route] stage={stage} variant={} connect_begin direct_candidates={} relay_candidate={}",
+        route_name(route),
+        target_addr.direct_addresses().count(),
+        target_addr.relay_url().is_some()
+    );
+    let connect = endpoint.connect(target_addr, MATCH_ALPN);
+    tokio::pin!(connect);
+    let mut report_at = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+
+    loop {
+        tokio::select! {
+            result = &mut connect => {
+                log_recovery_route_snapshot(endpoint, target_node_id, stage, "connect_finished");
+                return result.map_err(|error| NetworkError(error.to_string()));
+            }
+            _ = tokio::time::sleep_until(report_at) => {
+                log_recovery_route_snapshot(endpoint, target_node_id, stage, "connect_pending");
+                report_at += std::time::Duration::from_secs(1);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "recovery-diagnostics")]
+fn log_recovery_route_snapshot(
+    endpoint: &Endpoint,
+    target_node_id: NodeId,
+    stage: &str,
+    checkpoint: &str,
+) {
+    let Some(info) = endpoint.remote_info(target_node_id) else {
+        eprintln!("[WE-2 route] stage={stage} checkpoint={checkpoint} remote_info=unavailable");
+        return;
+    };
+    let connection_type = match info.conn_type {
+        iroh::endpoint::ConnectionType::Direct(_) => "direct",
+        iroh::endpoint::ConnectionType::Relay(_) => "relay",
+        iroh::endpoint::ConnectionType::Mixed(_, _) => "mixed",
+        iroh::endpoint::ConnectionType::None => "none",
+    };
+    let direct_payload_received = info
+        .addrs
+        .iter()
+        .filter(|addr| addr.last_payload.is_some())
+        .count();
+    let direct_ping_pong_received = info
+        .addrs
+        .iter()
+        .filter(|addr| {
+            addr.last_control
+                .as_ref()
+                .is_some_and(|(_, message)| matches!(message, ControlMsg::Ping | ControlMsg::Pong))
+        })
+        .count();
+    let relayed_call_me_maybe_received = info
+        .addrs
+        .iter()
+        .filter(|addr| {
+            addr.last_control
+                .as_ref()
+                .is_some_and(|(_, message)| matches!(message, ControlMsg::CallMeMaybe))
+        })
+        .count();
+    let relay_activity = info
+        .relay_url
+        .as_ref()
+        .is_some_and(|relay| relay.last_alive.is_some());
+    eprintln!(
+        "[WE-2 route] stage={stage} checkpoint={checkpoint} connection_type={connection_type} direct_candidates={} direct_payload_received={} direct_ping_pong_received={} relayed_call_me_maybe_received={} relay_candidate={} relay_payload_or_control_activity={} last_used={:?}",
+        info.addrs.len(),
+        direct_payload_received,
+        direct_ping_pong_received,
+        relayed_call_me_maybe_received,
+        info.relay_url.is_some(),
+        relay_activity,
+        info.last_used
+    );
+}
 
 #[derive(Debug)]
 pub struct NetworkError(String);
@@ -164,17 +331,35 @@ impl NetworkManager {
 impl MatchSession {
     /// Start listening for a peer and return the node ID to share as the invite.
     pub async fn host_match() -> Result<Self, NetworkError> {
-        let endpoint = Endpoint::builder()
-            .discovery_n0()
-            .alpns(vec![MATCH_ALPN.to_vec()])
+        Self::host_match_with_route(EndpointRoute::Default).await
+    }
+
+    #[cfg(feature = "recovery-diagnostics")]
+    pub async fn host_match_for_recovery_test(
+        route: RecoveryTestRoute,
+    ) -> Result<Self, NetworkError> {
+        Self::host_match_with_route(route.into()).await
+    }
+
+    async fn host_match_with_route(route: EndpointRoute) -> Result<Self, NetworkError> {
+        let endpoint = endpoint_builder(route)
             .bind()
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
         let local_node_id = endpoint.node_id().to_string();
-        if let Ok(node_addr) = endpoint.node_addr().await {
-            if let Ok(mut local_addrs) = LOCAL_NODE_ADDRS.lock() {
-                local_addrs.insert(local_node_id.clone(), node_addr);
+        match endpoint.node_addr().await {
+            Ok(node_addr) => {
+                let node_addr = restrict_node_addr(node_addr, route)?;
+                if let Ok(mut local_addrs) = LOCAL_NODE_ADDRS.lock() {
+                    local_addrs.insert(local_node_id.clone(), node_addr);
+                }
             }
+            Err(error) if route != EndpointRoute::Default => {
+                return Err(NetworkError(format!(
+                    "Could not obtain recovery-test route: {error}"
+                )));
+            }
+            Err(_) => {}
         }
 
         Ok(Self {
@@ -190,20 +375,48 @@ impl MatchSession {
 
     /// Connect to a host using the Node ID returned by `host_match`.
     pub async fn join_match(target_host_id: &str) -> Result<Self, NetworkError> {
+        Self::join_match_with_route(target_host_id, EndpointRoute::Default, "product").await
+    }
+
+    #[cfg(feature = "recovery-diagnostics")]
+    pub async fn join_match_for_recovery_test(
+        target_host_id: &str,
+        route: RecoveryTestRoute,
+        stage: &'static str,
+    ) -> Result<Self, NetworkError> {
+        Self::join_match_with_route(target_host_id, route.into(), stage).await
+    }
+
+    async fn join_match_with_route(
+        target_host_id: &str,
+        route: EndpointRoute,
+        stage: &'static str,
+    ) -> Result<Self, NetworkError> {
         let host_node_id = target_host_id
             .parse::<NodeId>()
             .map_err(|error| NetworkError(format!("Invalid host node ID: {error}")))?;
-        let endpoint = Endpoint::builder()
-            .discovery_n0()
-            .alpns(vec![MATCH_ALPN.to_vec()])
+        let endpoint = endpoint_builder(route)
             .bind()
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
-        let target_addr = LOCAL_NODE_ADDRS
+        let cached_target = LOCAL_NODE_ADDRS
             .lock()
             .ok()
-            .and_then(|local_addrs| local_addrs.get(target_host_id).cloned())
-            .unwrap_or_else(|| NodeAddr::from(host_node_id));
+            .and_then(|local_addrs| local_addrs.get(target_host_id).cloned());
+        let target_addr = match route {
+            EndpointRoute::Default => cached_target.unwrap_or_else(|| NodeAddr::from(host_node_id)),
+            _ => restrict_node_addr(
+                cached_target.ok_or_else(|| {
+                    NetworkError("Recovery test has no cached host address".into())
+                })?,
+                route,
+            )?,
+        };
+        #[cfg(feature = "recovery-diagnostics")]
+        let connection =
+            connect_with_recovery_diagnostics(&endpoint, target_addr, host_node_id, route, stage)
+                .await?;
+        #[cfg(not(feature = "recovery-diagnostics"))]
         let connection = endpoint
             .connect(target_addr, MATCH_ALPN)
             .await
@@ -238,12 +451,25 @@ impl MatchSession {
             let Some(incoming) = self.endpoint.accept().await else {
                 return Err(NetworkError("The endpoint was closed".into()));
             };
+            #[cfg(feature = "recovery-diagnostics")]
+            eprintln!(
+                "[WE-2 handshake] host received QUIC Initial remote={} validated={}",
+                incoming.remote_address(),
+                incoming.remote_address_validated()
+            );
             let connecting = match incoming.accept() {
                 Ok(connecting) => connecting,
                 Err(_) => continue,
             };
+            #[cfg(feature = "recovery-diagnostics")]
+            eprintln!(
+                "[WE-2 handshake] host waiting for QUIC handshake remote={}",
+                connecting.remote_address()
+            );
             match connecting.await {
                 Ok(connection) => {
+                    #[cfg(feature = "recovery-diagnostics")]
+                    eprintln!("[WE-2 handshake] host QUIC handshake completed");
                     let remote_node_id = iroh::endpoint::get_remote_node_id(&connection)
                         .map_err(|error| {
                             NetworkError(format!("Could not read peer Node ID: {error}"))
@@ -291,7 +517,11 @@ impl MatchSession {
                         Some((match_id, player_tag));
                     return Ok(());
                 }
-                Err(_) => continue,
+                Err(error) => {
+                    #[cfg(feature = "recovery-diagnostics")]
+                    eprintln!("[WE-2 handshake] host QUIC handshake failed: {error}");
+                    continue;
+                }
             }
         }
     }
