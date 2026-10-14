@@ -7,6 +7,9 @@ edition = "2024"
 name = "hex_game_orchestrator"
 path = "src/main.rs"
 
+[features]
+connection-diagnostics = ["hex_game_network/connection-diagnostics"]
+
 [dependencies]
 hex_game_core = { path = "../hex_game_core" }
 hex_game_network = { path = "../hex_game_network" }

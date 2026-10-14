@@ -1,5 +1,11 @@
 pub mod ffi;
 
+#[cfg(feature = "connection-diagnostics")]
+mod connection_diagnostics;
+
+#[cfg(feature = "connection-diagnostics")]
+use connection_diagnostics::{ConnectionDiagnostics, DiagnosticAttempt, observe_route};
+
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::LazyLock;
@@ -10,10 +16,9 @@ use hex_game_core::{
     engine,
     ffi::{hgs_free_string, hgs_get_current_state},
 };
-use iroh::{
-    Endpoint, NodeAddr, NodeId, RelayMode,
-    endpoint::{Connection, ControlMsg},
-};
+#[cfg(feature = "recovery-diagnostics")]
+use iroh::endpoint::ControlMsg;
+use iroh::{Endpoint, NodeAddr, NodeId, RelayMode, endpoint::Connection};
 use tokio::sync::{Notify, RwLock};
 
 const MATCH_ALPN: &[u8] = b"hexgamesim/match/0";
@@ -184,6 +189,136 @@ fn log_recovery_route_snapshot(
     );
 }
 
+#[cfg(feature = "connection-diagnostics")]
+async fn connect_with_connection_diagnostics(
+    endpoint: &Endpoint,
+    target_addr: NodeAddr,
+    target_node_id: NodeId,
+    diagnostics: &ConnectionDiagnostics,
+    attempt: &DiagnosticAttempt,
+    stage: &'static str,
+) -> Result<Connection, NetworkError> {
+    diagnostics.event(attempt, stage, "started", "pending", "unknown");
+    let connect = endpoint.connect(target_addr, MATCH_ALPN);
+    tokio::pin!(connect);
+    let mut report_at = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut last_route = None;
+
+    loop {
+        tokio::select! {
+            result = &mut connect => {
+                let observation = observe_route(endpoint, target_node_id);
+                if last_route != Some(observation.route) {
+                    if last_route.is_some() {
+                        diagnostics.route_change(attempt, stage, observation);
+                    } else {
+                        diagnostics.route_observation(attempt, stage, observation);
+                    }
+                }
+                match result {
+                    Ok(connection) => {
+                        diagnostics.event(attempt, stage, "completed", "success", observation.route);
+                        return Ok(connection);
+                    }
+                    Err(error) => {
+                        diagnostics.event(attempt, stage, "completed", "failure", observation.route);
+                        return Err(NetworkError(error.to_string()));
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(report_at) => {
+                let observation = observe_route(endpoint, target_node_id);
+                if last_route != Some(observation.route) {
+                    if last_route.is_some() {
+                        diagnostics.route_change(attempt, stage, observation);
+                    } else {
+                        diagnostics.route_observation(attempt, stage, observation);
+                    }
+                    last_route = Some(observation.route);
+                }
+                report_at += std::time::Duration::from_secs(1);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "connection-diagnostics")]
+async fn wait_with_connection_diagnostics<T, E, F>(
+    future: F,
+    endpoint: &Endpoint,
+    node_id: Option<NodeId>,
+    diagnostics: &ConnectionDiagnostics,
+    attempt: &DiagnosticAttempt,
+    stage: &'static str,
+) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    tokio::pin!(future);
+    let mut report_at = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep_until(report_at) => {
+                diagnostics.event(
+                    attempt,
+                    stage,
+                    "still_waiting",
+                    "pending",
+                    node_id
+                        .map(|node_id| observe_route(endpoint, node_id).route)
+                        .unwrap_or("unknown"),
+                );
+                report_at += std::time::Duration::from_secs(1);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "connection-diagnostics")]
+fn monitor_route_changes(
+    endpoint: Endpoint,
+    connection: Connection,
+    node_id: NodeId,
+    diagnostics: ConnectionDiagnostics,
+    attempt: DiagnosticAttempt,
+    stage: &'static str,
+) {
+    tokio::spawn(async move {
+        let mut previous_route = None;
+        let mut report_at = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let closed = connection.closed();
+        tokio::pin!(closed);
+
+        loop {
+            tokio::select! {
+                _ = &mut closed => {
+                    diagnostics.event(
+                        &attempt,
+                        stage,
+                        "connection_closed",
+                        "closed",
+                        previous_route.unwrap_or("unknown"),
+                    );
+                    break;
+                }
+                _ = tokio::time::sleep_until(report_at) => {
+                    let observation = observe_route(&endpoint, node_id);
+                    if previous_route != Some(observation.route) {
+                        if previous_route.is_some() {
+                            diagnostics.route_change(&attempt, stage, observation);
+                        } else {
+                            diagnostics.route_observation(&attempt, stage, observation);
+                        }
+                        previous_route = Some(observation.route);
+                    }
+                    report_at += std::time::Duration::from_secs(1);
+                }
+            }
+        }
+    });
+}
+
 #[derive(Debug)]
 pub struct NetworkError(String);
 
@@ -209,6 +344,10 @@ pub struct MatchSession {
     connection: Arc<RwLock<Option<Connection>>>,
     connection_ready: Arc<Notify>,
     player_session: Arc<Mutex<Option<(String, String)>>>,
+    #[cfg(feature = "connection-diagnostics")]
+    diagnostics: ConnectionDiagnostics,
+    #[cfg(feature = "connection-diagnostics")]
+    join_attempt: Option<DiagnosticAttempt>,
 }
 
 #[derive(Clone)]
@@ -342,10 +481,22 @@ impl MatchSession {
     }
 
     async fn host_match_with_route(route: EndpointRoute) -> Result<Self, NetworkError> {
-        let endpoint = endpoint_builder(route)
-            .bind()
-            .await
-            .map_err(|error| NetworkError(error.to_string()))?;
+        #[cfg(feature = "connection-diagnostics")]
+        let diagnostics = ConnectionDiagnostics::open("host").map_err(NetworkError)?;
+        #[cfg(feature = "connection-diagnostics")]
+        diagnostics.session_event("endpoint_bind", "started", "pending");
+        let endpoint_result = endpoint_builder(route).bind().await;
+        #[cfg(feature = "connection-diagnostics")]
+        diagnostics.session_event(
+            "endpoint_bind",
+            "completed",
+            if endpoint_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            },
+        );
+        let endpoint = endpoint_result.map_err(|error| NetworkError(error.to_string()))?;
         let local_node_id = endpoint.node_id().to_string();
         match endpoint.node_addr().await {
             Ok(node_addr) => {
@@ -370,6 +521,10 @@ impl MatchSession {
             connection: Arc::new(RwLock::new(None)),
             connection_ready: Arc::new(Notify::new()),
             player_session: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "connection-diagnostics")]
+            diagnostics,
+            #[cfg(feature = "connection-diagnostics")]
+            join_attempt: None,
         })
     }
 
@@ -392,13 +547,33 @@ impl MatchSession {
         route: EndpointRoute,
         stage: &'static str,
     ) -> Result<Self, NetworkError> {
-        let host_node_id = target_host_id
-            .parse::<NodeId>()
-            .map_err(|error| NetworkError(format!("Invalid host node ID: {error}")))?;
-        let endpoint = endpoint_builder(route)
-            .bind()
-            .await
-            .map_err(|error| NetworkError(error.to_string()))?;
+        #[cfg(feature = "connection-diagnostics")]
+        let diagnostics = ConnectionDiagnostics::open("joiner").map_err(NetworkError)?;
+        #[cfg(feature = "connection-diagnostics")]
+        let attempt = diagnostics.begin_attempt("joiner");
+        #[cfg(feature = "connection-diagnostics")]
+        diagnostics.event(&attempt, stage, "requested", "pending", "unknown");
+        let host_node_id = target_host_id.parse::<NodeId>().map_err(|error| {
+            #[cfg(feature = "connection-diagnostics")]
+            diagnostics.event(&attempt, "ticket_parse", "completed", "failure", "unknown");
+            NetworkError(format!("Invalid host node ID: {error}"))
+        })?;
+        #[cfg(feature = "connection-diagnostics")]
+        diagnostics.event(&attempt, "endpoint_bind", "started", "pending", "unknown");
+        let endpoint_result = endpoint_builder(route).bind().await;
+        #[cfg(feature = "connection-diagnostics")]
+        diagnostics.event(
+            &attempt,
+            "endpoint_bind",
+            "completed",
+            if endpoint_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            },
+            "unknown",
+        );
+        let endpoint = endpoint_result.map_err(|error| NetworkError(error.to_string()))?;
         let cached_target = LOCAL_NODE_ADDRS
             .lock()
             .ok()
@@ -412,15 +587,37 @@ impl MatchSession {
                 route,
             )?,
         };
-        #[cfg(feature = "recovery-diagnostics")]
+        #[cfg(feature = "connection-diagnostics")]
+        let connection = connect_with_connection_diagnostics(
+            &endpoint,
+            target_addr,
+            host_node_id,
+            &diagnostics,
+            &attempt,
+            "quic_connect",
+        )
+        .await?;
+        #[cfg(all(
+            not(feature = "connection-diagnostics"),
+            feature = "recovery-diagnostics"
+        ))]
         let connection =
             connect_with_recovery_diagnostics(&endpoint, target_addr, host_node_id, route, stage)
                 .await?;
-        #[cfg(not(feature = "recovery-diagnostics"))]
+        #[cfg(not(any(feature = "connection-diagnostics", feature = "recovery-diagnostics")))]
         let connection = endpoint
             .connect(target_addr, MATCH_ALPN)
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
+        #[cfg(feature = "connection-diagnostics")]
+        monitor_route_changes(
+            endpoint.clone(),
+            connection.clone(),
+            host_node_id,
+            diagnostics.clone(),
+            attempt.clone(),
+            "connection_lifetime",
+        );
 
         Ok(Self {
             local_node_id: endpoint.node_id().to_string(),
@@ -430,6 +627,10 @@ impl MatchSession {
             connection: Arc::new(RwLock::new(Some(connection))),
             connection_ready: Arc::new(Notify::new()),
             player_session: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "connection-diagnostics")]
+            diagnostics,
+            #[cfg(feature = "connection-diagnostics")]
+            join_attempt: Some(attempt),
         })
     }
 
@@ -451,45 +652,163 @@ impl MatchSession {
             let Some(incoming) = self.endpoint.accept().await else {
                 return Err(NetworkError("The endpoint was closed".into()));
             };
+            #[cfg(feature = "connection-diagnostics")]
+            let attempt = self.diagnostics.begin_attempt("host");
             #[cfg(feature = "recovery-diagnostics")]
             eprintln!(
                 "[WE-2 handshake] host received QUIC Initial remote={} validated={}",
                 incoming.remote_address(),
                 incoming.remote_address_validated()
             );
+            #[cfg(feature = "connection-diagnostics")]
+            self.diagnostics
+                .event(&attempt, "quic_initial", "received", "pending", "unknown");
             let connecting = match incoming.accept() {
                 Ok(connecting) => connecting,
-                Err(_) => continue,
+                Err(_) => {
+                    #[cfg(feature = "connection-diagnostics")]
+                    self.diagnostics.event(
+                        &attempt,
+                        "incoming_accept",
+                        "completed",
+                        "failure",
+                        "unknown",
+                    );
+                    continue;
+                }
             };
+            #[cfg(feature = "connection-diagnostics")]
+            self.diagnostics
+                .event(&attempt, "quic_handshake", "started", "pending", "unknown");
             #[cfg(feature = "recovery-diagnostics")]
             eprintln!(
                 "[WE-2 handshake] host waiting for QUIC handshake remote={}",
                 connecting.remote_address()
             );
-            match connecting.await {
+            #[cfg(feature = "connection-diagnostics")]
+            let handshake_result = wait_with_connection_diagnostics(
+                connecting,
+                &self.endpoint,
+                None,
+                &self.diagnostics,
+                &attempt,
+                "quic_handshake",
+            )
+            .await;
+            #[cfg(not(feature = "connection-diagnostics"))]
+            let handshake_result = connecting.await;
+            match handshake_result {
                 Ok(connection) => {
                     #[cfg(feature = "recovery-diagnostics")]
                     eprintln!("[WE-2 handshake] host QUIC handshake completed");
-                    let remote_node_id = iroh::endpoint::get_remote_node_id(&connection)
-                        .map_err(|error| {
-                            NetworkError(format!("Could not read peer Node ID: {error}"))
-                        })?
-                        .to_string();
-                    let auth = match receive_packet(&connection, 1024).await {
+                    let remote_node_id = match iroh::endpoint::get_remote_node_id(&connection) {
+                        Ok(node_id) => node_id,
+                        Err(error) => {
+                            #[cfg(feature = "connection-diagnostics")]
+                            self.diagnostics.event(
+                                &attempt,
+                                "peer_identity",
+                                "completed",
+                                "failure",
+                                "unknown",
+                            );
+                            return Err(NetworkError(format!(
+                                "Could not read peer Node ID: {error}"
+                            )));
+                        }
+                    };
+                    #[cfg(feature = "connection-diagnostics")]
+                    {
+                        let observation = observe_route(&self.endpoint, remote_node_id);
+                        self.diagnostics
+                            .route_observation(&attempt, "quic_handshake", observation);
+                        self.diagnostics.event(
+                            &attempt,
+                            "quic_handshake",
+                            "completed",
+                            "success",
+                            observation.route,
+                        );
+                    }
+                    #[cfg(feature = "connection-diagnostics")]
+                    self.diagnostics.event(
+                        &attempt,
+                        "peer_identity",
+                        "completed",
+                        "success",
+                        observe_route(&self.endpoint, remote_node_id).route,
+                    );
+                    #[cfg(feature = "connection-diagnostics")]
+                    self.diagnostics.event(
+                        &attempt,
+                        "peer_authentication",
+                        "started",
+                        "pending",
+                        observe_route(&self.endpoint, remote_node_id).route,
+                    );
+                    #[cfg(feature = "connection-diagnostics")]
+                    let auth_result = wait_with_connection_diagnostics(
+                        receive_packet(&connection, 1024),
+                        &self.endpoint,
+                        Some(remote_node_id),
+                        &self.diagnostics,
+                        &attempt,
+                        "peer_authentication",
+                    )
+                    .await;
+                    #[cfg(not(feature = "connection-diagnostics"))]
+                    let auth_result = receive_packet(&connection, 1024).await;
+                    let auth = match auth_result {
                         Ok(auth) => auth,
-                        Err(_) => continue,
+                        Err(_) => {
+                            #[cfg(feature = "connection-diagnostics")]
+                            self.diagnostics.event(
+                                &attempt,
+                                "peer_authentication",
+                                "completed",
+                                "failure",
+                                observe_route(&self.endpoint, remote_node_id).route,
+                            );
+                            continue;
+                        }
                     };
                     let (match_id, player_tag) = match parse_auth_token(&auth) {
                         Ok(identity) => identity,
-                        Err(_) => continue,
+                        Err(_) => {
+                            #[cfg(feature = "connection-diagnostics")]
+                            self.diagnostics.event(
+                                &attempt,
+                                "peer_authentication",
+                                "completed",
+                                "failure",
+                                observe_route(&self.endpoint, remote_node_id).route,
+                            );
+                            continue;
+                        }
                     };
                     if expected_match_id.is_some_and(|expected| expected != match_id) {
+                        #[cfg(feature = "connection-diagnostics")]
+                        self.diagnostics.event(
+                            &attempt,
+                            "match_binding",
+                            "completed",
+                            "failure",
+                            observe_route(&self.endpoint, remote_node_id).route,
+                        );
                         let _ = send_packet(&connection, "E:AUTH_REJECTED").await;
                         continue;
                     }
                     if !engine::match_exists(&match_id)
                         || engine::rebind_player_session(&match_id, &player_tag).is_err()
                     {
+                        #[cfg(feature = "connection-diagnostics")]
+                        self.diagnostics.event(
+                            &attempt,
+                            "match_binding",
+                            "completed",
+                            "failure",
+                            observe_route(&self.endpoint, remote_node_id).route,
+                        );
                         let _ = send_packet(&connection, "E:AUTH_REJECTED").await;
                         continue;
                     }
@@ -497,18 +816,87 @@ impl MatchSession {
                     let snapshot = match current_state_snapshot(&match_id) {
                         Ok(snapshot) => snapshot,
                         Err(error) => {
+                            #[cfg(feature = "connection-diagnostics")]
+                            self.diagnostics.event(
+                                &attempt,
+                                "snapshot_send",
+                                "completed",
+                                "failure",
+                                observe_route(&self.endpoint, remote_node_id).route,
+                            );
                             engine::release_player_session(&match_id, &player_tag);
                             let _ = send_packet(&connection, "E:STATE_UNAVAILABLE").await;
                             return Err(error);
                         }
                     };
-                    if let Err(error) = send_packet(&connection, &snapshot).await {
+                    #[cfg(feature = "connection-diagnostics")]
+                    self.diagnostics.event(
+                        &attempt,
+                        "snapshot_send",
+                        "started",
+                        "pending",
+                        observe_route(&self.endpoint, remote_node_id).route,
+                    );
+                    #[cfg(feature = "connection-diagnostics")]
+                    let snapshot_send_result = wait_with_connection_diagnostics(
+                        send_packet(&connection, &snapshot),
+                        &self.endpoint,
+                        Some(remote_node_id),
+                        &self.diagnostics,
+                        &attempt,
+                        "snapshot_send",
+                    )
+                    .await;
+                    #[cfg(not(feature = "connection-diagnostics"))]
+                    let snapshot_send_result = send_packet(&connection, &snapshot).await;
+                    if let Err(error) = snapshot_send_result {
+                        #[cfg(feature = "connection-diagnostics")]
+                        self.diagnostics.event(
+                            &attempt,
+                            "snapshot_send",
+                            "completed",
+                            "failure",
+                            observe_route(&self.endpoint, remote_node_id).route,
+                        );
                         engine::release_player_session(&match_id, &player_tag);
                         return Err(error);
                     }
 
+                    #[cfg(feature = "connection-diagnostics")]
+                    {
+                        let observation = observe_route(&self.endpoint, remote_node_id);
+                        self.diagnostics.event(
+                            &attempt,
+                            "snapshot_send",
+                            "completed",
+                            "success",
+                            observation.route,
+                        );
+                        self.diagnostics.event(
+                            &attempt,
+                            "peer_authentication",
+                            "completed",
+                            "success",
+                            observation.route,
+                        );
+                        self.diagnostics.event(
+                            &attempt,
+                            "connection_attempt",
+                            "completed",
+                            "success",
+                            observation.route,
+                        );
+                        monitor_route_changes(
+                            self.endpoint.clone(),
+                            connection.clone(),
+                            remote_node_id,
+                            self.diagnostics.clone(),
+                            attempt.clone(),
+                            "connection_lifetime",
+                        );
+                    }
                     *self.connection.write().await = Some(connection);
-                    *self.remote_node_id.write().await = Some(remote_node_id);
+                    *self.remote_node_id.write().await = Some(remote_node_id.to_string());
                     self.connection_ready.notify_one();
                     *self
                         .player_session
@@ -517,9 +905,17 @@ impl MatchSession {
                         Some((match_id, player_tag));
                     return Ok(());
                 }
-                Err(error) => {
+                Err(_error) => {
                     #[cfg(feature = "recovery-diagnostics")]
-                    eprintln!("[WE-2 handshake] host QUIC handshake failed: {error}");
+                    eprintln!("[WE-2 handshake] host QUIC handshake failed: {_error}");
+                    #[cfg(feature = "connection-diagnostics")]
+                    self.diagnostics.event(
+                        &attempt,
+                        "quic_handshake",
+                        "completed",
+                        "failure",
+                        "unknown",
+                    );
                     continue;
                 }
             }
@@ -548,9 +944,66 @@ impl MatchSession {
             ));
         }
         let connection = self.active_connection().await?;
-        let snapshot =
-            authenticate_connection(&connection, remote_match_id, local_match_id, player_tag)
-                .await?;
+        #[cfg(feature = "connection-diagnostics")]
+        let host_node_id = self
+            .remote_node_id
+            .read()
+            .await
+            .as_ref()
+            .and_then(|node| node.parse::<NodeId>().ok())
+            .ok_or_else(|| NetworkError("Connected peer identity is unavailable".into()))?;
+        #[cfg(feature = "connection-diagnostics")]
+        if let Some(attempt) = self.join_attempt.as_ref() {
+            self.diagnostics.event(
+                attempt,
+                "peer_authentication",
+                "started",
+                "pending",
+                observe_route(&self.endpoint, host_node_id).route,
+            );
+        }
+        #[cfg(feature = "connection-diagnostics")]
+        let snapshot_result = if let Some(attempt) = self.join_attempt.as_ref() {
+            wait_with_connection_diagnostics(
+                authenticate_connection(&connection, remote_match_id, local_match_id, player_tag),
+                &self.endpoint,
+                Some(host_node_id),
+                &self.diagnostics,
+                attempt,
+                "peer_authentication",
+            )
+            .await
+        } else {
+            authenticate_connection(&connection, remote_match_id, local_match_id, player_tag).await
+        };
+        #[cfg(not(feature = "connection-diagnostics"))]
+        let snapshot_result =
+            authenticate_connection(&connection, remote_match_id, local_match_id, player_tag).await;
+        #[cfg(feature = "connection-diagnostics")]
+        if let Some(attempt) = self.join_attempt.as_ref() {
+            let route = observe_route(&self.endpoint, host_node_id).route;
+            self.diagnostics.event(
+                attempt,
+                "peer_authentication",
+                "completed",
+                if snapshot_result.is_ok() {
+                    "success"
+                } else {
+                    "failure"
+                },
+                route,
+            );
+            if snapshot_result.is_ok() {
+                self.diagnostics.event(
+                    attempt,
+                    "connection_attempt",
+                    "completed",
+                    "success",
+                    route,
+                );
+            }
+        }
+        let snapshot = snapshot_result?;
         *self
             .player_session
             .lock()
@@ -568,23 +1021,88 @@ impl MatchSession {
         if self.is_host {
             return Err(NetworkError("Host cannot join a remote host".into()));
         }
+        #[cfg(feature = "connection-diagnostics")]
+        let attempt = self.diagnostics.begin_attempt("joiner");
         self.mark_disconnected().await;
-        let host_node_id = target_host_id
-            .parse::<NodeId>()
-            .map_err(|error| NetworkError(format!("Invalid host node ID: {error}")))?;
+        let host_node_id = target_host_id.parse::<NodeId>().map_err(|error| {
+            #[cfg(feature = "connection-diagnostics")]
+            self.diagnostics
+                .event(&attempt, "ticket_parse", "completed", "failure", "unknown");
+            NetworkError(format!("Invalid host node ID: {error}"))
+        })?;
+        let target_addr = LOCAL_NODE_ADDRS
+            .lock()
+            .ok()
+            .and_then(|local_addrs| local_addrs.get(target_host_id).cloned())
+            .unwrap_or_else(|| NodeAddr::from(host_node_id));
+        #[cfg(feature = "connection-diagnostics")]
+        let connection = connect_with_connection_diagnostics(
+            &self.endpoint,
+            target_addr,
+            host_node_id,
+            &self.diagnostics,
+            &attempt,
+            "reconnect_quic",
+        )
+        .await?;
+        #[cfg(not(feature = "connection-diagnostics"))]
         let connection = self
             .endpoint
-            .connect(
-                LOCAL_NODE_ADDRS
-                    .lock()
-                    .ok()
-                    .and_then(|local_addrs| local_addrs.get(target_host_id).cloned())
-                    .unwrap_or_else(|| NodeAddr::from(host_node_id)),
-                MATCH_ALPN,
-            )
+            .connect(target_addr, MATCH_ALPN)
             .await
             .map_err(|error| NetworkError(error.to_string()))?;
-        let snapshot = authenticate_connection(&connection, match_id, match_id, player_tag).await?;
+        #[cfg(feature = "connection-diagnostics")]
+        self.diagnostics.event(
+            &attempt,
+            "peer_authentication",
+            "started",
+            "pending",
+            observe_route(&self.endpoint, host_node_id).route,
+        );
+        #[cfg(feature = "connection-diagnostics")]
+        let snapshot_result = wait_with_connection_diagnostics(
+            authenticate_connection(&connection, match_id, match_id, player_tag),
+            &self.endpoint,
+            Some(host_node_id),
+            &self.diagnostics,
+            &attempt,
+            "peer_authentication",
+        )
+        .await;
+        #[cfg(not(feature = "connection-diagnostics"))]
+        let snapshot_result =
+            authenticate_connection(&connection, match_id, match_id, player_tag).await;
+        #[cfg(feature = "connection-diagnostics")]
+        self.diagnostics.event(
+            &attempt,
+            "peer_authentication",
+            "completed",
+            if snapshot_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            },
+            observe_route(&self.endpoint, host_node_id).route,
+        );
+        let snapshot = snapshot_result?;
+        #[cfg(feature = "connection-diagnostics")]
+        {
+            self.diagnostics.event(
+                &attempt,
+                "connection_attempt",
+                "completed",
+                "success",
+                observe_route(&self.endpoint, host_node_id).route,
+            );
+            monitor_route_changes(
+                self.endpoint.clone(),
+                connection.clone(),
+                host_node_id,
+                self.diagnostics.clone(),
+                attempt,
+                "connection_lifetime",
+            );
+        }
         *self.connection.write().await = Some(connection);
         *self.remote_node_id.write().await = Some(target_host_id.to_string());
         *self
