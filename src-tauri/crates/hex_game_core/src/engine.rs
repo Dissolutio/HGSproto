@@ -176,7 +176,9 @@ pub fn get_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Vec<(i32,
 }
 
 pub fn initialize_from_hexoscape(match_id: String, map_file: HexoscapeMapFile) {
-    let _ = try_initialize_map_file(match_id, map_file, None, false);
+    if let Err(error) = try_initialize_map_file(match_id, map_file, None, false) {
+        eprintln!("Match initialization failed: {error}");
+    }
 }
 
 pub fn try_initialize_from_hexoscape_with_registry(
@@ -184,6 +186,7 @@ pub fn try_initialize_from_hexoscape_with_registry(
     map_json: &str,
     registry: &ModRegistry,
 ) -> Result<(), String> {
+    reject_explicit_scenario_flow(map_json)?;
     let map_file: HexoscapeMapFile = serde_json::from_str(map_json)
         .map_err(|error| format!("Invalid Hexoscape map JSON: {error}"))?;
     try_initialize_map_file(match_id, map_file, Some(registry), false)
@@ -194,6 +197,7 @@ pub fn try_reset_from_hexoscape_with_registry(
     map_json: &str,
     registry: &ModRegistry,
 ) -> Result<(), String> {
+    reject_explicit_scenario_flow(map_json)?;
     let map_file: HexoscapeMapFile = serde_json::from_str(map_json)
         .map_err(|error| format!("Invalid Hexoscape map JSON: {error}"))?;
     try_initialize_map_file(match_id, map_file, Some(registry), true)
@@ -205,6 +209,9 @@ fn try_initialize_map_file(
     registry: Option<&ModRegistry>,
     replace_existing: bool,
 ) -> Result<(), String> {
+    let properties = map_file.hex_map.properties.iter()
+        .map(|(key, value)| (key.clone(), value.clone())).collect();
+    crate::flow::reject_metadata_flow(&properties)?;
     let mut game_state = GameState {
         context: MatchContext {
             match_id: match_id.clone(),
@@ -338,6 +345,15 @@ fn try_initialize_map_file(
         matches.insert(match_id, game_state);
     } else {
         matches.entry(match_id).or_insert(game_state);
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_explicit_scenario_flow(json: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("Invalid Hexoscape map JSON: {error}"))?;
+    if let Some(properties) = value.as_object() {
+        crate::flow::reject_metadata_flow(properties)?;
     }
     Ok(())
 }

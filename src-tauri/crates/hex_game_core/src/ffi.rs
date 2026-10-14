@@ -19,6 +19,17 @@ pub unsafe extern "C" fn hgs_initialize_match(
         .to_string_lossy()
         .into_owned();
     let json_manifest_bytes = unsafe { CStr::from_ptr(c_json_manifest) }.to_bytes();
+    let json = match std::str::from_utf8(json_manifest_bytes) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("Match initialization failed: invalid UTF-8: {error}");
+            return;
+        }
+    };
+    if let Err(error) = engine::reject_explicit_scenario_flow(json) {
+        eprintln!("Match initialization failed: {error}");
+        return;
+    }
 
     // 1. Safely deserialize the JSON layout into your Rust model structures
     if let Ok(map_file) = serde_json::from_slice::<HexoscapeMapFile>(json_manifest_bytes) {

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowDefinition {
     pub schema_version: u32,
     pub id: String,
@@ -13,6 +14,7 @@ pub struct FlowDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowPhase {
     pub id: String,
     pub order: String,
@@ -21,16 +23,79 @@ pub struct FlowPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TurnStep {
     pub id: String,
     pub action: String,
     pub allow_skip: bool,
 }
 
+pub const MAX_FLOW_BYTES: usize = 1024;
+pub const MAX_IDENTIFIER_BYTES: usize = "reference_first_accepted_action".len();
+pub const MAX_PHASES: usize = 1;
+pub const MAX_STEPS: usize = 3;
+const REFERENCE_JSON: &str = include_str!("reference_flow.json");
+
 pub static REFERENCE_FLOW: LazyLock<FlowDefinition> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("reference_flow.json"))
-        .expect("built-in reference flow must be valid")
+    let definition: FlowDefinition = serde_json::from_str(REFERENCE_JSON)
+        .expect("built-in reference flow must parse");
+    validate_limits(&definition).expect("built-in reference flow must fit its limits");
+    definition
 });
+
+pub fn validate_definition(json: &str) -> Result<FlowDefinition, String> {
+    if json.len() > MAX_FLOW_BYTES {
+        return Err(format!("Flow definition exceeds {MAX_FLOW_BYTES} bytes"));
+    }
+    let definition: FlowDefinition = serde_json::from_str(json)
+        .map_err(|error| format!("Invalid flow definition: {error}"))?;
+    validate_limits(&definition)?;
+    if definition.schema_version != 1 {
+        return Err(format!("Unsupported flow schema version: {}", definition.schema_version));
+    }
+    if definition != *REFERENCE_FLOW {
+        return Err("Only the built-in reference flow is supported: reference/play, P1 then P2, cycle, move/attack/end_turn steps, reference skip and policy settings".into());
+    }
+    Ok(definition)
+}
+
+fn validate_limits(definition: &FlowDefinition) -> Result<(), String> {
+    if definition.phases.len() != MAX_PHASES {
+        return Err(format!("Flow requires exactly {MAX_PHASES} phase"));
+    }
+    let phase = &definition.phases[0];
+    if phase.steps.len() != MAX_STEPS {
+        return Err(format!("Flow requires exactly {MAX_STEPS} turn steps"));
+    }
+    if phase.seats.len() != 2 {
+        return Err("Flow requires exactly two seats".into());
+    }
+    for id in [&definition.id, &definition.initial_phase, &definition.roster_lock_policy,
+        &definition.game_end_policy, &phase.id, &phase.order]
+        .into_iter()
+        .chain(phase.seats.iter())
+        .chain(phase.steps.iter().flat_map(|step| [&step.id, &step.action]))
+    {
+        if id.is_empty() || id.len() > MAX_IDENTIFIER_BYTES {
+            return Err(format!("Flow identifier must contain 1..={MAX_IDENTIFIER_BYTES} bytes"));
+        }
+        if !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+            return Err(format!("Invalid flow identifier: {id}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_metadata_flow(properties: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    for key in ["flow", "flow_definition", "flow_schema_version", "stages", "active_players",
+        "activePlayers", "phases", "turn_order", "turn_steps", "scripts", "expressions", "timers"]
+    {
+        if properties.contains_key(key) {
+            return Err(format!("Unsupported scenario flow declaration '{key}': only the implicit built-in reference flow is supported"));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FlowCursor {
@@ -129,7 +194,88 @@ fn phase_name(phase: TurnPhase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+        use super::*;
         use crate::engine;
+
+        #[test]
+        fn flow_limits_accept_exact_boundaries_and_reject_over_limit() {
+            assert!(REFERENCE_JSON.len() <= MAX_FLOW_BYTES);
+            let mut exact = REFERENCE_JSON.to_string();
+            exact.push_str(&" ".repeat(MAX_FLOW_BYTES - exact.len()));
+            assert!(validate_definition(&exact).is_ok());
+            assert!(validate_definition(&(exact + " ")).unwrap_err().contains("bytes"));
+            assert_eq!(REFERENCE_FLOW.roster_lock_policy.len(), MAX_IDENTIFIER_BYTES);
+            let mut value = serde_json::to_value(&*REFERENCE_FLOW).unwrap();
+            value["roster_lock_policy"] = "a".repeat(MAX_IDENTIFIER_BYTES + 1).into();
+            assert!(validate_definition(&value.to_string()).unwrap_err().contains("identifier"));
+            assert_eq!(REFERENCE_FLOW.phases.len(), MAX_PHASES);
+            let mut value = serde_json::to_value(&*REFERENCE_FLOW).unwrap();
+            let phase = value["phases"][0].clone();
+            value["phases"].as_array_mut().unwrap().push(phase);
+            // Compact JSON keeps this structural test below the byte limit.
+            assert!(validate_definition(&value.to_string()).unwrap_err().contains("phase"));
+            assert_eq!(REFERENCE_FLOW.phases[0].steps.len(), MAX_STEPS);
+            let mut value = serde_json::to_value(&*REFERENCE_FLOW).unwrap();
+            let step = value["phases"][0]["steps"][0].clone();
+            value["phases"][0]["steps"].as_array_mut().unwrap().push(step);
+            assert!(validate_definition(&value.to_string()).unwrap_err().contains("turn steps"));
+        }
+
+        #[test]
+        fn unsupported_flow_declarations_are_rejected() {
+            for (field, replacement) in [
+                ("schema_version", serde_json::json!(2)),
+                ("id", serde_json::json!("custom")),
+                ("initial_phase", serde_json::json!("setup")),
+                ("game_end_policy", serde_json::json!("score")),
+                ("stages", serde_json::json!({})),
+                ("activePlayers", serde_json::json!(["P1", "P2"])),
+                ("script", serde_json::json!("execute()")),
+                ("expression", serde_json::json!("turn + 1")),
+                ("timer", serde_json::json!(10)),
+            ] {
+                let mut value = serde_json::to_value(&*REFERENCE_FLOW).unwrap();
+                value[field] = replacement;
+                assert!(validate_definition(&value.to_string()).is_err(), "{field}");
+            }
+            for (field, replacement) in [
+                ("seats", serde_json::json!(["P1", "P2", "P3"])),
+                ("seats", serde_json::json!(["P2", "P1"])),
+                ("seats", serde_json::json!(["P1", "P1"])),
+                ("order", serde_json::json!("once")),
+                ("next", serde_json::json!({"expression": "choose()"})),
+                ("stages", serde_json::json!({})),
+            ] {
+                let mut value = serde_json::to_value(&*REFERENCE_FLOW).unwrap();
+                value["phases"][0][field] = replacement;
+                assert!(validate_definition(&value.to_string()).is_err(), "{field}");
+            }
+            for (field, replacement) in [
+                ("action", serde_json::json!("deploy")),
+                ("allow_skip", serde_json::json!(false)),
+                ("budget", serde_json::json!(2)),
+                ("script", serde_json::json!("run()")),
+            ] {
+                let mut value = serde_json::to_value(&*REFERENCE_FLOW).unwrap();
+                value["phases"][0]["steps"][0][field] = replacement;
+                assert!(validate_definition(&value.to_string()).is_err(), "{field}");
+            }
+        }
+
+        #[test]
+        fn scenario_metadata_cannot_enable_or_hide_flow_declarations() {
+            let registry = crate::mod_registry::ModRegistry::default();
+            for json in [
+                r#"{"hexMap":{},"flow":{"schema_version":2}}"#,
+                r#"{"hexMap":{"flow":{"schema_version":1}}}"#,
+                r#"{"hexMap":{"activePlayers":["P1","P2"]}}"#,
+            ] {
+                let result = engine::try_initialize_from_hexoscape_with_registry(
+                    "wb_invalid_metadata".into(), json, &registry);
+                assert!(result.unwrap_err().contains("flow declaration"));
+                assert!(!engine::match_exists("wb_invalid_metadata"));
+            }
+        }
 
         #[test]
         fn reference_schedule_advances_with_unchanged_public_snapshot() {
