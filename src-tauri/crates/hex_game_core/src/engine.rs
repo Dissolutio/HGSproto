@@ -1,3 +1,4 @@
+use crate::flow::{MatchFlow, REFERENCE_FLOW};
 use crate::mod_registry::ModRegistry;
 use crate::models::{
     Component, Entity, GameState, HexoscapeMapFile, MatchContext, SpatialPosition,
@@ -13,6 +14,9 @@ const REFEREE_ATTACK_DAMAGE: i32 = 1;
 pub static ACTIVE_MATCHES: LazyLock<Mutex<HashMap<String, GameState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_PLAYER_SESSIONS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// Always acquire ACTIVE_MATCHES before MATCH_FLOWS so both records commit together.
+static MATCH_FLOWS: LazyLock<Mutex<HashMap<String, MatchFlow>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Generates a hardcoded test sandbox with a small board and 2 units per player.
@@ -60,7 +64,7 @@ pub fn generate_test_sandbox(match_id: String) -> GameState {
     GameState {
         context: MatchContext {
             match_id,
-            active_player: "P1".to_string(),
+            active_player: REFERENCE_FLOW.phases[0].seats[0].clone(),
             turn_phase: TurnPhase::Movement,
             setup_locked: false,
             winner: None,
@@ -105,14 +109,43 @@ fn default_starter_units() -> Vec<StarterUnitDefinition> {
 
 /// Inserts a live match snapshot into system memory registry
 pub fn store_match(match_id: String, state: GameState) {
-    if let Ok(mut matches) = ACTIVE_MATCHES.lock() {
-        matches.insert(match_id, state);
+    if let Err(error) = try_store_match(match_id, state) {
+        eprintln!("Could not store match: {error}");
     }
+}
+
+fn try_store_match(match_id: String, state: GameState) -> Result<(), String> {
+    let flow = MatchFlow::reference(&state.context)?;
+    let mut matches = ACTIVE_MATCHES.lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    flows.insert(match_id.clone(), flow);
+    matches.insert(match_id, state);
+    Ok(())
+}
+
+pub fn get_match_flow(match_id: &str) -> Result<MatchFlow, String> {
+    let matches = ACTIVE_MATCHES.lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    if !matches.contains_key(match_id) {
+        return Err(format!("Unknown match: {match_id}"));
+    }
+    MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?
+        .get(match_id).cloned()
+        .ok_or_else(|| format!("Missing match flow: {match_id}"))
 }
 
 pub fn remove_match(match_id: &str) {
     if let Ok(mut matches) = ACTIVE_MATCHES.lock() {
-        matches.remove(match_id);
+        match MATCH_FLOWS.lock() {
+            Ok(mut flows) => {
+                matches.remove(match_id);
+                flows.remove(match_id);
+            }
+            Err(_) => eprintln!("Could not remove match: flow registry is unavailable"),
+        }
     }
     if let Ok(mut sessions) = ACTIVE_PLAYER_SESSIONS.lock() {
         sessions.remove(match_id);
@@ -175,7 +208,7 @@ fn try_initialize_map_file(
     let mut game_state = GameState {
         context: MatchContext {
             match_id: match_id.clone(),
-            active_player: "P1".to_string(),
+            active_player: REFERENCE_FLOW.phases[0].seats[0].clone(),
             turn_phase: TurnPhase::Movement,
             setup_locked: false,
             winner: None,
@@ -293,6 +326,12 @@ fn try_initialize_map_file(
     let mut matches = ACTIVE_MATCHES
         .lock()
         .map_err(|_| "Match registry is unavailable".to_string())?;
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    if replace_existing || !matches.contains_key(&match_id) {
+        let flow = MatchFlow::reference(&game_state.context)?;
+        flows.insert(match_id.clone(), flow);
+    }
     if replace_existing {
         release_player_session(&match_id, "Player_1");
         release_player_session(&match_id, "Player_2");
@@ -417,8 +456,15 @@ pub fn deploy_profile_unit(
         display_name: display_name.clone(),
         mod_id: Some(mod_id.to_string()),
     };
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let flow = flows.get_mut(match_id)
+        .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
     state.entities.insert(slot_unit_id.to_string(), deployed);
     evaluate_victory(state);
+    if state.context.turn_phase == TurnPhase::Finished {
+        flow.finish();
+    }
     Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
 }
 
@@ -590,7 +636,11 @@ pub fn process_action(match_id: &str, acting_seat: &str, action: &str) -> Result
         .get_mut(match_id)
         .ok_or_else(|| format!("Unknown match: {match_id}"))?;
 
-    apply_referee_action(state, acting_seat, action)
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let flow = flows.get_mut(match_id)
+        .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    apply_referee_action(state, flow, acting_seat, action)
 }
 
 fn normalize_seat(seat: &str) -> Result<&'static str, String> {
@@ -633,6 +683,7 @@ fn hex_distance(left: &SpatialPosition, right: &SpatialPosition) -> i64 {
 
 fn apply_referee_action(
     state: &mut GameState,
+    flow: &mut MatchFlow,
     acting_seat: &str,
     action: &str,
 ) -> Result<(), String> {
@@ -651,11 +702,14 @@ fn apply_referee_action(
             active_seat
         ));
     }
-    match state.context.turn_phase {
-        TurnPhase::Movement => {
-            if action == "S" {
-                state.context.turn_phase = TurnPhase::Attack;
-            } else {
+    if MatchFlow::from_context(flow.definition, &state.context)?.cursor != flow.cursor {
+        return Err("Match flow cursor disagrees with the public turn state".into());
+    }
+    let next = flow.advance()?;
+    let step = &flow.definition.phases[0].steps[flow.cursor.step_index];
+    match step.action.as_str() {
+        "move" => {
+            if action != "S" || !step.allow_skip {
                 let (entity_id, destination) = action
                     .strip_prefix("M:")
                     .and_then(|payload| payload.split_once(':'))
@@ -710,13 +764,10 @@ fn apply_referee_action(
                     .get_mut(entity_id)
                     .ok_or_else(|| format!("Unknown entity: {entity_id}"))?
                     .spatial = position;
-                state.context.turn_phase = TurnPhase::Attack;
             }
         }
-        TurnPhase::Attack => {
-            if action == "S" {
-                state.context.turn_phase = TurnPhase::End;
-            } else {
+        "attack" => {
+            if action != "S" || !step.allow_skip {
                 let (attacker_id, target_id) = parse_attack_action(action)?;
                 let attacker = state
                     .entities
@@ -769,21 +820,23 @@ fn apply_referee_action(
                 if *destructible <= 0 {
                     state.entities.remove(target_id);
                 }
-                state.context.turn_phase = TurnPhase::End;
             }
         }
-        TurnPhase::End => {
+        "end_turn" => {
             if action != "E" {
                 return Err("End phase accepts only E (end turn)".into());
             }
-            state.context.active_player = if acting_seat == "P1" { "P2" } else { "P1" }.into();
-            state.context.turn_phase = TurnPhase::Movement;
         }
-        TurnPhase::Finished => return Err("Match is finished".into()),
+        _ => return Err("Unsupported flow action".into()),
     }
 
+    flow.cursor = next;
+    flow.project(&mut state.context);
     state.context.setup_locked = true;
     evaluate_victory(state);
+    if state.context.turn_phase == TurnPhase::Finished {
+        flow.finish();
+    }
     Ok(())
 }
 
