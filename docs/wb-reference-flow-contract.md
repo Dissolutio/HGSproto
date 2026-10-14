@@ -37,3 +37,9 @@ flow record in a versioned envelope and atomically checkpoint them with accepted
 history. The legacy snapshot alone can reconstruct only the reference flow.
 No command IDs, replay guarantees, protocol negotiation, or disk persistence
 are introduced by WB.
+
+Legacy restores reconstruct the reference cursor from the existing active seat
+and public turn phase, including legacy seat/phase aliases. Movement, Attack,
+End, and Finished continuation fixtures preserve health, setup lock, and winner.
+No action effects are replayed. The existing restore-time elimination check is
+retained for compatibility with the existing suite.

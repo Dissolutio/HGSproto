@@ -198,6 +198,81 @@ mod tests {
         use crate::engine;
 
         #[test]
+        fn legacy_restore_continues_all_four_turn_states_without_reapplying_effects() {
+            for (index, phase) in [TurnPhase::Movement, TurnPhase::Attack,
+                TurnPhase::End, TurnPhase::Finished].into_iter().enumerate()
+            {
+                let id = format!("wb_restore_{index}");
+                let mut state = engine::generate_test_sandbox(id.clone());
+                state.context.active_player = "Player_1".into();
+                state.context.turn_phase = phase;
+                state.context.setup_locked = index != 0;
+                if let Some(crate::models::Component::Destructible { current_life, .. }) =
+                    state.entities.get_mut("HERO_P1").unwrap().components.get_mut("destructible")
+                {
+                    *current_life = 5;
+                }
+                if phase == TurnPhase::Finished {
+                    state.entities.retain(|id, _| !id.contains("P2"));
+                    state.context.winner = Some("P1".into());
+                }
+                let before = serde_json::to_value(&state).unwrap();
+                engine::restore_match_snapshot(&id, &before.to_string()).unwrap();
+                {
+                    let matches = engine::ACTIVE_MATCHES.lock().unwrap();
+                    assert_eq!(serde_json::to_value(&matches[&id]).unwrap(), before);
+                }
+                let flow = engine::get_match_flow(&id).unwrap();
+                assert_eq!(flow.cursor.step_index, index);
+                assert_eq!(flow.cursor.finished, phase == TurnPhase::Finished);
+                assert_eq!(flow.definition.schema_version, 1);
+                match phase {
+                    TurnPhase::Movement => engine::process_action(&id, "Player_1", "S").unwrap(),
+                    TurnPhase::Attack => {
+                        engine::process_action(&id, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
+                        let matches = engine::ACTIVE_MATCHES.lock().unwrap();
+                        let after = serde_json::to_value(&matches[&id]).unwrap();
+                        assert_eq!(after["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"], 3);
+                        assert_eq!(after["context"]["active_player"], "Player_1");
+                    }
+                    TurnPhase::End => {
+                        engine::process_action(&id, "P1", "E").unwrap();
+                        assert_eq!(engine::get_match_flow(&id).unwrap().cursor.seat_index, 1);
+                    }
+                    TurnPhase::Finished => {
+                        assert!(engine::process_action(&id, "P1", "E").is_err());
+                        assert_eq!(engine::get_match_flow(&id).unwrap(), flow);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn rejected_commands_preserve_entities_and_entire_flow_record() {
+            let id = "wb_rejection_atomicity";
+            for (phase, seat, action) in [
+                (TurnPhase::Movement, "P2", "S"),
+                (TurnPhase::Movement, "P1", "A:HERO_P1:UNIT_P2_1"),
+                (TurnPhase::Movement, "P1", "M:UNIT_P2_1:Q0R0Z0"),
+                (TurnPhase::Movement, "P1", "M:UNIT_P1_1:Q99R99Z0"),
+                (TurnPhase::Attack, "P1", "M:UNIT_P1_1:Q0R0Z0"),
+                (TurnPhase::Attack, "P1", "A:UNIT_P1_1:UNIT_P2_1"),
+                (TurnPhase::Attack, "P1", "A:HERO_P1:UNIT_P2_1:9"),
+                (TurnPhase::End, "P1", "S"),
+            ] {
+                let mut state = engine::generate_test_sandbox(id.into());
+                state.context.turn_phase = phase;
+                let before = serde_json::to_value(&state).unwrap();
+                engine::store_match(id.into(), state);
+                let flow = engine::get_match_flow(id).unwrap();
+                assert!(engine::process_action(id, seat, action).is_err(), "{action}");
+                assert_eq!(engine::get_match_flow(id).unwrap(), flow, "{action}");
+                let matches = engine::ACTIVE_MATCHES.lock().unwrap();
+                assert_eq!(serde_json::to_value(&matches[id]).unwrap(), before, "{action}");
+            }
+        }
+
+        #[test]
         fn flow_limits_accept_exact_boundaries_and_reject_over_limit() {
             assert!(REFERENCE_JSON.len() <= MAX_FLOW_BYTES);
             let mut exact = REFERENCE_JSON.to_string();

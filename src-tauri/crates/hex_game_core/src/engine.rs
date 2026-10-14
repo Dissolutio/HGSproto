@@ -553,8 +553,7 @@ pub fn restore_match_snapshot(match_id: &str, snapshot: &str) -> Result<(), Stri
         return Err("Snapshot match ID does not match the requested match".into());
     }
     evaluate_victory(&mut state);
-    store_match(match_id.to_string(), state);
-    Ok(())
+    try_store_match(match_id.to_string(), state)
 }
 
 pub fn restore_match_snapshot_as(
@@ -569,8 +568,7 @@ pub fn restore_match_snapshot_as(
     }
     state.context.match_id = match_id.to_string();
     evaluate_victory(&mut state);
-    store_match(match_id.to_string(), state);
-    Ok(())
+    try_store_match(match_id.to_string(), state)
 }
 
 /// Helper function to view if a match is actively running
