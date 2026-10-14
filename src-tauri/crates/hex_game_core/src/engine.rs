@@ -6,6 +6,8 @@ use crate::models::{
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
+const REFEREE_ATTACK_DAMAGE: i32 = 1;
+
 // A thread-safe, globally accessible map of active matches, locked behind a Mutex.
 // LazyLock guarantees this maps initializes safely in memory the exact millisecond it is first pinged.
 pub static ACTIVE_MATCHES: LazyLock<Mutex<HashMap<String, GameState>>> =
@@ -828,7 +830,7 @@ fn apply_referee_action(
                         _ => None,
                     })
                     .unwrap();
-                *destructible = destructible.saturating_sub(damage);
+                *destructible = destructible.saturating_sub(REFEREE_ATTACK_DAMAGE);
                 if *destructible <= 0 {
                     state.entities.remove(target_id);
                 }
@@ -1522,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    fn referee_enforces_seats_phases_action_budgets_and_health_scaled_damage() {
+    fn referee_enforces_seats_phases_action_budgets_and_fixed_damage() {
         let match_id = format!("referee_rules_test_{}", std::process::id());
         store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
         let initial = serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[&match_id]).unwrap();
