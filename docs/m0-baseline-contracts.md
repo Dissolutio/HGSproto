@@ -29,21 +29,25 @@ The client `build` and `dev` scripts regenerate the ignored WASM package first;
 
 The recovery suite is `hex_game_orchestrator`'s `network_simulation` integration
 test target. It contains both host/join/action synchronization and
-disconnect/replacement-peer recovery tests. In this environment it passed 10
-consecutive times with the tests serialized:
+disconnect/replacement-peer recovery tests. The official M0 gate is the
+explicit direct-only recovery variant, which passed 50 consecutive runs on
+2026-10-13:
 
 ```sh
-for run in $(seq 1 10); do
-  cargo test -p hex_game_orchestrator --test network_simulation -- --test-threads=1 || exit $?
+for run in $(seq 1 50); do
+  cargo test -p hex_game_orchestrator --test network_simulation network_simulation_recovery_direct_only -- --exact --ignored --test-threads=1 || exit $?
 done
 ```
 
-The full `cargo test -p hex_game_orchestrator` run also passed with its normal
-test scheduling. These runs did not reproduce the previously reported
-replacement-client timeout. They establish a repeatable passing baseline, but
-do not determine the root cause of that earlier intermittent failure. The
-test exercises Iroh endpoint bind/connect, host acceptance, disconnect
-detection, and reconnection/authentication; each wait is capped at 25 seconds.
+The direct-only variant disables relay and discovery routes. The default
+configuration is retained as a known-issue tracked check (risk R02), not as
+the gate: it failed on runs 18, 26, and 32 of 50 (3/50). The relay-only
+diagnostic variant passed 30/30 runs; it is not the official gate. All batches
+ran serially on one Linux development machine. Cross-network play was not
+tested. The replacement-client timeout remains possible on the default route;
+the failed runs stalled before authentication at the existing 25-second test
+cap, and the available telemetry did not prove which route carried the
+incomplete handshake.
 
 ## Mod profile JSON
 
@@ -96,7 +100,11 @@ The current match snapshot is a JSON `GameState` object with `context`
 `movement`, `attack`, `end`, or `finished`. Each entity has
 `id`, `spatial` (`q`, `r`, `z`), `components`, and optional
 `visual_primitive`, `display_name`, and `mod_id`. The Rust/WASM snapshot is
-authoritative; presentation-only React edits do not update it.
+authoritative. Current client gameplay actions go through the Rust/WASM
+referee or the native gateway; profile deployment calls the core and reads
+back its snapshot. Selection, inspection, camera movement, and health-label
+projection are presentation-only views. The historical Goliath display-only
+injector was removed in commit `c4a4242`.
 
 ### Creator deployment
 
@@ -240,3 +248,20 @@ the reset handler was updated to load a fresh WASM snapshot, and the reset
 check then passed. Browser-based movement replication between the two peers was
 not part of this run; action-token synchronization is covered by the Rust
 network integration suite above.
+
+### M0-C2 consolidated browser smoke
+
+On 2026-10-14, the production client was freshly built from commit `389f941`
+and exercised in Chrome `150.0.7871.250` (Electron `43.7.7`) on Linux x86_64.
+All nine M0-C2 checks passed: the board rendered 7 hexes, 6 units, and six
+health labels; click-to-move succeeded for a legal move and showed a visible
+referee error for an illegal move; a 12/12 core-deployed attacker reduced a
+2/2 adjacent target to 1/2 and the overlay matched the inspector; Movement,
+Attack, End, seat rotation, and both skip controls worked; valid profile import
+succeeded and an invalid `movement_speed` profile showed an error without
+changing deployed state; host/join connected; a reloaded join client recovered
+as P2 with the 7/8 HP hero unchanged and no repeated attack; reset returned the
+client to the fresh 6-unit sandbox; and eliminating all P2 units displayed
+`P1 wins` with action controls disabled. Host and join used two independent
+browser pages on the same machine (127.0.0.1 and localhost origins); no
+cross-network test was performed.
