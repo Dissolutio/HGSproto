@@ -230,6 +230,50 @@ because no peer connection is attempted. Keep each machine's log files with
 that machine's recording rows; do not merge files or rename them to include a
 ticket or node ID.
 
+## Collecting results
+
+The default log folders are `$HOME/hgs-we3-logs` on Linux and
+`%USERPROFILE%\hgs-we3-logs` on Windows. These defaults are intended to be
+outside a repository checkout. The repository has no ignore rule for these
+folders; if you override the log directory, keep it outside the checkout.
+
+Make a separate copy of the blank recording sheet outside the repository, fill
+in that copy, then place the completed copy beside the logs.
+
+Linux, from the repository root:
+
+```sh
+cp docs/we3-test-package/recording-sheet.md "$HOME/recording-sheet-filled.md"
+# Fill in $HOME/recording-sheet-filled.md in a text editor.
+cp "$HOME/recording-sheet-filled.md" "$HOME/hgs-we3-logs/recording-sheet-filled.md"
+find "$HOME/hgs-we3-logs" -maxdepth 1 -type f -printf '%f\n'
+tar -czf "$HOME/hgs-we3-results.tar.gz" -C "$HOME" hgs-we3-logs
+tar -tzf "$HOME/hgs-we3-results.tar.gz"
+```
+
+Windows PowerShell, from the repository root:
+
+```powershell
+Copy-Item .\docs\we3-test-package\recording-sheet.md "$env:USERPROFILE\recording-sheet-filled.md"
+# Fill in the copy in a text editor.
+Copy-Item "$env:USERPROFILE\recording-sheet-filled.md" "$env:HGS_CONNECTION_LOG_DIR\recording-sheet-filled.md"
+Get-ChildItem -LiteralPath $env:HGS_CONNECTION_LOG_DIR -File | Select-Object -ExpandProperty Name
+Compress-Archive -Path "$env:HGS_CONNECTION_LOG_DIR\*" -DestinationPath "$env:USERPROFILE\hgs-we3-results.zip"
+```
+
+Open the Windows ZIP in File Explorer and verify its contents. The Linux
+`tar -tzf` command above lists the Linux archive contents. In either case, the
+archive must contain only the diagnostic `.log` files and
+`recording-sheet-filled.md`. Check the sheet itself: it must contain no ticket,
+node ID, or match ID. Do not include screenshots, especially screenshots that
+show a ticket or ID. If any other file appears, do not send that archive.
+
+To move the Windows archive to the Linux laptop, copy
+`%USERPROFILE%\hgs-we3-results.zip` to a USB drive in File Explorer, safely
+eject the drive, connect it to Linux, and copy the archive into the Linux
+user's home folder. If sending results onward, use a PM-approved private
+transfer method; never send a ticket or key material with the results.
+
 ## Stop and verify cleanup
 
 Press **Ctrl+C** in every gateway and Vite terminal. Wait for each command to

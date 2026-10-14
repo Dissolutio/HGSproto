@@ -12,22 +12,48 @@ host…** at 120 seconds, record `still pending at 120s` as an observation cutof
 not as a product-enforced timeout. Keep the pending log and do not retry that
 attempt. Record route/stage from each local log without inferring a cause.
 
+## Before the first attempt
+
+- [ ] Confirm the phone's Wi-Fi is off, so its hotspot is using cellular data.
+- [ ] Confirm the Linux laptop is on home broadband and is not connected to
+      the phone hotspot.
+- [ ] Confirm the laptops use different providers or routers. Record provider
+      or router names only; do not record addresses.
+- [ ] Record the phone's cellular carrier and signal strength (for example,
+      signal bars out of the phone's displayed total).
+- [ ] Note that hotspot data use will be significant during this test.
+- [ ] Record the local time of day and any other devices heavily using either
+      network. Update the time and observations for each attempt.
+
 ## A. Fresh join — at least 20 attempts
 
-1. Start with a fresh host match. For odd-numbered attempts, Machine 1 hosts;
-   for even-numbered attempts, Machine 2 hosts.
-2. Record the firewall state on both machines. Confirm no VPN or tunnel is
-   active.
-3. On the host, select **Live Network Mode**, expand the portal, click
-   **Host Match**, and copy the entire ticket, including `@browser_...`.
-4. Send the ticket privately. On the guest's own local client, select Live
-   Network Mode, paste the complete ticket, and click **Join Match**.
-5. Record the time, visible status/error, success or observation cutoff, and
-   both log filenames. Confirm P1/Blue on the host and P2/Red on the guest.
-6. If the attempt fails or remains pending, preserve it as a result. Do not
-   repeat that same ticket. For the next attempt, start a fresh host match and
-   use the next attempt number.
-7. Complete at least 20 attempts, alternating which laptop hosts.
+1. Complete the checklist above. Start both gateways and browser clients as
+   described in the setup guide.
+2. Before each attempt after the first, end the previous match on both clients:
+   the host clicks **Leave Match & Reset Gateway**, then the guest clicks the
+   same control. Wait for both pages to show the reset/fresh local state,
+   select **Live Network Mode** again on each page, and wait for both local
+   gateway statuses to show connected. Do not stop the gateway processes for
+   this reset.
+3. During the batch, restart a gateway at least five times total, with at least
+   two restarts on each laptop. Do this only between attempts, after resetting
+   the previous match. In that gateway's terminal, press **Ctrl+C**, then run
+   the same diagnostic gateway command from the setup guide and wait for
+   `P2P gateway ready`. Leave the Vite server running. Record which laptop's
+   gateway restarted. These restarts ensure both first-join and later-join
+   conditions are represented.
+4. Alternate the host: Machine 1 hosts odd-numbered attempts and Machine 2
+   hosts even-numbered attempts. For each attempt, record whether it is the
+   first peer join since the latest gateway start on the host and on the guest.
+5. The host clicks **Host Match** and privately shares the complete, current
+   ticket. The guest pastes it into **Host connection ticket** and clicks
+   **Join Match**. Never put the ticket in the worksheet, a screenshot, or a
+   shared log.
+6. Record the join result, elapsed time, both log filenames, route/stage
+   evidence, and the state shown on both screens. If an attempt fails or is
+   still pending at 120 seconds, preserve it as a result; do not retry that
+   ticket.
+7. Reset both clients as in step 2 before starting the next fresh match.
 
 ## B. Play a short match
 
@@ -54,22 +80,58 @@ attempt. Record route/stage from each local log without inferring a cause.
    any disagreement, rejected action, delay, or visible error and attach the
    corresponding log names.
 
-## C. Disconnect and rejoin — at least 20 attempts
+## C1. Browser reload recovery — at least 20 attempts
+
+This checks recovery of the **browser-to-local-gateway link**. It does not drop
+the guest gateway's peer connection or test a replacement peer.
 
 1. Start and join a fresh match. Record both boards, active seat, positions,
-   health, and the accepted-action count or other visible action evidence.
-2. Use the same guest tab and reload it (`Ctrl+R` / `F5`) to preserve that tab's
-   session storage. When the recovery banner appears, click **Attempt Graceful
-   Reconnection**. Do not use **Leave Match & Reset Gateway**, which clears the
-   recovery data.
-3. For at least five attempts, begin rejoin while the host is idle. For at
-   least five others, have the host complete and confirm an action, then reload
-   the guest immediately. Alternate which laptop is guest over the batch.
-4. Confirm the guest returns as the same seat and that accepted actions, health,
-   and unit positions match the host. Check specifically for healing or a
-   repeated attack. Record both log files and the final states.
-5. Repeat with a fresh session until at least 20 rejoin attempts are recorded.
-   Do not retry an individual failed or pending attempt.
+   health, and accepted-action evidence.
+2. Keep both gateway processes running. Reload the same guest browser tab
+   (`Ctrl+R` / `F5`) on the same origin so its session storage is preserved.
+3. When the recovery banner appears, click **Attempt Graceful Reconnection**.
+   Record the browser-to-gateway result and whether the peer connection and
+   match state remain intact. A transient peer-status notice alone does not
+   establish that a new peer connection was made.
+4. Repeat for at least 20 attempts, using a fresh match each time and the
+   Scenario A reset procedure between attempts. Do not retry an individual
+   failed or pending attempt.
+
+## C2. Guest peer replacement — at least 20 attempts
+
+This requires an actual guest gateway shutdown and a new **Join Match**. A
+browser reload alone is not a peer replacement. The replacement gateway has a
+new peer identity; the host gateway and its current ticket must remain active.
+Complete at least 20 attempts: at least 10 while the host is idle and at least
+10 immediately after the host has accepted an action.
+
+1. For each attempt, start a fresh match and join as in Scenario A. Keep the
+   host gateway process running. Keep the current host ticket private and
+   available to paste again; do not record it.
+2. For an **idle** attempt, do not make a game action immediately before the
+   guest gateway is stopped. For an **after-action** attempt, have the host
+   accept one legal action, confirm that the resulting state is visible on
+   both screens, and then immediately proceed.
+3. On the guest laptop, press **Ctrl+C** in the gateway terminal while leaving
+   the host gateway running. This closes the guest endpoint and is the step
+   that drops the peer connection. Do not substitute a browser reload or a
+   short network interruption. Record when the host reports the peer
+   disconnected and the pre-drop match state.
+4. Restart the guest gateway with the diagnostic command from the setup guide.
+   Wait for it to print `P2P gateway ready` and for the guest browser to show
+   its local gateway connected. If the old in-memory session is reported
+   expired, wait for the page to reconnect to a fresh local session.
+5. On the guest, paste the same still-current host ticket into **Host
+   connection ticket** and click **Join Match**. This uses the normal join
+   flow to create a new peer connection; it is not the graceful-reconnection
+   button. Stop timing at success, visible failure, or the 120-second
+   observation cutoff. Do not retry a failed or pending attempt.
+6. On success, confirm the guest is P2/Red and compare the host snapshot,
+   positions, health, seat, and accepted-action state with the pre-drop state.
+   Record both log filenames and observations on both screens.
+7. End/reset both clients using the Scenario A procedure before the next
+   attempt. Alternate the idle and after-action conditions until each has at
+   least 10 results. Do not count C1 browser reloads toward the C2 total.
 
 ## D. Host connection loss
 
@@ -99,16 +161,39 @@ combine its counts with the home-router/cellular-hotspot baseline.
    After the idle period, take one legal turn and confirm both pages agree on
    seat, phase, positions, and health.
 
-## G. Bad or incomplete ticket
+## G. Ticket rejection and unavailable host
+
+For each G attempt, start the timer when the guest clicks **Join Match**. Record
+the exact message, whether the page still responds to a harmless action such as
+collapsing and reopening the portal, and the seconds until a message appears.
+If there is no message by 120 seconds, record `still pending at 120s`. Do not
+submit the ticket again or retry a pending attempt.
+
+### G1. Missing suffix
 
 1. On the guest, select Live Network Mode and open the portal.
 2. Paste only the host Node ID, omitting `@` and the match-ID suffix, then click
    **Join Match**.
-3. Record the exact visible message and seconds to display. The expected client
-   message is `Paste the complete host connection ticket (Node ID@match ID)`.
-4. Confirm the host receives no peer connection. This invalid input is rejected
-   in the client before a network attempt; do not expect a peer-attempt log for
-   it.
+3. Record the exact message and response time. This client-side validation
+   should reject the input before a peer connection is attempted, so no
+   peer-attempt log is expected.
+
+### G2. Ticket for a match the host ended
+
+1. Host a match and privately retain the complete ticket.
+2. On the host, click **Leave Match & Reset Gateway** and wait for the reset.
+   Keep the guest gateway running.
+3. On the guest, submit the retained, correctly formatted ticket once. Record
+   the exact result using the timing and responsiveness instructions above.
+
+### G3. Host gateway not running
+
+1. Host a match and privately retain the complete, correctly formatted ticket.
+2. Press **Ctrl+C** in the host gateway terminal and verify that the host
+   gateway has stopped. Do not stop the guest gateway.
+3. On the guest, submit the ticket once. Record the exact result using the
+   timing and responsiveness instructions above. Restart the host gateway
+   after recording the outcome. Do not retry a pending attempt.
 
 ## Analysis plan
 
@@ -118,7 +203,9 @@ connections, calculate median and worst connection time. For every failure or
 pending attempt, report each side's last route observation and last logged
 stage; label unknown values as unknown. Keep the route-classification sample
 time caveat explicit: route changes are timestamped when first observed by the
-one-second sampler, not at the exact underlying transition.
+one-second sampler, not at the exact underlying transition. Report C1
+browser-to-gateway recovery separately from C2 replacement-peer attempts; do
+not count C1 as peer reconnection evidence.
 
 Compare the cross-network sample with the existing single-machine default-mode
 recovery measurements, explicitly stating their sample sizes and that the
