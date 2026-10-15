@@ -6,8 +6,9 @@ cross-network run has been performed yet.
 
 ## Safety and test boundaries
 
-- Use only the Linux home-broadband laptop and the Windows 11 hotspot laptop,
-  with no VPN, tunnel service, or third-party relay tunnel.
+- Use only the Linux home-broadband laptop and the Windows test laptop (the
+  Windows 11 phone-hotspot laptop for this run), with no VPN, tunnel service,
+  or third-party relay tunnel.
 - Each laptop runs its own native gateway and browser client. A browser talks
   only to the gateway on the same laptop. The game's ticket connects the peers.
 - Do not disable the firewall, add or edit firewall rules, change
@@ -18,8 +19,12 @@ cross-network run has been performed yet.
   prompt appears, choose **Cancel** rather than creating another allow rule.
   If that prevents a connection, record the result and stop for PM direction.
 - Do not include tickets, node IDs, or private key material in shared sheets,
-  screenshots, or diagnostic logs. Tickets are short-lived join invitations;
-  pass them only to the other tester through the agreed private channel.
+  screenshots, or diagnostic logs. Tickets are short-lived join invitations.
+  Move the current ticket between laptops only through the tester's shared
+  text pad. The pad name must be long and random, and its address must be known
+  only to the tester. Never share or write the address in any repository file.
+  Keep only the current ticket in the pad; clear it after each attempt and at
+  the end of each session. Never use the pad for log files.
 - Use the same repository commit on both laptops. Build native code on each
   operating system; do not copy a Linux executable to Windows or create a
   packaged distribution.
@@ -39,7 +44,8 @@ uses Iroh `0.29.0`, Rust/Cargo `1.98.1`, Node.js `20.20.2`, npm `10.8.2`,
 
 The Windows feasibility result supplied for this order verified those
 versions. The detailed Windows installer checklist is not present in this
-repository. On that already-verified laptop, verify rather than reinstall:
+repository. On the already-verified Windows test laptop, verify rather than
+reinstall:
 
 ```powershell
 rustc --version
@@ -75,9 +81,9 @@ Node.js `20.20.2` installation. Record any version deviation; do not silently
 substitute a different version.
 
 Both machines need Git, the Rust toolchain for their native platform, the
-prerequisites above, and a supported desktop browser. The Windows machine was
-verified at the baseline commit, but this new diagnostics commit has not yet
-been built on Windows.
+prerequisites above, and a supported desktop browser. The Windows test laptop
+was verified at the baseline commit, but this new diagnostics commit has not
+yet been built on Windows.
 
 ## Build and start each machine
 
@@ -142,7 +148,26 @@ otherwise listens on all interfaces. Use the printed
 `http://127.0.0.1:1420/` URL. Do not use `--host 0.0.0.0`. The dev command
 builds the WASM module before starting Vite.
 
+## Optional diagnostics-off default recovery check
+
+This check is optional. From the repository root, run it once without the
+WE-3 `connection-diagnostics` feature:
+
+```sh
+cargo test --locked -p hex_game_orchestrator --test network_simulation network_simulation_auth_sync_disconnect_and_recovery -- --exact
+```
+
+Do not retry it if it fails. The test target may still print its pre-existing
+WE-2 test-only route diagnostics; do not add `--features
+connection-diagnostics`.
+
 ## Publisher and firewall prompts
+
+An actionable Windows dialog stays open and presents buttons or other options.
+For any such dialog, record its exact wording, the program named, and every
+option shown, then follow the applicable instructions below. A transient
+notification that disappears or only offers to open Settings is not that
+dialog: record that it appeared and what it was about; do not change settings.
 
 If Windows displays a publisher/SmartScreen notice, verify that the program is
 the locally built `hex_game_orchestrator.exe` under this repository's
@@ -159,9 +184,10 @@ record that too. Never turn off the firewall.
 
 Before every attempt, record the rule state on both laptops:
 
-- Windows: open **Windows Defender Firewall with Advanced Security**
-  (`wf.msc`), inspect the enabled inbound rule for `hex_game_orchestrator.exe`,
-  and record its Enabled, Action, Direction, and Profile values. Do not edit it.
+- Windows test laptop: open **Windows Defender Firewall with Advanced Security**
+  (`wf.msc`) and inspect the enabled rule for `hex_game_orchestrator.exe` under
+  **Inbound Rules**. A rule listed under Inbound Rules has Direction **Inbound**.
+  Record Enabled, Action, Direction, and Profile. Do not edit the rule.
 - Linux: use the existing firewall's read-only status view (for example,
   `sudo ufw status verbose` when UFW is installed). Record `inactive`,
   `active` plus the relevant existing rule, or `unknown` if no read-only view
@@ -179,7 +205,9 @@ local gateway connection status to show connected before continuing.
 1. The host clicks **Host Match**. The portal shows **Your connection ticket**.
 2. Copy the entire value, including the `@` and the match-ID suffix
    (`NodeID@browser_...`). Do not trim or retype the suffix.
-3. Send that ticket to the other tester through the agreed private channel.
+3. Clear any old ticket from the shared text pad, then put only this current
+   ticket there for the other laptop. The pad address must remain known only to
+   the tester and must never be written in the repository.
 4. The guest pastes it into **Host connection ticket** and clicks **Join Match**.
 5. Success is shown as **Joined and synchronized with the host** on the guest
    and **Peer connected; action-token synchronization is active** on the host.
@@ -188,6 +216,8 @@ local gateway connection status to show connected before continuing.
    message or a visible error. If the UI remains at **Connecting to Iroh
    host…** for 120 seconds, record `still pending at 120s`; this is an external
    observation cutoff, not a product timeout. Do not retry that same attempt.
+7. Clear the pad after the attempt, including after a pending observation
+   cutoff. Clear it again at the end of the session. Never put logs there.
 
 ### Two local clients on one laptop
 
@@ -232,17 +262,23 @@ ticket or node ID.
 
 ## Collecting results
 
+Do not collect while a gateway is running. Stop every gateway with **Ctrl+C**
+and wait for it to exit first; on Windows the running gateway holds its log
+files open.
+
 The default log folders are `$HOME/hgs-we3-logs` on Linux and
 `%USERPROFILE%\hgs-we3-logs` on Windows. These defaults are intended to be
 outside a repository checkout. The repository has no ignore rule for these
 folders; if you override the log directory, keep it outside the checkout.
 
-Make a separate copy of the blank recording sheet outside the repository, fill
-in that copy, then place the completed copy beside the logs.
+Make and fill in a separate copy of the recording sheet outside the repository,
+then place the completed copy beside the logs. This external copy is expected;
+editing it does not edit the repository. Do not fill in the checked-in template.
 
 Linux, from the repository root:
 
 ```sh
+set -e
 cp docs/we3-test-package/recording-sheet.md "$HOME/recording-sheet-filled.md"
 # Fill in $HOME/recording-sheet-filled.md in a text editor.
 cp "$HOME/recording-sheet-filled.md" "$HOME/hgs-we3-logs/recording-sheet-filled.md"
@@ -251,28 +287,47 @@ tar -czf "$HOME/hgs-we3-results.tar.gz" -C "$HOME" hgs-we3-logs
 tar -tzf "$HOME/hgs-we3-results.tar.gz"
 ```
 
-Windows PowerShell, from the repository root:
+Windows PowerShell, from the repository root in a new terminal after the
+gateway has stopped:
 
 ```powershell
+$ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) { throw 'USERPROFILE is empty.' }
+$env:HGS_CONNECTION_LOG_DIR = Join-Path $env:USERPROFILE 'hgs-we3-logs'
+if ([string]::IsNullOrWhiteSpace($env:HGS_CONNECTION_LOG_DIR)) { throw 'HGS_CONNECTION_LOG_DIR is empty; refusing to archive.' }
+$logDir = [System.IO.Path]::GetFullPath($env:HGS_CONNECTION_LOG_DIR)
+$driveRoot = [System.IO.Path]::GetPathRoot($logDir)
+if ($logDir.TrimEnd('\') -eq $driveRoot.TrimEnd('\')) { throw 'Refusing to use a drive root as the archive source.' }
+if (-not (Test-Path -LiteralPath $logDir -PathType Container)) { throw "Log folder not found: $logDir" }
 Copy-Item .\docs\we3-test-package\recording-sheet.md "$env:USERPROFILE\recording-sheet-filled.md"
 # Fill in the copy in a text editor.
-Copy-Item "$env:USERPROFILE\recording-sheet-filled.md" "$env:HGS_CONNECTION_LOG_DIR\recording-sheet-filled.md"
-Get-ChildItem -LiteralPath $env:HGS_CONNECTION_LOG_DIR -File | Select-Object -ExpandProperty Name
-Compress-Archive -Path "$env:HGS_CONNECTION_LOG_DIR\*" -DestinationPath "$env:USERPROFILE\hgs-we3-results.zip"
+Copy-Item "$env:USERPROFILE\recording-sheet-filled.md" "$logDir\recording-sheet-filled.md" -ErrorAction Stop
+if (-not (Test-Path -LiteralPath "$logDir\recording-sheet-filled.md" -PathType Leaf)) { throw 'Filled recording sheet is missing.' }
+if (-not (Get-ChildItem -LiteralPath $logDir -Filter 'hgs-we3-*.log' -File)) { throw 'No diagnostic logs found.' }
+$unexpected = @(Get-ChildItem -LiteralPath $logDir -File | Where-Object { $_.Name -ne 'recording-sheet-filled.md' -and $_.Name -notlike 'hgs-we3-*.log' })
+if ($unexpected.Count -gt 0) { throw 'Unexpected files in log folder; do not archive.' }
+Get-ChildItem -LiteralPath $logDir -File | Select-Object -ExpandProperty Name
+$archivePath = Join-Path $env:USERPROFILE 'hgs-we3-results.zip'
+Compress-Archive -Path "$logDir\*" -DestinationPath $archivePath -Force -ErrorAction Stop
+if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) { throw 'Archive is missing; collection failed.' }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+try { $zip.Entries | Select-Object -ExpandProperty FullName } finally { $zip.Dispose() }
 ```
 
-Open the Windows ZIP in File Explorer and verify its contents. The Linux
-`tar -tzf` command above lists the Linux archive contents. In either case, the
-archive must contain only the diagnostic `.log` files and
-`recording-sheet-filled.md`. Check the sheet itself: it must contain no ticket,
-node ID, or match ID. Do not include screenshots, especially screenshots that
-show a ticket or ID. If any other file appears, do not send that archive.
+The Windows command lists archive entries read-only; record the displayed
+names. A missing ZIP means collection failed. The Linux `tar -tzf` command
+lists the Linux archive entries; record those names too. Each archive must
+contain only diagnostic `.log` files and `recording-sheet-filled.md`. Check the
+sheet itself: it must contain no ticket, node ID, or match ID. Do not include
+screenshots, especially screenshots that show a ticket or ID. If any other
+file appears, do not send that archive.
 
-To move the Windows archive to the Linux laptop, copy
-`%USERPROFILE%\hgs-we3-results.zip` to a USB drive in File Explorer, safely
-eject the drive, connect it to Linux, and copy the archive into the Linux
-user's home folder. If sending results onward, use a PM-approved private
-transfer method; never send a ticket or key material with the results.
+Approved ways to move results are a USB drive or the tester's own private cloud
+folder. To move the Windows archive to Linux by USB, copy
+`%USERPROFILE%\hgs-we3-results.zip` to the USB drive in File Explorer, safely
+eject it, connect it to Linux, and copy the archive into the Linux user's home
+folder. Never use the shared text pad for log files.
 
 ## Stop and verify cleanup
 

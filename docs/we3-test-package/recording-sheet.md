@@ -1,5 +1,7 @@
 # WE-3 Recording Sheet
 
+The quick proof uses the same columns and observation tables in this sheet.
+
 Use one row per attempt, including failed, timed-out-at-observation-cutoff, and
 not-exercised attempts. Record times with timezone. Record the firewall state
 again for every row; do not write only “same” unless the earlier row/snapshot
