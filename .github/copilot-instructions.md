@@ -24,3 +24,8 @@
 
 # Style
 - Plain-language summaries. Explain decisions briefly. Flag risks and anything that would make later work harder.
+
+# CI coverage
+- CI runs browser-free client storage tests but does not launch a browser.
+- CI does not build the Tauri desktop crate because the Linux runner lacks `glib-2.0`.
+- The default-mode recovery test is tracked, not a gating check.
