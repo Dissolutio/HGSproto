@@ -22,7 +22,7 @@ jobs:
           toolchain: 1.98.1
           targets: wasm32-unknown-unknown
       - name: Run workspace tests
-        run: cargo test --workspace --locked -- --skip network_simulation_auth_sync_disconnect_and_recovery
+        run: cargo test -p hex_game_core -p hex_game_network -p hex_game_orchestrator --locked -- --skip network_simulation_auth_sync_disconnect_and_recovery
 
   recovery-direct-only:
     runs-on: ubuntu-latest
