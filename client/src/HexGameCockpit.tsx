@@ -11,6 +11,7 @@ export default function HexGameCockpit() {
     state: {
       mode, gameState, selectedUnitId, actionPending, endTurnAfterSkip, inspectedEntity,
       connection, notice, socket, localNodeId, localMatchId, remoteNodeId,
+      sandboxRestoreNotice, setSandboxRestoreNotice,
       isPeerConnected, joinNodeId, setJoinNodeId, recoverySession, setRecoveryDismissed,
     },
     view: {
@@ -43,6 +44,9 @@ export default function HexGameCockpit() {
         onReconnect={handleGracefulReconnection}
         onDismissRecovery={() => setRecoveryDismissed(true)}
         notice={notice}
+        sandboxRestoreNotice={sandboxRestoreNotice}
+        onDismissSandboxRestore={() => setSandboxRestoreNotice(null)}
+        onStartFreshSandbox={handleStartFreshSandbox}
         terrainCount={terrain.length}
         unitCount={units.length}
         playerSeat={playerSeat}
