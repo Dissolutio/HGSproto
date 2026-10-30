@@ -8,6 +8,7 @@
     "dev": "npm run build:wasm && vite",
     "build": "npm run build:wasm && tsc && vite build",
     "preview": "vite preview",
+    "test": "tsc -p tsconfig.test.json && node --test tests/sandboxPersistence.test.mjs",
     "tauri": "cd .. && tauri"
   },
   "dependencies": {

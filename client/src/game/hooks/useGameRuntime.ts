@@ -2,11 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ThreeEvent } from "@react-three/fiber";
 import init, {
   wasm_deploy_profile_unit,
+  wasm_export_local_sandbox,
   wasm_get_current_state,
   wasm_initialize_match,
   wasm_load_mod_profiles,
   wasm_process_token_for_match,
   wasm_reset_match,
+  wasm_restore_local_sandbox,
 } from "../../wasm/hex_game_core";
 import {
   ACTIVE_MATCH_ID_STORAGE_KEY,
@@ -21,12 +23,20 @@ import {
   entitiesFromState,
   findComponent,
   isAdjacent,
+  isRecord,
   parseState,
-  profileHealth,
+  summarizeProfiles,
   terrainFromEntities,
   unitLabels,
   unitSeat,
 } from "../model";
+import {
+  discardSavedSandbox,
+  openSandboxStorage,
+  restoreSavedSandbox,
+  saveSandbox,
+  type SandboxStorage,
+} from "../sandboxPersistence";
 import type {
   ConnectionState,
   EngineState,
@@ -71,6 +81,50 @@ export function useGameRuntime() {
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const reconnectAttempts = useRef(0);
   const healthLabelElements = useRef(new Map<string, HTMLDivElement>());
+  const sandboxStorage = useRef<SandboxStorage | null>(null);
+  const sandboxRestoreAttempted = useRef(false);
+  const sandboxSavingEnabled = useRef(false);
+
+  const showLoadedProfiles = (summaries: ModProfileSummary[], append: boolean) => {
+    setLoadedModProfiles((current) => append ? [...current, ...summaries] : summaries);
+    setSelectedModId(summaries[0]?.modId ?? "");
+    setStartingHealth(summaries[0]?.currentHealth.toString() ?? "");
+  };
+
+  const restoreLocalSandboxOnce = () => {
+    if (sandboxRestoreAttempted.current) return null;
+    sandboxRestoreAttempted.current = true;
+    const storage = openSandboxStorage(() => window.sessionStorage);
+    sandboxStorage.current = storage;
+    const startup = restoreSavedSandbox(
+      storage,
+      (record) => wasm_restore_local_sandbox(WASM_MATCH_ID, record),
+    );
+    sandboxSavingEnabled.current = startup.savingEnabled;
+    if (startup.kind === "empty") return null;
+    if (startup.kind !== "restored") return startup.message;
+    try {
+      const record: unknown = JSON.parse(startup.record);
+      const profiles = isRecord(record) && Array.isArray(record.profiles) ? record.profiles : [];
+      showLoadedProfiles(summarizeProfiles(profiles), false);
+    } catch (error) {
+      return `Saved sandbox restored, but its profile list could not be shown: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    return `Saved sandbox restored with ${startup.profileCount} profile${startup.profileCount === 1 ? "" : "s"}`;
+  };
+
+  const saveLocalSandbox = () => {
+    if (!sandboxSavingEnabled.current) {
+      return sandboxRestoreAttempted.current
+        ? " · not saved for refresh (saving is off for this page)"
+        : "";
+    }
+    const warning = saveSandbox(
+      sandboxStorage.current,
+      () => wasm_export_local_sandbox(WASM_MATCH_ID),
+    );
+    return warning ? ` · ${warning}` : "";
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -86,12 +140,14 @@ export function useGameRuntime() {
         try {
           await init();
           if (cancelled) return;
+          const restoreNotice = restoreLocalSandboxOnce();
+          // Leaves a restored or already running sandbox match unchanged.
           wasm_initialize_match(WASM_MATCH_ID, MOCK_MAP_JSON);
           const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
           if (cancelled) return;
           setGameState(state);
           setConnection("ready");
-          setNotice("Autonomous WASM sandbox ready");
+          setNotice(restoreNotice ?? "Autonomous WASM sandbox ready");
         } catch (error) {
           if (cancelled) return;
           setConnection("offline");
@@ -447,7 +503,7 @@ export function useGameRuntime() {
         }
         setSelectedUnitId(null);
         sync3DCanvasWithWasmState();
-        setNotice(`Applied locally: ${token}`);
+        setNotice(`Applied locally: ${token}${saveLocalSandbox()}`);
         return true;
       } catch (error) {
         setNotice(`WASM action failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -553,29 +609,11 @@ export function useGameRuntime() {
     }
     try {
       const parsed: unknown = JSON.parse(modProfileText);
-      const profiles = Array.isArray(parsed) ? parsed : [parsed];
-      const summaries = profiles.map((profile): ModProfileSummary => {
-        if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
-          throw new Error("Each mod profile must be a JSON object");
-        }
-        const record = profile as Record<string, unknown>;
-        return {
-          modId: typeof record.mod_id === "string" ? record.mod_id : "Unknown mod ID",
-          displayName:
-            typeof record.display_name === "string" ? record.display_name : "Unnamed profile",
-          visualPrimitive:
-            typeof record.visual_primitive === "string"
-              ? record.visual_primitive
-              : "Unknown primitive",
-          ...profileHealth(record),
-        };
-      });
+      const summaries = summarizeProfiles(Array.isArray(parsed) ? parsed : [parsed]);
       const loadedCount = wasm_load_mod_profiles(modProfileText);
-      setLoadedModProfiles((current) => [...current, ...summaries]);
-      setSelectedModId(summaries[0]?.modId ?? "");
-      setStartingHealth(summaries[0]?.currentHealth.toString() ?? "");
+      showLoadedProfiles(summaries, true);
       setNotice(
-        `Loaded ${loadedCount} community mod profile${loadedCount === 1 ? "" : "s"}`,
+        `Loaded ${loadedCount} community mod profile${loadedCount === 1 ? "" : "s"}${saveLocalSandbox()}`,
       );
     } catch (error) {
       setNotice(
@@ -618,7 +656,7 @@ export function useGameRuntime() {
       );
       setSelectedUnitId(null);
       setNotice(
-        `Deployed ${displayName} in ${deploymentSlot.id} for ${deploymentSeat} at ${life}/${selectedProfile.maxHealth} HP`,
+        `Deployed ${displayName} in ${deploymentSlot.id} for ${deploymentSeat} at ${life}/${selectedProfile.maxHealth} HP${saveLocalSandbox()}`,
       );
     } catch (error) {
       setNotice(
@@ -692,11 +730,12 @@ export function useGameRuntime() {
         await init();
         wasm_reset_match(WASM_MATCH_ID, MOCK_MAP_JSON);
         setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
+        const saveNotice = saveLocalSandbox();
         if (mode === "network") {
           setMode("wasm");
-          setNotice("Native gateway unavailable; local WASM sandbox refreshed");
+          setNotice(`Native gateway unavailable; local WASM sandbox refreshed${saveNotice}`);
         } else {
-          setNotice("Fresh sandbox map loaded");
+          setNotice(`Fresh sandbox map loaded${saveNotice}`);
         }
         setConnection("ready");
       } catch (error) {
@@ -731,6 +770,20 @@ export function useGameRuntime() {
     setSelectedUnitId(null);
     setInspectedEntity(null);
     triggerFreshMapSnapshotLoad(gatewayResetRequested);
+  };
+
+  const handleStartFreshSandbox = () => {
+    if (!window.confirm(
+      "Start fresh? This discards the saved local sandbox, its imported profiles, and the current local match.",
+    )) return;
+    const error = discardSavedSandbox(
+      sandboxStorage.current ?? openSandboxStorage(() => window.sessionStorage),
+    );
+    if (error) {
+      setNotice(error);
+      return;
+    }
+    window.location.reload();
   };
 
   const playerOneCount = units.filter((unit) => {
@@ -772,7 +825,7 @@ export function useGameRuntime() {
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
-      setStartingHealth, loadModProfiles, handleDeployProfile,
+      setStartingHealth, loadModProfiles, handleDeployProfile, handleStartFreshSandbox,
     },
     actions: {
       chooseMode, clearSelection, submitAction, handleEndTurn, selectUnit, handleHexClick,

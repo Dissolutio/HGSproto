@@ -18,6 +18,7 @@ type ModProfilePanelProps = {
   onDeployProfile: () => void;
   setupLocked: boolean;
   matchFinished: boolean;
+  onStartFresh: () => void;
 };
 
 export function ModProfilePanel({
@@ -38,6 +39,7 @@ export function ModProfilePanel({
   onDeployProfile,
   setupLocked,
   matchFinished,
+  onStartFresh,
 }: ModProfilePanelProps) {
   return (
     <details style={styles.section}>
@@ -154,6 +156,17 @@ export function ModProfilePanel({
           ))}
         </ul>
       )}
+      <button
+        type="button"
+        onClick={onStartFresh}
+        disabled={!enabled}
+        style={styles.button}
+      >
+        Start Fresh Sandbox
+      </button>
+      <p role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
+        This tab keeps the local sandbox and its profiles across a refresh. Start fresh discards them.
+      </p>
     </details>
   );
 }
