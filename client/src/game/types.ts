@@ -61,4 +61,6 @@ export type ModProfileSummary = {
   maxHealth: number;
 };
 
+export type ProfileFeedback = { kind: "error" | "success"; text: string };
+
 export type HealthLabelElements = RefObject<Map<string, HTMLDivElement>>;

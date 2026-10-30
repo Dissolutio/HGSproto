@@ -1,10 +1,11 @@
-import type { ModProfileSummary, PlayerSeat, RenderEntity } from "../types";
+import type { ModProfileSummary, PlayerSeat, ProfileFeedback, RenderEntity } from "../types";
 
 type ModProfilePanelProps = {
   profileText: string;
   onProfileTextChange: (value: string) => void;
   enabled: boolean;
   onLoadProfiles: () => void;
+  loadFeedback?: ProfileFeedback | null;
   loadedProfiles: ModProfileSummary[];
   selectedProfile: ModProfileSummary | null;
   onSelectProfile: (modId: string) => void;
@@ -16,6 +17,7 @@ type ModProfilePanelProps = {
   startingHealth: string;
   onStartingHealthChange: (value: string) => void;
   onDeployProfile: () => void;
+  deployFeedback?: ProfileFeedback | null;
   setupLocked: boolean;
   matchFinished: boolean;
   onStartFresh: () => void;
@@ -26,6 +28,7 @@ export function ModProfilePanel({
   onProfileTextChange,
   enabled,
   onLoadProfiles,
+  loadFeedback,
   loadedProfiles,
   selectedProfile,
   onSelectProfile,
@@ -37,6 +40,7 @@ export function ModProfilePanel({
   startingHealth,
   onStartingHealthChange,
   onDeployProfile,
+  deployFeedback,
   setupLocked,
   matchFinished,
   onStartFresh,
@@ -50,6 +54,7 @@ export function ModProfilePanel({
       <textarea
         id="mod-profile-json"
         aria-label="Community mod profile JSON"
+        aria-describedby="mod-profile-load-feedback"
         value={profileText}
         onChange={(event) => onProfileTextChange(event.target.value)}
         placeholder={'{\n  "schema_version": 1,\n  "mod_id": "com.community.scout",\n  "display_name": "Community Scout",\n  "visual_primitive": "CUBE",\n  "components": {\n    "destructible": { "current_life": 5, "max_life": 5 },\n    "tags": ["Unit"]\n  }\n}'}
@@ -63,6 +68,15 @@ export function ModProfilePanel({
       >
         Load Mod Profile
       </button>
+      <p
+        id="mod-profile-load-feedback"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        style={{ ...styles.feedback, color: loadFeedback?.kind === "error" ? "#ff9999" : "#70d6a4" }}
+      >
+        {loadFeedback && `${loadFeedback.kind === "error" ? "Error: " : ""}${loadFeedback.text}`}
+      </p>
       {loadedProfiles.length > 0 && (
         <div style={{ marginTop: 12 }}>
           <label style={styles.label} htmlFor="profile-to-deploy">
@@ -131,6 +145,7 @@ export function ModProfilePanel({
           <button
             type="button"
             onClick={onDeployProfile}
+            aria-describedby="mod-profile-deploy-feedback"
             disabled={
               !enabled ||
               !selectedProfile ||
@@ -142,6 +157,15 @@ export function ModProfilePanel({
           >
             Deploy Profile into Roster Slot
           </button>
+          <p
+            id="mod-profile-deploy-feedback"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            style={{ ...styles.feedback, color: deployFeedback?.kind === "error" ? "#ff9999" : "#70d6a4" }}
+          >
+            {deployFeedback && `${deployFeedback.kind === "error" ? "Error: " : ""}${deployFeedback.text}`}
+          </p>
           <p role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
             The Rust core replaces the selected unit in place and owns its health, tags, and visual. Deployment locks after the first referee action.
           </p>
@@ -213,5 +237,11 @@ const styles = {
     color: "#b4c5ba",
     fontSize: 10,
     overflowWrap: "anywhere" as const,
+  },
+  feedback: {
+    margin: "6px 0 0",
+    fontSize: 12,
+    overflowWrap: "anywhere" as const,
+    whiteSpace: "pre-wrap" as const,
   },
 };
