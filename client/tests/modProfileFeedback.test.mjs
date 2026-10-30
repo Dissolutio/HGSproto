@@ -114,7 +114,7 @@ test("long multiline core errors are preserved as escaped text, not markup", () 
   assertAccessible(markup);
   assert.ok(markup.includes("x".repeat(1000)));
   assert.ok(markup.includes("\n&lt;script&gt;"));
-  assert.doesNotMatch(markup, /<script>/);
+  assert.doesNotMatch(markup, /<script>/i);
 });
 
 test("the next attempt can clear either feedback region independently", () => {
