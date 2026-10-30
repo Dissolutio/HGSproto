@@ -14,10 +14,10 @@ permissions:
 
 jobs:
   rust-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@3ea7b2dde9987cecfa88322de1f09983972fc8e9
         with:
           toolchain: 1.98.1
           targets: wasm32-unknown-unknown
@@ -25,10 +25,10 @@ jobs:
         run: cargo test -p hex_game_core -p hex_game_network -p hex_game_orchestrator --locked -- --skip network_simulation_auth_sync_disconnect_and_recovery
 
   recovery-direct-only:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@3ea7b2dde9987cecfa88322de1f09983972fc8e9
         with:
           toolchain: 1.98.1
           targets: wasm32-unknown-unknown
@@ -36,21 +36,21 @@ jobs:
         run: cargo test -p hex_game_orchestrator --test network_simulation network_simulation_recovery_direct_only --locked -- --exact --ignored --test-threads=1
 
   web-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@3ea7b2dde9987cecfa88322de1f09983972fc8e9
         with:
           toolchain: 1.98.1
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: client/package-lock.json
       - name: Set npm version
         run: npm install --global npm@10.8.2
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: wasm-pack-cache
         with:
           path: ~/.cargo/bin/wasm-pack
@@ -60,14 +60,16 @@ jobs:
         run: cargo install wasm-pack --version 0.15.0 --locked
       - name: Install client dependencies
         run: npm --prefix client ci
+      - name: Run client tests
+        run: npm --prefix client run test
       - name: Build client
         run: npm --prefix client run build
 
   recovery-default-tracked:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@3ea7b2dde9987cecfa88322de1f09983972fc8e9
         with:
           toolchain: 1.98.1
           targets: wasm32-unknown-unknown
