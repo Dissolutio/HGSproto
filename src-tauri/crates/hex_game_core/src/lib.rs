@@ -1,6 +1,7 @@
 pub mod engine;
 pub mod ffi;
 pub mod flow;
+pub mod local_sandbox;
 pub mod mod_registry;
 pub mod models;
 pub mod query;
