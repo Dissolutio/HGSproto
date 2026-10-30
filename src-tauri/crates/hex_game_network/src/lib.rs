@@ -49,9 +49,7 @@ impl From<RecoveryTestRoute> for EndpointRoute {
 
 fn endpoint_builder(route: EndpointRoute) -> iroh::endpoint::Builder {
     match route {
-        EndpointRoute::Default => {
-            Endpoint::builder(presets::N0).alpns(vec![MATCH_ALPN.to_vec()])
-        }
+        EndpointRoute::Default => Endpoint::builder(presets::N0).alpns(vec![MATCH_ALPN.to_vec()]),
         EndpointRoute::DirectOnly => Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
             .alpns(vec![MATCH_ALPN.to_vec()]),
@@ -79,11 +77,10 @@ fn restrict_node_addr(node_addr: NodeAddr, route: EndpointRoute) -> Result<NodeA
         }
         #[cfg(feature = "recovery-diagnostics")]
         EndpointRoute::RelayOnly => {
-            let relay_url = node_addr
-                .relay_urls()
-                .next()
-                .cloned()
-                .ok_or_else(|| NetworkError("Relay-only recovery test has no relay URL".into()))?;
+            let relay_url =
+                node_addr.relay_urls().next().cloned().ok_or_else(|| {
+                    NetworkError("Relay-only recovery test has no relay URL".into())
+                })?;
             Ok(NodeAddr::new(node_addr.id).with_relay_url(relay_url))
         }
     }
@@ -334,18 +331,9 @@ impl MatchSession {
         if route == EndpointRoute::RelayOnly {
             endpoint.online().await;
         }
-        match restrict_node_addr(endpoint.addr(), route) {
-            Ok(node_addr) => {
-                if let Ok(mut local_addrs) = LOCAL_NODE_ADDRS.lock() {
-                    local_addrs.insert(local_node_id.clone(), node_addr);
-                }
-            }
-            Err(error) if route != EndpointRoute::Default => {
-                return Err(NetworkError(format!(
-                    "Could not obtain recovery-test route: {error}"
-                )));
-            }
-            Err(_) => {}
+        let node_addr = restrict_node_addr(endpoint.addr(), route)?;
+        if let Ok(mut local_addrs) = LOCAL_NODE_ADDRS.lock() {
+            local_addrs.insert(local_node_id.clone(), node_addr);
         }
 
         Ok(Self {
