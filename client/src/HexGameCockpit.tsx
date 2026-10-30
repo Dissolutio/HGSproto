@@ -20,6 +20,7 @@ export default function HexGameCockpit() {
     },
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
+      profileLoadFeedback, profileDeployFeedback,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
       setStartingHealth, loadModProfiles, handleDeployProfile, handleStartFreshSandbox,
     },
@@ -80,6 +81,7 @@ export default function HexGameCockpit() {
             onProfileTextChange={setModProfileText}
             enabled={mode === "wasm" && connection === "ready"}
             onLoadProfiles={loadModProfiles}
+            loadFeedback={profileLoadFeedback}
             loadedProfiles={loadedModProfiles}
             selectedProfile={selectedProfile ?? null}
             onSelectProfile={(modId) => {
@@ -98,6 +100,7 @@ export default function HexGameCockpit() {
             startingHealth={startingHealth}
             onStartingHealthChange={setStartingHealth}
             onDeployProfile={handleDeployProfile}
+            deployFeedback={profileDeployFeedback}
             setupLocked={!!gameState?.context?.setup_locked}
             matchFinished={!!gameState?.context?.winner}
             onStartFresh={handleStartFreshSandbox}

@@ -43,6 +43,7 @@ import type {
   ModProfileSummary,
   Mode,
   PlayerSeat,
+  ProfileFeedback,
   RecoverySession,
   RenderEntity,
   TerrainData,
@@ -63,6 +64,8 @@ export function useGameRuntime() {
   const [notice, setNotice] = useState("Loading local WebAssembly engine");
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [modProfileText, setModProfileText] = useState("");
+  const [profileLoadFeedback, setProfileLoadFeedback] = useState<ProfileFeedback | null>(null);
+  const [profileDeployFeedback, setProfileDeployFeedback] = useState<ProfileFeedback | null>(null);
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
   const [selectedModId, setSelectedModId] = useState("");
   const [deploymentSeat, setDeploymentSeat] = useState<PlayerSeat>("P1");
@@ -603,7 +606,9 @@ export function useGameRuntime() {
   };
 
   const loadModProfiles = () => {
+    setProfileLoadFeedback(null);
     if (!modProfileText.trim()) {
+      setProfileLoadFeedback({ kind: "error", text: "Paste a mod profile before loading" });
       setNotice("Paste a mod profile before loading");
       return;
     }
@@ -612,10 +617,18 @@ export function useGameRuntime() {
       const summaries = summarizeProfiles(Array.isArray(parsed) ? parsed : [parsed]);
       const loadedCount = wasm_load_mod_profiles(modProfileText);
       showLoadedProfiles(summaries, true);
+      setProfileLoadFeedback({
+        kind: "success",
+        text: `Loaded ${loadedCount} community mod profile${loadedCount === 1 ? "" : "s"}: ${summaries.map((profile) => profile.displayName).join(", ")}`,
+      });
       setNotice(
         `Loaded ${loadedCount} community mod profile${loadedCount === 1 ? "" : "s"}${saveLocalSandbox()}`,
       );
     } catch (error) {
+      setProfileLoadFeedback({
+        kind: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
       setNotice(
         `Mod profile load failed: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -623,11 +636,14 @@ export function useGameRuntime() {
   };
 
   const handleDeployProfile = () => {
+    setProfileDeployFeedback(null);
     if (mode !== "wasm" || connection !== "ready") {
+      setProfileDeployFeedback({ kind: "error", text: "Switch to Autonomous Sandbox Mode before deploying a profile" });
       setNotice("Switch to Autonomous Sandbox Mode before deploying a profile");
       return;
     }
     if (!selectedProfile || !deploymentSlot) {
+      setProfileDeployFeedback({ kind: "error", text: "Select a loaded unit profile and a roster slot first" });
       setNotice("Select a loaded unit profile and a roster slot first");
       return;
     }
@@ -637,6 +653,7 @@ export function useGameRuntime() {
       life < 1 ||
       life > selectedProfile.maxHealth
     ) {
+      setProfileDeployFeedback({ kind: "error", text: `Starting health must be a whole number from 1 to ${selectedProfile.maxHealth}` });
       setNotice(`Starting health must be a whole number from 1 to ${selectedProfile.maxHealth}`);
       return;
     }
@@ -655,10 +672,18 @@ export function useGameRuntime() {
         entitiesFromState(state).find((entity) => entity.id === deploymentSlot.id) ?? null,
       );
       setSelectedUnitId(null);
+      setProfileDeployFeedback({
+        kind: "success",
+        text: `Deployed ${displayName} in ${deploymentSlot.id} for ${deploymentSeat} at ${life}/${selectedProfile.maxHealth} HP`,
+      });
       setNotice(
         `Deployed ${displayName} in ${deploymentSlot.id} for ${deploymentSeat} at ${life}/${selectedProfile.maxHealth} HP${saveLocalSandbox()}`,
       );
     } catch (error) {
+      setProfileDeployFeedback({
+        kind: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
       setNotice(
         `Unit deployment failed: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -824,6 +849,7 @@ export function useGameRuntime() {
     },
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
+      profileLoadFeedback, profileDeployFeedback,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
       setStartingHealth, loadModProfiles, handleDeployProfile, handleStartFreshSandbox,
     },
