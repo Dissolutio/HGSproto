@@ -1142,6 +1142,299 @@ mod tests {
         assert!(!match_exists(&match_id));
     }
 
+    const PRESERVATION_PROFILE: &str = r#"{
+        "schema_version": 1,
+        "mod_id": "com.example.preservation",
+        "display_name": "Preserved Unit",
+        "visual_primitive": "CUBE",
+        "components": {
+            "destructible": {"current_life": 12, "max_life": 12},
+            "tags": ["Unit", "Heavy"]
+        }
+    }"#;
+
+    const UNKNOWN_MOD_MAP: &str = r#"{
+        "hexMap": {},
+        "boardPieces": [{
+            "uid": "replacement",
+            "inventoryID": "g7",
+            "altitude": 0,
+            "rotation": 0,
+            "pieceCoords": {"q": 0, "r": 0, "s": 0}
+        }],
+        "starterUnits": [{
+            "id": "REPLACEMENT_UNIT",
+            "mod_id": "com.unknown.preservation",
+            "seat": "P1"
+        }]
+    }"#;
+
+    #[derive(Debug, PartialEq)]
+    struct PreservationState {
+        snapshot: String,
+        flow: MatchFlow,
+        active_seat: String,
+        turn_phase: TurnPhase,
+        registry: serde_json::Value,
+    }
+
+    fn preservation_state(match_id: &str, registry: &ModRegistry) -> PreservationState {
+        let (snapshot, active_seat, turn_phase) = {
+            let matches = ACTIVE_MATCHES.lock().unwrap();
+            let state = &matches[match_id];
+            (
+                serde_json::to_string(state).unwrap(),
+                state.context.active_player.clone(),
+                state.context.turn_phase,
+            )
+        };
+        PreservationState {
+            snapshot,
+            flow: get_match_flow(match_id).unwrap(),
+            active_seat,
+            turn_phase,
+            registry: serde_json::to_value(&*registry.templates.read().unwrap()).unwrap(),
+        }
+    }
+
+    fn changed_preservation_match(name: &str) -> (String, ModRegistry) {
+        let match_id = format!("{name}_{}", std::process::id());
+        let registry = ModRegistry::default();
+        assert_eq!(
+            registry
+                .load_batch(&format!("[{PRESERVATION_PROFILE}]"))
+                .unwrap(),
+            1
+        );
+        store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
+        let initial = preservation_state(&match_id, &registry);
+        deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            7,
+            &registry,
+        )
+        .unwrap();
+        let changed = preservation_state(&match_id, &registry);
+        assert_ne!(changed.snapshot, initial.snapshot);
+        let state: serde_json::Value = serde_json::from_str(&changed.snapshot).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["current_life"],
+            7
+        );
+        assert_eq!(state["context"]["setup_locked"], false);
+        (match_id, registry)
+    }
+
+    fn damage_preservation_match(match_id: &str, registry: &ModRegistry) {
+        process_action(match_id, "P1", "S").unwrap();
+        process_action(match_id, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
+        let state: serde_json::Value =
+            serde_json::from_str(&preservation_state(match_id, registry).snapshot).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
+            3
+        );
+        assert_eq!(state["context"]["setup_locked"], true);
+        assert_eq!(state["context"]["turn_phase"], "end");
+    }
+
+    #[test]
+    fn failed_setup_unknown_mod_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_setup_unknown_mod");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            try_initialize_from_hexoscape_with_registry(match_id.clone(), UNKNOWN_MOD_MAP, &registry)
+                .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Starter unit 'REPLACEMENT_UNIT' references unknown mod_id 'com.unknown.preservation'"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_reset_unknown_mod_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_reset_unknown_mod");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            try_reset_from_hexoscape_with_registry(match_id.clone(), UNKNOWN_MOD_MAP, &registry)
+                .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Starter unit 'REPLACEMENT_UNIT' references unknown mod_id 'com.unknown.preservation'"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_reset_malformed_map_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_reset_malformed_map");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            try_reset_from_hexoscape_with_registry(match_id.clone(), "{", &registry).unwrap_err();
+
+        assert!(error.starts_with("Invalid Hexoscape map JSON:"), "{error}");
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    fn assert_failed_deploy_preserves_match(
+        name: &str,
+        slot: &str,
+        mod_id: &str,
+        seat: &str,
+        starting_life: i32,
+        expected_error: &str,
+    ) {
+        // A successful deployment changes the live match without locking setup, so
+        // these cases reach their own validation guards rather than the setup lock.
+        let (match_id, registry) = changed_preservation_match(name);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            deploy_profile_unit(&match_id, slot, mod_id, seat, starting_life, &registry).unwrap_err();
+
+        assert_eq!(error, expected_error);
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_deploy_unknown_slot_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_unknown_slot",
+            "MISSING_UNIT",
+            "com.example.preservation",
+            "P1",
+            7,
+            "Unknown roster unit: MISSING_UNIT",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_invalid_seat_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_invalid_seat",
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P3",
+            7,
+            "seat must be 'P1' or 'P2'",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_zero_life_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_zero_life",
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            0,
+            "starting health must be within 1..=12",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_above_max_life_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_above_max_life",
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            13,
+            "starting health must be within 1..=12",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_unknown_mod_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_unknown_mod",
+            "UNIT_P1_1",
+            "com.unknown.preservation",
+            "P1",
+            7,
+            "Starter unit 'UNIT_P1_1' references unknown mod_id 'com.unknown.preservation'",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_after_first_action_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_deploy_after_first_action");
+        process_action(&match_id, "P1", "S").unwrap();
+        let before = preservation_state(&match_id, &registry);
+        let state: serde_json::Value = serde_json::from_str(&before.snapshot).unwrap();
+        assert_eq!(state["context"]["setup_locked"], true);
+        assert_eq!(before.turn_phase, TurnPhase::Attack);
+
+        let error = deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            12,
+            &registry,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Roster deployment is only allowed before the first referee action"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_batch_import_preserves_existing_match_and_entire_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_batch_import");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+        let valid = PRESERVATION_PROFILE.replace("com.example.preservation", "com.example.new_unit");
+        let mut invalid: serde_json::Value = serde_json::from_str(PRESERVATION_PROFILE).unwrap();
+        invalid["mod_id"] = serde_json::json!("com.example.invalid_unit");
+        invalid["components"]["destructible"]["current_life"] = serde_json::json!(0);
+
+        let error = registry
+            .load_batch(&format!("[{valid},{invalid}]"))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "profile com.example.invalid_unit: destructible.current_life must be within 1..=max_life"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        let error = deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.new_unit",
+            "P1",
+            7,
+            &registry,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "Starter unit 'UNIT_P1_1' references unknown mod_id 'com.example.new_unit'"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
     #[test]
     fn mod_aware_setup_uses_registry_components_and_injects_seat_tag() {
         let match_id = format!("registered_mod_profile_test_{}", std::process::id());
