@@ -12,6 +12,9 @@ type GameHudProps = {
   onReconnect: () => void;
   onDismissRecovery: () => void;
   notice: string;
+  sandboxRestoreNotice?: string | null;
+  onDismissSandboxRestore?: () => void;
+  onStartFreshSandbox?: () => void;
   terrainCount: number;
   unitCount: number;
   playerSeat: PlayerSeat | null;
@@ -42,6 +45,9 @@ export function GameHud({
   onReconnect,
   onDismissRecovery,
   notice,
+  sandboxRestoreNotice,
+  onDismissSandboxRestore,
+  onStartFreshSandbox,
   terrainCount,
   unitCount,
   playerSeat,
@@ -145,6 +151,23 @@ export function GameHud({
             type="button"
             aria-label="Dismiss disconnect notification"
             onClick={onDismissRecovery}
+            style={styles.dismissButton}
+          >
+            ×
+          </button>
+        </aside>
+      )}
+
+      {sandboxRestoreNotice && (
+        <aside role="alert" style={styles.recoveryBanner}>
+          <span style={styles.notice}>{sandboxRestoreNotice}</span>
+          <button type="button" onClick={onStartFreshSandbox} style={styles.reconnectButton}>
+            Start Fresh Sandbox
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss sandbox restore notification"
+            onClick={onDismissSandboxRestore}
             style={styles.dismissButton}
           >
             ×

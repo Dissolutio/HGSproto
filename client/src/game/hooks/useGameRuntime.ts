@@ -61,6 +61,7 @@ export function useGameRuntime() {
   const [inspectedEntity, setInspectedEntity] = useState<RenderEntity | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [notice, setNotice] = useState("Loading local WebAssembly engine");
+  const [sandboxRestoreNotice, setSandboxRestoreNotice] = useState<string | null>(null);
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [modProfileText, setModProfileText] = useState("");
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
@@ -102,6 +103,10 @@ export function useGameRuntime() {
     );
     sandboxSavingEnabled.current = startup.savingEnabled;
     if (startup.kind === "empty") return null;
+    if (startup.kind === "rejected") {
+      setSandboxRestoreNotice(startup.message);
+      return null;
+    }
     if (startup.kind !== "restored") return startup.message;
     try {
       const record: unknown = JSON.parse(startup.record);
@@ -815,6 +820,7 @@ export function useGameRuntime() {
     state: {
       mode, gameState, selectedUnitId, actionPending, endTurnAfterSkip, inspectedEntity,
       connection, notice, socket, localSeat, localNodeId, localMatchId, remoteNodeId,
+      sandboxRestoreNotice, setSandboxRestoreNotice,
       isPeerConnected, joinNodeId, setJoinNodeId, recoverySession, recoveryDismissed, setRecoveryDismissed,
     },
     view: {
