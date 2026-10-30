@@ -21,7 +21,7 @@ export default function HexGameCockpit() {
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
-      setStartingHealth, loadModProfiles, handleDeployProfile,
+      setStartingHealth, loadModProfiles, handleDeployProfile, handleStartFreshSandbox,
     },
     actions: {
       chooseMode, clearSelection, submitAction, handleEndTurn, selectUnit, handleHexClick,
@@ -100,6 +100,7 @@ export default function HexGameCockpit() {
             onDeployProfile={handleDeployProfile}
             setupLocked={!!gameState?.context?.setup_locked}
             matchFinished={!!gameState?.context?.winner}
+            onStartFresh={handleStartFreshSandbox}
           />
           <NetworkPortal
             mode={mode}

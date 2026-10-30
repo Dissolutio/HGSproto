@@ -63,6 +63,18 @@ pub fn wasm_deploy_profile_unit(
 }
 
 #[wasm_bindgen]
+pub fn wasm_export_local_sandbox(match_id: String) -> Result<String, JsValue> {
+    crate::local_sandbox::export_local_sandbox(&match_id, &MOD_REGISTRY)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_restore_local_sandbox(match_id: String, record_json: String) -> Result<u32, JsValue> {
+    crate::local_sandbox::restore_local_sandbox(&match_id, &record_json, &MOD_REGISTRY)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
 pub fn wasm_get_current_state(match_id: String) -> String {
     let matches = match engine::ACTIVE_MATCHES.lock() {
         Ok(matches) => matches,
@@ -102,8 +114,9 @@ fn error_json(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        initialize_match, wasm_deploy_profile_unit, wasm_get_current_state, wasm_initialize_match,
-        wasm_load_mod_profiles, wasm_process_token_for_match, wasm_reset_match,
+        initialize_match, wasm_deploy_profile_unit, wasm_export_local_sandbox,
+        wasm_get_current_state, wasm_initialize_match, wasm_load_mod_profiles,
+        wasm_process_token_for_match, wasm_reset_match,
     };
 
     #[test]
@@ -300,5 +313,66 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
         assert_eq!(state["entities"]["UNIT_P1_2"]["spatial"], initial_position);
+    }
+
+    #[test]
+    fn wasm_exported_local_sandbox_restores_through_the_core() {
+        let mod_id = format!("com.example.wasm_saved_{}", std::process::id());
+        let profile = format!(
+            r#"{{
+                "schema_version": 1,
+                "mod_id": "{mod_id}",
+                "display_name": "Saved Goliath",
+                "visual_primitive": "CUBE",
+                "components": {{
+                    "destructible": {{"current_life": 12, "max_life": 12}},
+                    "tags": ["Unit", "Heavy"]
+                }}
+            }}"#
+        );
+        assert_eq!(wasm_load_mod_profiles(profile).unwrap(), 1);
+        let match_id = format!("wasm_saved_match_{}", std::process::id());
+        let map_json = r#"{
+            "hexMap": {},
+            "boardPieces": [{
+                "uid": "g7",
+                "inventoryID": "g7",
+                "altitude": 0,
+                "rotation": 0,
+                "pieceCoords": {"q": 0, "r": 0, "s": 0}
+            }]
+        }"#;
+        wasm_initialize_match(match_id.clone(), map_json.to_string()).unwrap();
+        wasm_deploy_profile_unit(match_id.clone(), "HERO_P2".into(), mod_id.clone(), "P2".into(), 12)
+            .unwrap();
+        wasm_deploy_profile_unit(match_id.clone(), "UNIT_P1_1".into(), mod_id.clone(), "P1".into(), 12)
+            .unwrap();
+        for token in ["M:UNIT_P1_2:Q0R2Z0", "A:UNIT_P1_1:HERO_P2"] {
+            assert!(wasm_process_token_for_match(match_id.clone(), "P1".into(), token.into())
+                .starts_with("VALID_STEP:"));
+        }
+        let before: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
+        let record = wasm_export_local_sandbox(match_id.clone()).unwrap();
+        crate::engine::remove_match(&match_id);
+
+        let fresh_page_registry = crate::mod_registry::ModRegistry::default();
+        crate::local_sandbox::restore_local_sandbox(&match_id, &record, &fresh_page_registry)
+            .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            after["entities"]["HERO_P2"]["components"]["destructible"]["data"]["current_life"],
+            11
+        );
+        assert!(fresh_page_registry.get_template(&mod_id).is_ok());
+        assert!(wasm_process_token_for_match(match_id.clone(), "P2".into(), "E".into())
+            .starts_with("E:"));
+        assert_eq!(
+            wasm_process_token_for_match(match_id.clone(), "P1".into(), "E".into()),
+            "VALID_STEP:E"
+        );
+        crate::engine::remove_match(&match_id);
     }
 }
