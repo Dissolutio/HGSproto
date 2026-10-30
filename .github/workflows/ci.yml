@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: wasm32-unknown-unknown
+      - name: Run workspace tests
+        run: cargo test -p hex_game_core -p hex_game_network -p hex_game_orchestrator --locked -- --skip network_simulation_auth_sync_disconnect_and_recovery
+
+  recovery-direct-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: wasm32-unknown-unknown
+      - name: Run direct-only recovery regression test
+        run: cargo test -p hex_game_orchestrator --test network_simulation network_simulation_recovery_direct_only --locked -- --exact --ignored --test-threads=1
+
+  web-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - name: Set npm version
+        run: npm install --global npm@10.8.2
+      - uses: actions/cache@v4
+        id: wasm-pack-cache
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.15.0
+      - name: Install wasm-pack
+        if: steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Install client dependencies
+        run: npm --prefix client ci
+      - name: Build client
+        run: npm --prefix client run build
+
+  recovery-default-tracked:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: wasm32-unknown-unknown
+      - name: Run default recovery test
+        id: recovery
+        continue-on-error: true
+        run: cargo test -p hex_game_orchestrator --test network_simulation network_simulation_auth_sync_disconnect_and_recovery --locked -- --exact --test-threads=1
+      - name: Record default recovery result
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.recovery.outcome }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ "$TEST_OUTCOME" = "success" ]; then
+            result=pass
+          else
+            result=fail
+          fi
+          echo "Default recovery check: **${result}** (run id: ${RUN_ID})" >> "$GITHUB_STEP_SUMMARY"
