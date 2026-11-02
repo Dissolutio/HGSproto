@@ -3,6 +3,7 @@
 - The base branch is `dev`. Never target, push to, or merge into `main`. Open a draft pull request and do not merge it. Remove any "[WIP]" from the title when finished.
 - One issue, one pull request. Keep commits small and labeled. List any change you made that the issue did not request.
 - Do not touch `main`, release workflows, lockfiles, or anything the issue does not name, unless the issue says otherwise.
+- Do not edit anything under `.github/workflows/`, release or deploy files, or any file that reads secrets, unless the issue explicitly says to. Never add secrets or deploy credentials to a workflow that runs on pull requests. If the work seems to need one of these, stop and ask in the pull request.
 
 # Authority and scope
 - The Rust core is the only rules authority. No game rules in the browser client, the gateway, or the native peer receiver.
