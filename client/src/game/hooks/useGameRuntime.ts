@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ThreeEvent } from "@react-three/fiber";
 import init, {
+  wasm_apply_setup,
   wasm_deploy_profile_unit,
   wasm_export_local_sandbox,
+  wasm_export_setup,
   wasm_get_current_state,
   wasm_initialize_match,
   wasm_load_mod_profiles,
@@ -23,7 +25,6 @@ import {
   entitiesFromState,
   findComponent,
   isAdjacent,
-  isRecord,
   parseState,
   summarizeProfiles,
   terrainFromEntities,
@@ -37,6 +38,7 @@ import {
   saveSandbox,
   type SandboxStorage,
 } from "../sandboxPersistence";
+import { loadedProfilesFromSetup, loadSetupFile, setupFileName } from "../setupFiles";
 import type {
   ConnectionState,
   EngineState,
@@ -67,6 +69,8 @@ export function useGameRuntime() {
   const [modProfileText, setModProfileText] = useState("");
   const [profileLoadFeedback, setProfileLoadFeedback] = useState<ProfileFeedback | null>(null);
   const [profileDeployFeedback, setProfileDeployFeedback] = useState<ProfileFeedback | null>(null);
+  const [setupFeedback, setSetupFeedback] = useState<ProfileFeedback | null>(null);
+  const [setupBusy, setSetupBusy] = useState(false);
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
   const [selectedModId, setSelectedModId] = useState("");
   const [deploymentSeat, setDeploymentSeat] = useState<PlayerSeat>("P1");
@@ -88,6 +92,9 @@ export function useGameRuntime() {
   const sandboxStorage = useRef<SandboxStorage | null>(null);
   const sandboxRestoreAttempted = useRef(false);
   const sandboxSavingEnabled = useRef(false);
+  const setupLoadPending = useRef(false);
+  const setupActionsEnabled = useRef(false);
+  setupActionsEnabled.current = mode === "wasm" && connection === "ready";
 
   const showLoadedProfiles = (summaries: ModProfileSummary[], append: boolean) => {
     setLoadedModProfiles((current) => append ? [...current, ...summaries] : summaries);
@@ -112,9 +119,7 @@ export function useGameRuntime() {
     }
     if (startup.kind !== "restored") return startup.message;
     try {
-      const record: unknown = JSON.parse(startup.record);
-      const profiles = isRecord(record) && Array.isArray(record.profiles) ? record.profiles : [];
-      showLoadedProfiles(summarizeProfiles(profiles), false);
+      showLoadedProfiles(loadedProfilesFromSetup(startup.record), false);
     } catch (error) {
       return `Saved sandbox restored, but its profile list could not be shown: ${error instanceof Error ? error.message : String(error)}`;
     }
@@ -487,6 +492,65 @@ export function useGameRuntime() {
     setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
   };
 
+  const handleExportSetup = () => {
+    if (!setupActionsEnabled.current || setupLoadPending.current) return;
+    try {
+      const text = wasm_export_setup(WASM_MATCH_ID);
+      const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = setupFileName(JSON.parse(text).name);
+      document.body.appendChild(link);
+      try {
+        link.click();
+      } finally {
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      }
+      setSetupFeedback({ kind: "success", text: "Setup exported" });
+    } catch (error) {
+      setSetupFeedback({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  const handleLoadSetup = async (file: File) => {
+    if (!setupActionsEnabled.current || setupLoadPending.current) return;
+    setupLoadPending.current = true;
+    setSetupBusy(true);
+    try {
+      await loadSetupFile(
+        file,
+        () => setupActionsEnabled.current && window.confirm(
+          "Load setup? This replaces the whole current local sandbox and any profiles loaded. There is no merge.",
+        ),
+        (text) => wasm_apply_setup(WASM_MATCH_ID, text),
+        () => {
+          const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
+          const profiles = loadedProfilesFromSetup(wasm_export_local_sandbox(WASM_MATCH_ID));
+          setGameState(state);
+          showLoadedProfiles(profiles, false);
+          setSelectedUnitId(null);
+          setInspectedEntity(null);
+          setActionPending(false);
+          setEndTurnAfterSkip(null);
+          setDeploymentSeat("P1");
+          setDeploymentSlotId("");
+          setModProfileText("");
+          setProfileLoadFeedback(null);
+          setProfileDeployFeedback(null);
+          const message = `Setup loaded${saveLocalSandbox()}`;
+          setSetupFeedback({ kind: "success", text: message });
+          setNotice(message);
+        },
+      );
+    } catch (error) {
+      setSetupFeedback({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setupLoadPending.current = false;
+      setSetupBusy(false);
+    }
+  };
+
   const submitAction = (token: string) => {
     if (!canAct) {
       setNotice(actionPending
@@ -856,6 +920,7 @@ export function useGameRuntime() {
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
       profileLoadFeedback, profileDeployFeedback,
+      setupFeedback, setupBusy, handleExportSetup, handleLoadSetup,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
       setStartingHealth, loadModProfiles, handleDeployProfile, handleStartFreshSandbox,
     },

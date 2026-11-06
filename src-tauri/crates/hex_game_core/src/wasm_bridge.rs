@@ -75,6 +75,17 @@ pub fn wasm_restore_local_sandbox(match_id: String, record_json: String) -> Resu
 }
 
 #[wasm_bindgen]
+pub fn wasm_apply_setup(match_id: String, setup_json: String) -> Result<(), JsValue> {
+    crate::setup::apply_setup(match_id, &setup_json, &MOD_REGISTRY)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_export_setup(match_id: String) -> Result<String, JsValue> {
+    crate::setup::export_setup(&match_id, &MOD_REGISTRY).map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
 pub fn wasm_get_current_state(match_id: String) -> String {
     let matches = match engine::ACTIVE_MATCHES.lock() {
         Ok(matches) => matches,
@@ -114,13 +125,18 @@ fn error_json(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        initialize_match, wasm_deploy_profile_unit, wasm_export_local_sandbox,
-        wasm_get_current_state, wasm_initialize_match, wasm_load_mod_profiles,
-        wasm_process_token_for_match, wasm_reset_match,
+        MOD_REGISTRY, initialize_match, wasm_apply_setup, wasm_deploy_profile_unit,
+        wasm_export_local_sandbox, wasm_export_setup, wasm_get_current_state,
+        wasm_initialize_match, wasm_load_mod_profiles, wasm_process_token_for_match,
+        wasm_reset_match,
     };
+
+    // Applying a setup replaces the page-wide registry, so registry users must not run in parallel.
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn wasm_api_initializes_queries_and_processes_moves() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let match_id = format!("wasm_bridge_test_{}", std::process::id());
         let map_json = r#"{
             "hexMap": {"name": "wasm-test"},
@@ -183,12 +199,14 @@ mod tests {
 
     #[test]
     fn wasm_initializer_reports_invalid_map_data() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let error = initialize_match("invalid_map".to_string(), "not json").unwrap_err();
         assert!(error.contains("Invalid Hexoscape map JSON"));
     }
 
     #[test]
     fn wasm_mod_profile_loader_accepts_a_single_profile_object() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let mod_id = format!("com.example.wasm_{}", std::process::id());
         let profile_json = format!(
             r#"{{
@@ -231,6 +249,7 @@ mod tests {
 
     #[test]
     fn wasm_profile_deployment_updates_the_authoritative_match_snapshot() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let mod_id = format!("com.example.wasm_deploy_{}", std::process::id());
         let profile = format!(
             r#"[{{
@@ -291,6 +310,7 @@ mod tests {
 
     #[test]
     fn wasm_reset_replaces_existing_match_snapshot() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let match_id = format!("wasm_reset_test_{}", std::process::id());
         let map_json = r#"{
             "hexMap": {},
@@ -317,6 +337,7 @@ mod tests {
 
     #[test]
     fn wasm_exported_local_sandbox_restores_through_the_core() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let mod_id = format!("com.example.wasm_saved_{}", std::process::id());
         let profile = format!(
             r#"{{
@@ -372,6 +393,116 @@ mod tests {
         assert_eq!(
             wasm_process_token_for_match(match_id.clone(), "P1".into(), "E".into()),
             "VALID_STEP:E"
+        );
+        crate::engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn wasm_setup_wrappers_replace_profiles_and_export_starting_health() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let match_id = format!("wasm_setup_{}", std::process::id());
+        wasm_initialize_match(
+            match_id.clone(),
+            r#"{"hexMap":{},"boardPieces":[{"uid":"g7","inventoryID":"g7",
+            "altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}}]}"#
+                .into(),
+        )
+        .unwrap();
+        let original: serde_json::Value =
+            serde_json::from_str(&wasm_export_setup(match_id.clone()).unwrap()).unwrap();
+        assert_eq!(original["setup_version"], 1);
+        assert_eq!(original["profiles"], serde_json::json!([]));
+        assert_eq!(original["roster"], serde_json::json!([]));
+
+        let mut setup = original;
+        setup["name"] = "WASM setup".into();
+        setup["profiles"] = serde_json::json!([{
+            "schema_version": 1,
+            "mod_id": "com.example.wasm_setup",
+            "display_name": "Setup Goliath",
+            "visual_primitive": "CUBE",
+            "components": {
+                "destructible": {"current_life": 12, "max_life": 12},
+                "tags": ["Unit"]
+            }
+        }]);
+        setup["roster"] = serde_json::json!([
+            {"slot": "UNIT_P1_1", "seat": "P1", "profile": "com.example.wasm_setup", "starting_health": 12},
+            {"slot": "HERO_P2", "seat": "P2", "profile": "com.example.wasm_setup", "starting_health": 10}
+        ]);
+        wasm_apply_setup(match_id.clone(), setup.to_string()).unwrap();
+        for token in ["M:UNIT_P1_2:Q0R2Z0", "A:UNIT_P1_1:HERO_P2"] {
+            assert!(
+                wasm_process_token_for_match(match_id.clone(), "P1".into(), token.into())
+                    .starts_with("VALID_STEP:")
+            );
+        }
+        let state: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
+        assert_eq!(
+            state["entities"]["HERO_P2"]["components"]["destructible"]["data"]["current_life"],
+            9
+        );
+        let exported: serde_json::Value =
+            serde_json::from_str(&wasm_export_setup(match_id.clone()).unwrap()).unwrap();
+        let hero = exported["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["slot"] == "HERO_P2")
+            .unwrap();
+        assert_eq!(hero["starting_health"], 10);
+        assert_eq!(exported["profiles"].as_array().unwrap().len(), 1);
+        let record = wasm_export_local_sandbox(match_id.clone()).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(saved["setup"]["name"], exported["name"]);
+        assert_eq!(saved["setup"]["map"], exported["map"]);
+        assert_eq!(saved["profiles"].as_array().unwrap().len(), 1);
+        let fresh_registry = crate::mod_registry::ModRegistry::default();
+        crate::local_sandbox::restore_local_sandbox(&match_id, &record, &fresh_registry).unwrap();
+        let restored_setup: serde_json::Value =
+            serde_json::from_str(&crate::setup::export_setup(&match_id, &fresh_registry).unwrap())
+                .unwrap();
+        assert_eq!(restored_setup, exported);
+
+        // JsValue errors cannot be constructed natively; exercise the identical core call.
+        let mut refused = setup.clone();
+        refused["rules"] = serde_json::json!({});
+        let error =
+            crate::setup::apply_setup(match_id.clone(), &refused.to_string(), &MOD_REGISTRY)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            "invalid setup: unknown field 'rules', expected one of 'setup_version', 'name', 'map', 'profiles', 'roster'"
+        );
+        let after_refusal: serde_json::Value =
+            serde_json::from_str(&wasm_export_local_sandbox(match_id.clone()).unwrap()).unwrap();
+        assert_eq!(after_refusal, saved);
+
+        setup["profiles"] = serde_json::json!([]);
+        setup["roster"] = serde_json::json!([]);
+        wasm_apply_setup(match_id.clone(), setup.to_string()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&wasm_export_local_sandbox(match_id.clone()).unwrap()).unwrap();
+        assert_eq!(saved["profiles"], serde_json::json!([]));
+        crate::engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn setup_export_core_error_is_preserved_without_native_jsvalue() {
+        let registry = crate::mod_registry::ModRegistry::default();
+        assert_eq!(
+            crate::setup::export_setup("wasm_setup_missing", &registry).unwrap_err(),
+            "Unknown match: wasm_setup_missing"
+        );
+        let match_id = format!("wasm_setup_no_record_{}", std::process::id());
+        crate::engine::store_match(
+            match_id.clone(),
+            crate::engine::generate_test_sandbox(match_id.clone()),
+        );
+        assert_eq!(
+            crate::setup::export_setup(&match_id, &registry).unwrap_err(),
+            "setup: this match has no setup record"
         );
         crate::engine::remove_match(&match_id);
     }

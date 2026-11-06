@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import type { ModProfileSummary, PlayerSeat, ProfileFeedback, RenderEntity } from "../types";
 
 type ModProfilePanelProps = {
@@ -21,6 +22,10 @@ type ModProfilePanelProps = {
   setupLocked: boolean;
   matchFinished: boolean;
   onStartFresh: () => void;
+  onExportSetup: () => void;
+  onLoadSetup: (file: File) => Promise<void>;
+  setupFeedback?: ProfileFeedback | null;
+  setupBusy?: boolean;
 };
 
 export function ModProfilePanel({
@@ -44,10 +49,60 @@ export function ModProfilePanel({
   setupLocked,
   matchFinished,
   onStartFresh,
+  onExportSetup,
+  onLoadSetup,
+  setupFeedback,
+  setupBusy,
 }: ModProfilePanelProps) {
+  const setupFileInput = useRef<HTMLInputElement>(null);
   return (
     <details style={styles.section}>
       <summary style={styles.summary}>🔌 Community Mod Profile Loader</summary>
+      <button
+        type="button"
+        onClick={onExportSetup}
+        disabled={!enabled || setupBusy}
+        aria-describedby="setup-feedback setup-note"
+        style={styles.button}
+      >
+        Export setup
+      </button>{" "}
+      <button
+        type="button"
+        onClick={() => setupFileInput.current?.click()}
+        disabled={!enabled || setupBusy}
+        aria-describedby="setup-feedback setup-note"
+        style={styles.button}
+      >
+        Load setup
+      </button>
+      <input
+        ref={setupFileInput}
+        type="file"
+        accept=".json"
+        aria-label="Setup JSON file"
+        hidden
+        disabled={!enabled || setupBusy}
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = "";
+          if (file) void onLoadSetup(file);
+        }}
+      />
+      <p
+        id="setup-feedback"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        style={{ ...styles.feedback, color: setupFeedback?.kind === "error" ? "#ff9999" : "#70d6a4" }}
+      >
+        {setupFeedback?.text}
+      </p>
+      <p id="setup-note" role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
+        {enabled
+          ? "Loading a setup replaces the local sandbox and all loaded profiles after confirmation."
+          : "Setup files are available only in the ready local WASM sandbox, not in network mode."}
+      </p>
       <label style={styles.label} htmlFor="mod-profile-json">
         Paste a mod profile or profile batch as JSON
       </label>

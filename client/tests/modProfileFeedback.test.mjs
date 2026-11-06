@@ -31,6 +31,8 @@ const props = {
   setupLocked: false,
   matchFinished: false,
   onStartFresh: noop,
+  onExportSetup: noop,
+  onLoadSetup: async () => {},
 };
 
 const renderPanel = (overrides = {}) =>
@@ -125,4 +127,28 @@ test("the next attempt can clear either feedback region independently", () => {
   const deployCleared = renderPanel({ loadFeedback: error, deployFeedback: null });
   assert.match(region(deployCleared, "mod-profile-deploy-feedback"), /><\/p>$/);
   assert.match(region(deployCleared, "mod-profile-load-feedback"), /Error: core rejection/);
+});
+
+test("setup controls have a JSON picker and preserve exact escaped inline core feedback", () => {
+  const reason = "invalid setup: unknown field `rules`\n<detail>";
+  const html = renderPanel({ setupFeedback: { kind: "error", text: reason } });
+  const markup = region(html, "setup-feedback");
+  assertAccessible(markup);
+  assert.match(markup, /color:#ff9999/);
+  assert.ok(markup.includes("invalid setup: unknown field `rules`\n&lt;detail&gt;"));
+  assert.doesNotMatch(markup, /Error:|<detail>/);
+  assert.match(html, /type="file" accept="\.json" aria-label="Setup JSON file"/);
+  for (const label of ["Export setup", "Load setup"]) {
+    assert.match(html, new RegExp(`<button[^>]*aria-describedby="setup-feedback setup-note"[^>]*>${label}</button>`));
+  }
+});
+
+test("setup controls are disabled with a network explanation, and success uses the existing style", () => {
+  const html = renderPanel({ enabled: false });
+  for (const label of ["Export setup", "Load setup"]) {
+    assert.match(html, new RegExp(`<button[^>]*disabled=""[^>]*>${label}</button>`));
+  }
+  assert.match(html, /not in network mode/);
+  const success = renderPanel({ setupFeedback: { kind: "success", text: "Setup loaded" } });
+  assert.match(region(success, "setup-feedback"), /color:#70d6a4.*>Setup loaded<\/p>/);
 });

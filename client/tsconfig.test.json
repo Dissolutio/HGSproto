@@ -10,5 +10,5 @@
     "rootDir": "src",
     "outDir": ".test-build"
   },
-  "files": ["src/game/sandboxPersistence.ts", "src/game/components/ModProfilePanel.tsx"]
+  "files": ["src/game/sandboxPersistence.ts", "src/game/setupFiles.ts", "src/game/components/ModProfilePanel.tsx"]
 }
