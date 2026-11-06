@@ -412,7 +412,18 @@ pub(crate) fn replace_with_staged_match(
     match_id: String,
     state: GameState,
     flow: MatchFlow,
-    setup_record: crate::setup::SetupRecord,
+    setup_record: Option<crate::setup::SetupRecord>,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    commit_staged_match(match_id, state, flow, setup_record, true, commit_with_locks)
+}
+
+fn commit_staged_match(
+    match_id: String,
+    state: GameState,
+    flow: MatchFlow,
+    setup_record: Option<crate::setup::SetupRecord>,
+    release_sessions: bool,
     commit_with_locks: impl FnOnce(),
 ) -> Result<(), String> {
     let mut matches = ACTIVE_MATCHES
@@ -424,12 +435,36 @@ pub(crate) fn replace_with_staged_match(
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
     commit_with_locks();
-    release_player_session(&match_id, "Player_1");
-    release_player_session(&match_id, "Player_2");
+    if release_sessions {
+        release_player_session(&match_id, "Player_1");
+        release_player_session(&match_id, "Player_2");
+    }
     flows.insert(match_id.clone(), flow);
-    setup_records.insert(match_id.clone(), setup_record);
+    if let Some(setup_record) = setup_record {
+        setup_records.insert(match_id.clone(), setup_record);
+    } else {
+        setup_records.remove(&match_id);
+    }
     matches.insert(match_id, state);
     Ok(())
+}
+
+pub(crate) fn restore_staged_match_snapshot(
+    match_id: String,
+    mut state: GameState,
+    setup_record: Option<crate::setup::SetupRecord>,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    evaluate_victory(&mut state);
+    let flow = MatchFlow::reference(&state.context)?;
+    commit_staged_match(
+        match_id,
+        state,
+        flow,
+        setup_record,
+        false,
+        commit_with_locks,
+    )
 }
 
 pub(crate) fn reject_explicit_scenario_flow(json: &str) -> Result<(), String> {

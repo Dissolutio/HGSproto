@@ -720,7 +720,7 @@ pub fn apply_setup(match_id: String, json: &str, registry: &ModRegistry) -> Resu
             .map_err(|error| format!("setup: could not record the starting map: {error}"))?,
         roster: setup.roster,
     };
-    crate::engine::replace_with_staged_match(match_id, state, flow, record, || {
+    crate::engine::replace_with_staged_match(match_id, state, flow, Some(record), || {
         *templates = staged_templates;
     })
 }
@@ -787,6 +787,7 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
 mod tests {
     use super::*;
     use crate::{engine, wasm_bridge};
+    use crate::local_sandbox::{export_local_sandbox, restore_local_sandbox};
     use serde_json::json;
 
     // Verbatim JSON from design section 2.6.
@@ -1876,6 +1877,35 @@ mod tests {
             registry.get_template("com.community.goliath").unwrap().components.get("destructible"),
             Some(Component::Destructible { current_life: 12, max_life: 12 })
         ));
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn local_sandbox_v2_round_trip_preserves_section_2_6_setup_and_live_snapshot() {
+        let match_id = format!("local_sandbox_v2_example_{}", std::process::id());
+        let registry = ModRegistry::default();
+        apply_setup(match_id.clone(), VALID, &registry).unwrap();
+        engine::process_action(&match_id, "P1", "M:UNIT_P1_1:Q0R1Z0").unwrap();
+        engine::process_action(&match_id, "P1", "A:UNIT_P1_1:HERO_P2").unwrap();
+
+        let expected_setup: Value =
+            serde_json::from_str(&export_setup(&match_id, &registry).unwrap()).unwrap();
+        let expected_snapshot = match_value(&match_id);
+        let record = export_local_sandbox(&match_id, &registry).unwrap();
+        let saved_record: Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(saved_record["record_version"], 2);
+        assert!(saved_record["setup"].get("profiles").is_none());
+        engine::remove_match(&match_id);
+
+        let restored_registry = ModRegistry::default();
+        assert_eq!(
+            restore_local_sandbox(&match_id, &record, &restored_registry).unwrap(),
+            1
+        );
+        assert_eq!(match_value(&match_id), expected_snapshot);
+        let restored_setup: Value =
+            serde_json::from_str(&export_setup(&match_id, &restored_registry).unwrap()).unwrap();
+        assert_eq!(restored_setup, expected_setup);
         engine::remove_match(&match_id);
     }
 
