@@ -74,6 +74,60 @@ pub struct RosterEntry {
     pub starting_health: i32,
 }
 
+pub(crate) const DEFAULT_SETUP_NAME: &str = "Default sandbox";
+
+#[derive(Debug, Clone)]
+pub(crate) struct SetupRecord {
+    pub(crate) name: String,
+    pub(crate) map: Value,
+    pub(crate) roster: Vec<RosterEntry>,
+}
+
+pub(crate) fn legacy_setup_map(map: &HexoscapeMapFile) -> Result<Value, String> {
+    let mut value = serde_json::to_value(map)
+        .map_err(|error| format!("setup: could not record the starting map: {error}"))?;
+    if let Some(units) = value.get_mut("starterUnits").and_then(Value::as_array_mut) {
+        for (definition, unit) in map.starter_units.iter().zip(units) {
+            if let Some(unit) = unit.as_object_mut() {
+                if unit.get("mod_id").is_some_and(Value::is_null) {
+                    unit.remove("mod_id");
+                }
+                if let Ok(seat) = crate::engine::starter_unit_seat(definition) {
+                    unit.insert("seat".into(), Value::String(seat.into()));
+                } else if unit.get("seat").is_some_and(Value::is_null) {
+                    unit.remove("seat");
+                }
+            }
+        }
+    }
+    Ok(value)
+}
+
+pub(crate) fn inline_legacy_profile_starters(
+    map: &mut Value,
+    starters: &[crate::models::StarterUnitDefinition],
+    state: &crate::models::GameState,
+) -> Result<(), String> {
+    let Some(units) = map.get_mut("starterUnits").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (definition, unit) in starters.iter().zip(units) {
+        if definition.mod_id.is_none() {
+            continue;
+        }
+        let Some(entity) = state.entities.get(&definition.id) else {
+            continue;
+        };
+        let components = serde_json::to_value(&entity.components)
+            .map_err(|error| format!("setup: could not record starter unit: {error}"))?;
+        if let Some(unit) = unit.as_object_mut() {
+            unit.remove("mod_id");
+            unit.insert("components".into(), components);
+        }
+    }
+    Ok(())
+}
+
 // Count containers, not scalar values: the root object is depth one. Refuse
 // duplicate keys before inserting into Value, including opaque metadata.
 struct JsonSeed {
@@ -660,9 +714,73 @@ pub fn apply_setup(match_id: String, json: &str, registry: &ModRegistry) -> Resu
         .templates
         .write()
         .map_err(|_| "mod registry write lock is poisoned".to_string())?;
-    crate::engine::replace_with_staged_match(match_id, state, flow, || {
+    let record = SetupRecord {
+        name: setup.name,
+        map: serde_json::to_value(&setup.map)
+            .map_err(|error| format!("setup: could not record the starting map: {error}"))?,
+        roster: setup.roster,
+    };
+    crate::engine::replace_with_staged_match(match_id, state, flow, record, || {
         *templates = staged_templates;
     })
+}
+
+/// Exports the immutable setup that produced the match, not its live state.
+pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, String> {
+    let templates = registry
+        .templates
+        .read()
+        .map_err(|_| "mod registry read lock is poisoned".to_string())?;
+    let matches = crate::engine::ACTIVE_MATCHES
+        .lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    if !matches.contains_key(match_id) {
+        return Err(format!("Unknown match: {match_id}"));
+    }
+    let flows = crate::engine::match_flows()
+        .lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    if !flows.contains_key(match_id) {
+        return Err(format!("Missing match flow: {match_id}"));
+    }
+    let records = crate::engine::setup_records()
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    let record = records
+        .get(match_id)
+        .ok_or_else(|| "setup: this match has no setup record".to_string())?
+        .clone();
+
+    let profile_ids: std::collections::BTreeSet<_> = record
+        .roster
+        .iter()
+        .map(|entry| entry.profile.as_str())
+        .collect();
+    let mut profiles = Vec::with_capacity(profile_ids.len());
+    for mod_id in profile_ids {
+        let profile = templates
+            .get(mod_id)
+            .ok_or_else(|| format!("setup: profile '{mod_id}' is missing from the registry"))?;
+        profiles.push(profile.clone());
+    }
+    let mut roster = record.roster.clone();
+    roster.sort_by(|left, right| left.slot.cmp(&right.slot));
+    drop(records);
+    drop(flows);
+    drop(matches);
+    drop(templates);
+    let output = serde_json::json!({
+        "setup_version": 1,
+        "name": record.name,
+        "map": record.map,
+        "profiles": profiles,
+        "roster": roster,
+    });
+    let json = serde_json::to_string(&output)
+        .map_err(|error| format!("setup: export serialization failed: {error}"))?;
+    validate_setup(&json)
+        .map_err(|error| format!("setup: recorded setup is not valid: {error}"))?;
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -1593,6 +1711,26 @@ mod tests {
         &snapshot["entities"][unit]["components"][name]["data"]
     }
 
+    fn assert_export_matches_roster(match_id: &str, registry: &ModRegistry) -> Value {
+        let exported: Value = serde_json::from_str(&export_setup(match_id, registry).unwrap()).unwrap();
+        let snapshot = match_value(match_id);
+        for entry in exported["roster"].as_array().unwrap() {
+            let slot = entry["slot"].as_str().unwrap();
+            let seat = entry["seat"].as_str().unwrap();
+            assert_eq!(snapshot["entities"][slot]["mod_id"], entry["profile"]);
+            assert_eq!(
+                component(&snapshot, slot, "destructible")["current_life"],
+                entry["starting_health"]
+            );
+            assert!(component(&snapshot, slot, "tags")["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|label| label == seat));
+        }
+        exported
+    }
+
     #[derive(Debug, PartialEq)]
     struct ApplyPreservation {
         snapshot: String,
@@ -1687,6 +1825,7 @@ mod tests {
         let match_id = format!("apply_example_2_6_{}", std::process::id());
         let registry = ModRegistry::default();
         apply_setup(match_id.clone(), VALID, &registry).unwrap();
+        let setup_before_play = export_setup(&match_id, &registry).unwrap();
         let snapshot = match_value(&match_id);
         assert_eq!(snapshot["context"]["active_player"], "P1");
         assert_eq!(snapshot["context"]["turn_phase"], "movement");
@@ -1722,10 +1861,315 @@ mod tests {
         assert_eq!(component(&after, "HERO_P2", "destructible")["max_life"], 12);
         assert_eq!(after["entities"]["UNIT_P1_1"]["spatial"], json!({"q": 0, "r": 1, "z": 0}));
         assert_eq!(after["context"]["setup_locked"], true);
+        let exported: Value = serde_json::from_str(&export_setup(&match_id, &registry).unwrap()).unwrap();
+        assert_eq!(
+            exported["roster"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["slot"] == "HERO_P2")
+                .unwrap()["starting_health"],
+            10
+        );
+        assert_eq!(export_setup(&match_id, &registry).unwrap(), setup_before_play);
         assert!(matches!(
             registry.get_template("com.community.goliath").unwrap().components.get("destructible"),
             Some(Component::Destructible { current_life: 12, max_life: 12 })
         ));
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn exported_setup_round_trips_to_equal_match_and_canonical_json_value() {
+        let first_id = format!("setup_export_roundtrip_a_{}", std::process::id());
+        let second_id = format!("setup_export_roundtrip_b_{}", std::process::id());
+        let first_registry = ModRegistry::default();
+        let second_registry = ModRegistry::default();
+        apply_setup(first_id.clone(), VALID, &first_registry).unwrap();
+        let first_export = export_setup(&first_id, &first_registry).unwrap();
+        apply_setup(second_id.clone(), &first_export, &second_registry).unwrap();
+        let second_export = export_setup(&second_id, &second_registry).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&first_export).unwrap(),
+            serde_json::from_str::<Value>(&second_export).unwrap()
+        );
+        let first_snapshot = match_value(&first_id);
+        let mut second_snapshot = match_value(&second_id);
+        second_snapshot["context"]["match_id"] = first_id.as_str().into();
+        assert_eq!(first_snapshot, second_snapshot);
+        engine::remove_match(&first_id);
+        engine::remove_match(&second_id);
+    }
+
+    #[test]
+    fn default_sandbox_exports_a_valid_empty_roster_setup() {
+        let match_id = format!("setup_export_default_{}", std::process::id());
+        let registry = ModRegistry::default();
+        let map = r#"{
+            "hexMap": {"name": "Local WASM Sandbox"},
+            "boardPieces": [{
+                "uid": "sandbox-g7", "inventoryID": "g7", "altitude": 0,
+                "rotation": 0, "pieceCoords": {"q": 0, "r": 0, "s": 0}
+            }],
+            "starterUnits": [
+                {"id": "UNIT_P1_1", "components": {
+                    "tags": {"type": "Tags", "data": {"labels": ["Unit", "P1"]}},
+                    "destructible": {"type": "Destructible", "data": {"current_life": 4, "max_life": 4}}
+                }},
+                {"id": "UNIT_P1_2", "components": {
+                    "tags": {"type": "Tags", "data": {"labels": ["Unit", "P1"]}},
+                    "destructible": {"type": "Destructible", "data": {"current_life": 4, "max_life": 4}}
+                }},
+                {"id": "UNIT_P2_1", "components": {
+                    "tags": {"type": "Tags", "data": {"labels": ["Unit", "P2"]}},
+                    "destructible": {"type": "Destructible", "data": {"current_life": 4, "max_life": 4}}
+                }},
+                {"id": "UNIT_P2_2", "components": {
+                    "tags": {"type": "Tags", "data": {"labels": ["Unit", "P2"]}},
+                    "destructible": {"type": "Destructible", "data": {"current_life": 4, "max_life": 4}}
+                }},
+                {"id": "HERO_P1", "components": {
+                    "tags": {"type": "Tags", "data": {"labels": ["Unit", "P1", "Hero"]}},
+                    "destructible": {"type": "Destructible", "data": {"current_life": 8, "max_life": 8}}
+                }},
+                {"id": "HERO_P2", "components": {
+                    "tags": {"type": "Tags", "data": {"labels": ["Unit", "P2", "Hero"]}},
+                    "destructible": {"type": "Destructible", "data": {"current_life": 8, "max_life": 8}}
+                }}
+            ]
+        }"#;
+        engine::try_initialize_from_hexoscape_with_registry(match_id.clone(), map, &registry)
+            .unwrap();
+        let exported: Value = serde_json::from_str(&export_setup(&match_id, &registry).unwrap()).unwrap();
+        assert_eq!(exported["name"], DEFAULT_SETUP_NAME);
+        assert_eq!(exported["roster"], json!([]));
+        validate_setup(&exported.to_string()).unwrap();
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn legacy_profile_starter_is_exported_as_valid_inline_map_data() {
+        let match_id = format!("setup_export_legacy_starter_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry.load_batch(&format!("[{EXISTING_PROFILE}]")).unwrap();
+        let map = r#"{
+            "hexMap": {"name": "Legacy profile map"},
+            "boardPieces": [{
+                "uid": "arena", "inventoryID": "g7", "altitude": 0,
+                "rotation": 0, "pieceCoords": {"q": 0, "r": 0, "s": 0}
+            }],
+            "starterUnits": [{
+                "id": "UNIT_P1_1", "seat": "P1", "mod_id": "com.example.apply_existing"
+            }]
+        }"#;
+        engine::try_initialize_from_hexoscape_with_registry(match_id.clone(), map, &registry)
+            .unwrap();
+        let exported: Value =
+            serde_json::from_str(&export_setup(&match_id, &registry).unwrap()).unwrap();
+        assert_eq!(exported["profiles"], json!([]));
+        assert_eq!(exported["roster"], json!([]));
+        assert!(exported["map"]["starterUnits"][0].get("mod_id").is_none());
+        assert_eq!(
+            exported["map"]["starterUnits"][0]["components"]["destructible"]["data"]
+                ["max_life"],
+            12
+        );
+        validate_setup(&exported.to_string()).unwrap();
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn redeploy_replaces_roster_entry_and_drops_unused_profile() {
+        let match_id = format!("setup_export_redeploy_{}", std::process::id());
+        let mut setup = example();
+        let mut second_profile = setup["profiles"][0].clone();
+        second_profile["mod_id"] = "com.example.alternate".into();
+        second_profile["display_name"] = "Alternate".into();
+        setup["profiles"].as_array_mut().unwrap().push(second_profile);
+        setup["roster"][1]["profile"] = "com.example.alternate".into();
+        let registry = ModRegistry::default();
+        apply_setup(match_id.clone(), &setup.to_string(), &registry).unwrap();
+        assert_export_matches_roster(&match_id, &registry);
+
+        engine::deploy_profile_unit_recorded(
+            &match_id,
+            "HERO_P2",
+            "com.community.goliath",
+            "P2",
+            9,
+            &registry,
+        )
+        .unwrap();
+        let exported = assert_export_matches_roster(&match_id, &registry);
+        assert_eq!(
+            exported["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|profile| profile["mod_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["com.community.goliath"]
+        );
+        assert_eq!(
+            exported["roster"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["slot"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["HERO_P2", "UNIT_P1_1"]
+        );
+        engine::deploy_profile_unit_recorded(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.alternate",
+            "P1",
+            8,
+            &registry,
+        )
+        .unwrap();
+        let exported = assert_export_matches_roster(&match_id, &registry);
+        assert_eq!(
+            exported["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|profile| profile["mod_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["com.community.goliath", "com.example.alternate"]
+        );
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn deploy_to_match_without_setup_record_keeps_legacy_behavior_and_apply_restores_record() {
+        let legacy_id = format!("setup_export_recordless_legacy_{}", std::process::id());
+        let recorded_id = format!("setup_export_recordless_new_{}", std::process::id());
+        let legacy_registry = ModRegistry::default();
+        let recorded_registry = ModRegistry::default();
+        legacy_registry
+            .load_batch(&format!("[{EXISTING_PROFILE}]"))
+            .unwrap();
+        recorded_registry
+            .load_batch(&format!("[{EXISTING_PROFILE}]"))
+            .unwrap();
+        engine::store_match(
+            legacy_id.clone(),
+            engine::generate_test_sandbox(legacy_id.clone()),
+        );
+        engine::store_match(
+            recorded_id.clone(),
+            engine::generate_test_sandbox(recorded_id.clone()),
+        );
+        assert_eq!(
+            export_setup("setup_export_unknown_match", &recorded_registry).unwrap_err(),
+            "Unknown match: setup_export_unknown_match"
+        );
+        let legacy_result = engine::deploy_profile_unit(
+            &legacy_id,
+            "UNIT_P1_1",
+            "com.example.apply_existing",
+            "P1",
+            7,
+            &legacy_registry,
+        )
+        .unwrap();
+        let recorded_result = engine::deploy_profile_unit_recorded(
+            &recorded_id,
+            "UNIT_P1_1",
+            "com.example.apply_existing",
+            "P1",
+            7,
+            &recorded_registry,
+        )
+        .unwrap();
+        assert_eq!(recorded_result, legacy_result);
+        let legacy_snapshot = match_value(&legacy_id);
+        let mut recorded_snapshot = match_value(&recorded_id);
+        recorded_snapshot["context"]["match_id"] = legacy_id.as_str().into();
+        assert_eq!(legacy_snapshot, recorded_snapshot);
+        assert_eq!(
+            export_setup(&recorded_id, &recorded_registry).unwrap_err(),
+            "setup: this match has no setup record"
+        );
+
+        apply_setup(recorded_id.clone(), VALID, &recorded_registry).unwrap();
+        validate_setup(&export_setup(&recorded_id, &recorded_registry).unwrap()).unwrap();
+        engine::remove_match(&legacy_id);
+        engine::remove_match(&recorded_id);
+    }
+
+    #[test]
+    fn locked_or_failed_deploy_and_failed_export_leave_setup_record_unchanged() {
+        let match_id = format!("setup_export_preservation_{}", std::process::id());
+        let registry = ModRegistry::default();
+        apply_setup(match_id.clone(), VALID, &registry).unwrap();
+        let before = export_setup(&match_id, &registry).unwrap();
+        let before_value: Value = serde_json::from_str(&before).unwrap();
+        let profile_batch = before_value["profiles"].to_string();
+        let snapshot_before = match_value(&match_id);
+        let flow_before = engine::get_match_flow(&match_id).unwrap();
+        let registry_before = registry_value(&registry);
+
+        assert!(engine::deploy_profile_unit_recorded(
+            &match_id,
+            "NOT_A_SLOT",
+            "com.community.goliath",
+            "P1",
+            7,
+            &registry,
+        )
+        .is_err());
+        assert_eq!(export_setup(&match_id, &registry).unwrap(), before);
+        assert_eq!(match_value(&match_id), snapshot_before);
+        assert_eq!(engine::get_match_flow(&match_id).unwrap(), flow_before);
+        assert_eq!(registry_value(&registry), registry_before);
+
+        assert!(apply_setup(match_id.clone(), "not json", &registry).is_err());
+        assert_eq!(export_setup(&match_id, &registry).unwrap(), before);
+        assert_eq!(match_value(&match_id), snapshot_before);
+        assert_eq!(engine::get_match_flow(&match_id).unwrap(), flow_before);
+        assert_eq!(registry_value(&registry), registry_before);
+
+        registry.templates.write().unwrap().clear();
+        assert_eq!(
+            export_setup(&match_id, &registry).unwrap_err(),
+            "setup: profile 'com.community.goliath' is missing from the registry"
+        );
+        assert_eq!(match_value(&match_id), snapshot_before);
+        assert_eq!(engine::get_match_flow(&match_id).unwrap(), flow_before);
+        assert!(registry.templates.read().unwrap().is_empty());
+        registry.load_batch(&profile_batch).unwrap();
+        assert_eq!(export_setup(&match_id, &registry).unwrap(), before);
+
+        engine::process_action(&match_id, "P1", "M:UNIT_P1_1:Q0R1Z0").unwrap();
+        assert!(engine::deploy_profile_unit_recorded(
+            &match_id,
+            "UNIT_P2_1",
+            "com.community.goliath",
+            "P2",
+            4,
+            &registry,
+        )
+        .is_err());
+        assert_eq!(export_setup(&match_id, &registry).unwrap(), before);
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn removing_match_removes_setup_record() {
+        let match_id = format!("setup_export_cleanup_{}", std::process::id());
+        let registry = ModRegistry::default();
+        apply_setup(match_id.clone(), VALID, &registry).unwrap();
+        engine::remove_match(&match_id);
+        engine::store_match(
+            match_id.clone(),
+            engine::generate_test_sandbox(match_id.clone()),
+        );
+        assert_eq!(
+            export_setup(&match_id, &registry).unwrap_err(),
+            "setup: this match has no setup record"
+        );
         engine::remove_match(&match_id);
     }
 
