@@ -1,7 +1,11 @@
-//! Self-contained setup v1 validation. Only scratch registries are used here.
+//! Self-contained setup v1 validation and atomic apply. Validation and staging use
+//! scratch registries only; `apply_setup` commits after every check has passed.
 use crate::engine::get_hex_footprint_offsets;
+use crate::flow::MatchFlow;
 use crate::mod_registry::{ModRegistry, UnitTemplate};
-use crate::models::Component;
+use crate::models::{
+    BoardPiece, Component, HexMapInfo, HexoscapeMapFile, PieceCoords, StarterUnitDefinition,
+};
 use serde::de::{DeserializeSeed, Error, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -10,6 +14,7 @@ use std::fmt;
 
 const MAX_SETUP_BYTES: usize = 1_048_576;
 const MAX_DEPTH: usize = 32;
+const MAX_STAGED_SNAPSHOT_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone)]
 pub struct ValidatedSetup {
@@ -550,6 +555,113 @@ pub fn validate_setup(json: &str) -> Result<ValidatedSetup, String> {
         },
         profiles,
         roster,
+    })
+}
+
+fn check_staged_snapshot_size(bytes: usize) -> Result<(), String> {
+    if bytes > MAX_STAGED_SNAPSHOT_BYTES {
+        return Err(format!(
+            "setup: initial match state is {bytes} bytes, over the {MAX_STAGED_SNAPSHOT_BYTES} byte limit"
+        ));
+    }
+    Ok(())
+}
+
+/// Converts a validated setup map into the legacy map shape. Inline starter
+/// components use the profile component parser, as the validator does.
+fn legacy_map_file(map: &SetupMap) -> Result<HexoscapeMapFile, String> {
+    let starter_units = map
+        .starter_units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| {
+            let synthetic = serde_json::json!({
+                "schema_version": 1, "mod_id": "setup.inline",
+                "display_name": "Inline starter", "visual_primitive": "CUBE",
+                "components": unit.components,
+            });
+            let template: UnitTemplate = serde_json::from_value(synthetic)
+                .map_err(|error| format!("map.starterUnits[{index}]: {error}"))?;
+            Ok(StarterUnitDefinition {
+                id: unit.id.clone(),
+                mod_id: None,
+                seat: Some(unit.seat.clone()),
+                components: template.components,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(HexoscapeMapFile {
+        hex_map: HexMapInfo {
+            properties: map.hex_map.clone().into_iter().collect(),
+        },
+        board_pieces: map
+            .board_pieces
+            .iter()
+            .map(|piece| BoardPiece {
+                uid: piece.uid.clone(),
+                inventory_id: piece.inventory_id.clone(),
+                altitude: piece.altitude,
+                rotation: piece.rotation,
+                piece_coords: PieceCoords {
+                    q: piece.piece_coords.q,
+                    r: piece.piece_coords.r,
+                    s: piece.piece_coords.s,
+                },
+            })
+            .collect(),
+        starter_units,
+    })
+}
+
+/// Validates a setup, builds its whole starting match off to the side, and only
+/// then replaces the registry contents and the match in one step (design D2: replace,
+/// never merge). Any failure leaves the registry, match, flow and seat sessions as
+/// they were. Lock order: registry, then ACTIVE_MATCHES, then MATCH_FLOWS.
+pub fn apply_setup(match_id: String, json: &str, registry: &ModRegistry) -> Result<(), String> {
+    let setup = validate_setup(json)?;
+
+    let scratch = ModRegistry::default();
+    scratch
+        .templates
+        .write()
+        .map_err(|_| "mod registry write lock is poisoned".to_string())?
+        .extend(
+            setup
+                .profiles
+                .iter()
+                .map(|template| (template.mod_id.clone(), template.clone())),
+        );
+
+    let map_file = legacy_map_file(&setup.map)?;
+    let mut state = crate::engine::build_map_state(match_id.clone(), map_file, Some(&scratch))?;
+    for (index, entry) in setup.roster.iter().enumerate() {
+        crate::engine::stage_profile_deployment(
+            &mut state,
+            &entry.slot,
+            &entry.profile,
+            &entry.seat,
+            entry.starting_health,
+            &scratch,
+        )
+        .map_err(|error| format!("roster[{index}]: {error}"))?;
+    }
+    let snapshot = serde_json::to_vec(&state)
+        .map_err(|error| format!("setup: could not measure initial match state: {error}"))?;
+    check_staged_snapshot_size(snapshot.len())?;
+    let flow = MatchFlow::reference(&state.context)?;
+    let staged_templates = std::mem::take(
+        &mut *scratch
+            .templates
+            .write()
+            .map_err(|_| "mod registry write lock is poisoned".to_string())?,
+    );
+
+    let mut templates = registry
+        .templates
+        .write()
+        .map_err(|_| "mod registry write lock is poisoned".to_string())?;
+    crate::engine::replace_with_staged_match(match_id, state, flow, || {
+        *templates = staged_templates;
     })
 }
 
@@ -1453,6 +1565,253 @@ mod tests {
             .unwrap()
             .iter()
             .any(|profile| profile["mod_id"] == private_profile));
+        engine::remove_match(&match_id);
+    }
+
+    // ---- S2: atomic apply ----
+
+    const EXISTING_PROFILE: &str = r#"{
+        "schema_version": 1,
+        "mod_id": "com.example.apply_existing",
+        "display_name": "Existing Unit",
+        "visual_primitive": "CUBE",
+        "components": {
+            "destructible": {"current_life": 12, "max_life": 12},
+            "tags": ["Unit", "Heavy"]
+        }
+    }"#;
+
+    fn match_value(match_id: &str) -> Value {
+        serde_json::to_value(&engine::ACTIVE_MATCHES.lock().unwrap()[match_id]).unwrap()
+    }
+
+    fn registry_value(registry: &ModRegistry) -> Value {
+        serde_json::to_value(&*registry.templates.read().unwrap()).unwrap()
+    }
+
+    fn component<'a>(snapshot: &'a Value, unit: &str, name: &str) -> &'a Value {
+        &snapshot["entities"][unit]["components"][name]["data"]
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ApplyPreservation {
+        snapshot: String,
+        flow: crate::flow::MatchFlow,
+        registry: Value,
+    }
+
+    fn apply_preservation(match_id: &str, registry: &ModRegistry) -> ApplyPreservation {
+        let snapshot =
+            serde_json::to_string(&engine::ACTIVE_MATCHES.lock().unwrap()[match_id]).unwrap();
+        ApplyPreservation {
+            snapshot,
+            flow: engine::get_match_flow(match_id).unwrap(),
+            registry: registry_value(registry),
+        }
+    }
+
+    /// A running match whose state has changed through deployment and legal actions,
+    /// with a profile loaded and the P1 seat bound.
+    fn changed_running_match(name: &str) -> (String, ModRegistry) {
+        let match_id = format!("{name}_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry.load_batch(&format!("[{EXISTING_PROFILE}]")).unwrap();
+        engine::store_match(match_id.clone(), engine::generate_test_sandbox(match_id.clone()));
+        engine::deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.apply_existing",
+            "P1",
+            7,
+            &registry,
+        )
+        .unwrap();
+        engine::process_action(&match_id, "P1", "S").unwrap();
+        engine::process_action(&match_id, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
+        engine::rebind_player_session(&match_id, "Player_1").unwrap();
+        let snapshot = match_value(&match_id);
+        assert_eq!(snapshot["context"]["setup_locked"], true);
+        assert_eq!(snapshot["context"]["turn_phase"], "end");
+        assert_eq!(component(&snapshot, "UNIT_P2_1", "destructible")["current_life"], 3);
+        (match_id, registry)
+    }
+
+    /// Valid setup whose staged snapshot exceeds 1 MiB: 300 pieces of 24 hexes.
+    fn oversized_setup() -> String {
+        let pieces: Vec<Value> = (0..300)
+            .map(|index| {
+                json!({ "uid": format!("p{index}"), "inventoryID": "g24", "altitude": 0,
+                    "rotation": 0, "pieceCoords": { "q": index * 6 - 900, "r": 0, "s": 900 - index * 6 } })
+            })
+            .collect();
+        json!({
+            "setup_version": 1, "name": "Oversized",
+            "map": { "hexMap": {}, "boardPieces": pieces },
+            "profiles": [], "roster": []
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn apply_setup_is_reproducible_across_and_within_match_ids() {
+        let first_id = format!("apply_repro_a_{}", std::process::id());
+        let second_id = format!("apply_repro_b_{}", std::process::id());
+        apply_setup(first_id.clone(), VALID, &ModRegistry::default()).unwrap();
+        apply_setup(second_id.clone(), VALID, &ModRegistry::default()).unwrap();
+        let first = match_value(&first_id);
+        let mut second = match_value(&second_id);
+        assert_eq!(second["context"]["match_id"], second_id.as_str());
+        second["context"]["match_id"] = first_id.as_str().into();
+        assert_eq!(first, second);
+        assert_eq!(
+            engine::get_match_flow(&first_id).unwrap(),
+            engine::get_match_flow(&second_id).unwrap()
+        );
+
+        // Change the match, then apply the same file into the same id again.
+        let flow = engine::get_match_flow(&first_id).unwrap();
+        engine::process_action(&first_id, "P1", "S").unwrap();
+        assert_ne!(match_value(&first_id), first);
+        let registry = ModRegistry::default();
+        apply_setup(first_id.clone(), VALID, &registry).unwrap();
+        assert_eq!(match_value(&first_id), first);
+        assert_eq!(engine::get_match_flow(&first_id).unwrap(), flow);
+        apply_setup(first_id.clone(), VALID, &registry).unwrap();
+        assert_eq!(match_value(&first_id), first);
+        engine::remove_match(&first_id);
+        engine::remove_match(&second_id);
+    }
+
+    #[test]
+    fn apply_setup_section_2_6_example_plays_with_fixed_damage_and_unchanged_template() {
+        let match_id = format!("apply_example_2_6_{}", std::process::id());
+        let registry = ModRegistry::default();
+        apply_setup(match_id.clone(), VALID, &registry).unwrap();
+        let snapshot = match_value(&match_id);
+        assert_eq!(snapshot["context"]["active_player"], "P1");
+        assert_eq!(snapshot["context"]["turn_phase"], "movement");
+        assert_eq!(snapshot["context"]["setup_locked"], false);
+        assert_eq!(snapshot["entities"].as_object().unwrap().len(), 11);
+
+        for (unit, current, seat) in [("UNIT_P1_1", 12, "P1"), ("HERO_P2", 10, "P2")] {
+            let destructible = component(&snapshot, unit, "destructible");
+            assert_eq!(destructible["current_life"], current);
+            assert_eq!(destructible["max_life"], 12);
+            assert_eq!(component(&snapshot, unit, "tags")["labels"], json!(["Unit", "Heavy", seat]));
+            assert_eq!(snapshot["entities"][unit]["mod_id"], "com.community.goliath");
+            assert_eq!(snapshot["entities"][unit]["display_name"], "Goliath");
+            assert_eq!(snapshot["entities"][unit]["visual_primitive"], "CUBE");
+        }
+        for (unit, life, labels) in [
+            ("HERO_P1", 8, json!(["Unit", "P1", "Hero"])),
+            ("UNIT_P2_1", 4, json!(["Unit", "P2"])),
+        ] {
+            let destructible = component(&snapshot, unit, "destructible");
+            assert_eq!(destructible["current_life"], life);
+            assert_eq!(destructible["max_life"], life);
+            assert_eq!(component(&snapshot, unit, "tags")["labels"], labels);
+            assert!(snapshot["entities"][unit].get("mod_id").is_none());
+        }
+        assert_eq!(snapshot["entities"]["UNIT_P1_1"]["spatial"], json!({"q": -1, "r": 1, "z": 0}));
+        assert_eq!(snapshot["entities"]["HERO_P2"]["spatial"], json!({"q": 1, "r": 1, "z": 0}));
+
+        engine::process_action(&match_id, "P1", "M:UNIT_P1_1:Q0R1Z0").unwrap();
+        engine::process_action(&match_id, "P1", "A:UNIT_P1_1:HERO_P2").unwrap();
+        let after = match_value(&match_id);
+        assert_eq!(component(&after, "HERO_P2", "destructible")["current_life"], 9);
+        assert_eq!(component(&after, "HERO_P2", "destructible")["max_life"], 12);
+        assert_eq!(after["entities"]["UNIT_P1_1"]["spatial"], json!({"q": 0, "r": 1, "z": 0}));
+        assert_eq!(after["context"]["setup_locked"], true);
+        assert!(matches!(
+            registry.get_template("com.community.goliath").unwrap().components.get("destructible"),
+            Some(Component::Destructible { current_life: 12, max_life: 12 })
+        ));
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_apply_setup_preserves_changed_match_flow_registry_and_seats() {
+        let (match_id, registry) = changed_running_match("apply_failure_preserves");
+        let before = apply_preservation(&match_id, &registry);
+        let oversized = oversized_setup();
+        validate_setup(&oversized).unwrap();
+        let mut missing_profile = example();
+        missing_profile["roster"][0]["profile"] = "com.community.titan".into();
+
+        for (json, expected) in [
+            (
+                missing_profile.to_string(),
+                "roster[0]: profile 'com.community.titan' is not in this setup's profiles".to_string(),
+            ),
+            ("not json".to_string(), "invalid setup JSON: expected ident at line 1 column 2".to_string()),
+            (oversized, String::new()),
+        ] {
+            let error = apply_setup(match_id.clone(), &json, &registry).unwrap_err();
+            if expected.is_empty() {
+                assert!(
+                    error.starts_with("setup: initial match state is ")
+                        && error.ends_with(" bytes, over the 1048576 byte limit"),
+                    "{error}"
+                );
+                let bytes: usize = error["setup: initial match state is ".len()..]
+                    .split(' ').next().unwrap().parse().unwrap();
+                assert!(bytes > 1_048_576);
+            } else {
+                assert_eq!(error, expected);
+            }
+            assert_eq!(apply_preservation(&match_id, &registry), before);
+            assert_eq!(
+                engine::rebind_player_session(&match_id, "Player_1").unwrap_err(),
+                "Player seat is already active: Player_1"
+            );
+        }
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn staged_snapshot_limit_allows_exactly_one_mib_and_refuses_one_more_byte() {
+        assert_eq!(check_staged_snapshot_size(1_048_576), Ok(()));
+        assert_eq!(
+            check_staged_snapshot_size(1_048_577).unwrap_err(),
+            "setup: initial match state is 1048577 bytes, over the 1048576 byte limit"
+        );
+    }
+
+    #[test]
+    fn apply_setup_replaces_registry_contents_instead_of_merging() {
+        let match_id = format!("apply_replaces_registry_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry.load_batch(&format!("[{EXISTING_PROFILE}]")).unwrap();
+        apply_setup(match_id.clone(), VALID, &registry).unwrap();
+        let templates = registry.templates.read().unwrap();
+        assert_eq!(templates.keys().collect::<Vec<_>>(), ["com.community.goliath"]);
+        drop(templates);
+        assert!(registry.get_template("com.example.apply_existing").is_err());
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn apply_setup_replaces_locked_in_progress_match_and_releases_seats() {
+        let (match_id, registry) = changed_running_match("apply_replaces_locked");
+        engine::rebind_player_session(&match_id, "Player_2").unwrap();
+        apply_setup(match_id.clone(), VALID, &registry).unwrap();
+
+        let snapshot = match_value(&match_id);
+        assert_eq!(snapshot["context"]["match_id"], match_id.as_str());
+        assert_eq!(snapshot["context"]["setup_locked"], false);
+        assert_eq!(snapshot["context"]["active_player"], "P1");
+        assert_eq!(snapshot["context"]["turn_phase"], "movement");
+        assert!(snapshot["context"].get("winner").is_none());
+        assert!(snapshot["entities"].get("UNIT_P1_2").is_none());
+        assert_eq!(component(&snapshot, "HERO_P2", "destructible")["current_life"], 10);
+        let flow = engine::get_match_flow(&match_id).unwrap();
+        assert_eq!(flow.cursor.seat_index, 0);
+        assert_eq!(flow.cursor.step_index, 0);
+        assert!(!flow.cursor.finished);
+        engine::rebind_player_session(&match_id, "Player_1").unwrap();
+        engine::rebind_player_session(&match_id, "Player_2").unwrap();
+        engine::deploy_profile_unit(&match_id, "UNIT_P2_1", "com.community.goliath", "P2", 5, &registry)
+            .unwrap();
         engine::remove_match(&match_id);
     }
 }

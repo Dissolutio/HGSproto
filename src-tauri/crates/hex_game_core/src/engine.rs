@@ -216,6 +216,34 @@ fn try_initialize_map_file(
     registry: Option<&ModRegistry>,
     replace_existing: bool,
 ) -> Result<(), String> {
+    let game_state = build_map_state(match_id.clone(), map_file, registry)?;
+
+    let mut matches = ACTIVE_MATCHES
+        .lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    if replace_existing || !matches.contains_key(&match_id) {
+        let flow = MatchFlow::reference(&game_state.context)?;
+        flows.insert(match_id.clone(), flow);
+    }
+    if replace_existing {
+        release_player_session(&match_id, "Player_1");
+        release_player_session(&match_id, "Player_2");
+        matches.insert(match_id, game_state);
+    } else {
+        matches.entry(match_id).or_insert(game_state);
+    }
+    Ok(())
+}
+
+/// Builds the starting `GameState` for a parsed map without storing it anywhere.
+/// The legacy initializers and the setup apply both use this builder.
+pub(crate) fn build_map_state(
+    match_id: String,
+    map_file: HexoscapeMapFile,
+    registry: Option<&ModRegistry>,
+) -> Result<GameState, String> {
     let properties = map_file.hex_map.properties.iter()
         .map(|(key, value)| (key.clone(), value.clone())).collect();
     crate::flow::reject_metadata_flow(&properties)?;
@@ -341,22 +369,29 @@ fn try_initialize_map_file(
         game_state.entities.insert(entity.id.clone(), entity);
     }
 
+    Ok(game_state)
+}
+
+/// Commits a fully staged match in one step, replacing any match with the same id.
+/// `commit_with_locks` runs only after ACTIVE_MATCHES and MATCH_FLOWS are both held,
+/// so a caller holding an earlier lock (the mod registry) can mutate its own state
+/// in the same step. Nothing is mutated before every lock is acquired.
+pub(crate) fn replace_with_staged_match(
+    match_id: String,
+    state: GameState,
+    flow: MatchFlow,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
     let mut matches = ACTIVE_MATCHES
         .lock()
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
-    if replace_existing || !matches.contains_key(&match_id) {
-        let flow = MatchFlow::reference(&game_state.context)?;
-        flows.insert(match_id.clone(), flow);
-    }
-    if replace_existing {
-        release_player_session(&match_id, "Player_1");
-        release_player_session(&match_id, "Player_2");
-        matches.insert(match_id, game_state);
-    } else {
-        matches.entry(match_id).or_insert(game_state);
-    }
+    commit_with_locks();
+    release_player_session(&match_id, "Player_1");
+    release_player_session(&match_id, "Player_2");
+    flows.insert(match_id.clone(), flow);
+    matches.insert(match_id, state);
     Ok(())
 }
 
@@ -419,6 +454,57 @@ pub fn deploy_profile_unit(
     starting_life: i32,
     registry: &ModRegistry,
 ) -> Result<String, String> {
+    let prepared = prepare_profile_deployment(slot_unit_id, mod_id, seat, starting_life, registry)?;
+
+    let mut matches = ACTIVE_MATCHES
+        .lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    let state = matches
+        .get_mut(match_id)
+        .ok_or_else(|| format!("Unknown match: {match_id}"))?;
+    let deployed = check_profile_deployment(state, slot_unit_id, mod_id, seat, prepared)?;
+    let display_name = deployed.display_name.clone();
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let flow = flows.get_mut(match_id)
+        .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    commit_profile_deployment(state, deployed);
+    if state.context.turn_phase == TurnPhase::Finished {
+        flow.finish();
+    }
+    Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
+}
+
+/// Applies `deploy_profile_unit`'s rules to a staged state that is not stored
+/// anywhere. The caller derives the match flow from the staged context afterwards.
+pub(crate) fn stage_profile_deployment(
+    state: &mut GameState,
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    starting_life: i32,
+    registry: &ModRegistry,
+) -> Result<String, String> {
+    let prepared = prepare_profile_deployment(slot_unit_id, mod_id, seat, starting_life, registry)?;
+    let deployed = check_profile_deployment(state, slot_unit_id, mod_id, seat, prepared)?;
+    let display_name = deployed.display_name.clone();
+    commit_profile_deployment(state, deployed);
+    Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
+}
+
+struct PreparedDeployment {
+    components: HashMap<String, Component>,
+    visual_primitive: Option<String>,
+    display_name: Option<String>,
+}
+
+fn prepare_profile_deployment(
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    starting_life: i32,
+    registry: &ModRegistry,
+) -> Result<PreparedDeployment, String> {
     if !matches!(seat, "P1" | "P2") {
         return Err("seat must be 'P1' or 'P2'".to_string());
     }
@@ -446,13 +532,16 @@ pub fn deploy_profile_unit(
         return Err(format!("starting health must be within 1..={max_life}"));
     }
     *current_life = starting_life;
+    Ok(PreparedDeployment { components, visual_primitive, display_name })
+}
 
-    let mut matches = ACTIVE_MATCHES
-        .lock()
-        .map_err(|_| "Match registry is unavailable".to_string())?;
-    let state = matches
-        .get_mut(match_id)
-        .ok_or_else(|| format!("Unknown match: {match_id}"))?;
+fn check_profile_deployment(
+    state: &GameState,
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    prepared: PreparedDeployment,
+) -> Result<Entity, String> {
     if state.context.setup_locked
         || state.context.turn_phase == TurnPhase::Finished
         || state.context.winner.is_some()
@@ -475,24 +564,19 @@ pub fn deploy_profile_unit(
         ));
     }
 
-    let deployed = Entity {
+    Ok(Entity {
         id: slot_unit_id.to_string(),
         spatial: existing.spatial.clone(),
-        components,
-        visual_primitive,
-        display_name: display_name.clone(),
+        components: prepared.components,
+        visual_primitive: prepared.visual_primitive,
+        display_name: prepared.display_name,
         mod_id: Some(mod_id.to_string()),
-    };
-    let mut flows = MATCH_FLOWS.lock()
-        .map_err(|_| "Match flow registry is unavailable".to_string())?;
-    let flow = flows.get_mut(match_id)
-        .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
-    state.entities.insert(slot_unit_id.to_string(), deployed);
+    })
+}
+
+fn commit_profile_deployment(state: &mut GameState, deployed: Entity) {
+    state.entities.insert(deployed.id.clone(), deployed);
     evaluate_victory(state);
-    if state.context.turn_phase == TurnPhase::Finished {
-        flow.finish();
-    }
-    Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
 }
 
 fn starter_unit_seat(unit: &StarterUnitDefinition) -> Result<&'static str, String> {
@@ -2366,5 +2450,158 @@ mod tests {
         let restored = &matches[&match_id];
         assert_eq!(restored.context.turn_phase, TurnPhase::Finished);
         assert_eq!(restored.context.winner.as_deref(), Some("P1"));
+    }
+
+    // ---- S2: the extracted builders keep the legacy behavior ----
+
+    const EQUALITY_MAPS: [&str; 3] = [
+        r#"{"hexMap": {"name": "default"}, "boardPieces": [
+            {"uid": "g7", "inventoryID": "g7", "altitude": 0, "rotation": 0,
+             "pieceCoords": {"q": 0, "r": 0, "s": 0}}]}"#,
+        r#"{"hexMap": {}, "boardPieces": [
+            {"uid": "a", "inventoryID": "r24", "altitude": 2, "rotation": 3,
+             "pieceCoords": {"q": 4, "r": -2, "s": -2}},
+            {"uid": "b", "inventoryID": "wallWalk9", "altitude": 0, "rotation": -1,
+             "pieceCoords": {"q": -3, "r": 1, "s": 2}},
+            {"uid": "c", "inventoryID": "s3", "altitude": 0, "rotation": 1,
+             "pieceCoords": {"q": 0, "r": 0, "s": 0}}],
+          "starterUnits": [
+            {"id": "MOD_P2", "mod_id": "com.example.preservation", "seat": "P2"},
+            {"id": "INLINE_P1", "player": "P1", "components": {
+                "tags": {"type": "Tags", "data": {"labels": ["Unit", "P1"]}},
+                "destructible": {"type": "Destructible", "data": {"current_life": 3, "max_life": 5}}}},
+            {"id": "MOD_P1", "mod_id": "com.example.preservation", "owner": "Player_1"}]}"#,
+        r#"{"hexMap": {}, "boardPieces": [
+            {"uid": "solo", "inventoryID": "g2", "altitude": 0, "rotation": 0,
+             "pieceCoords": {"q": 0, "r": 0, "s": 0}}],
+          "starterUnits": [{"id": "SOLO_P1", "seat": "P1", "components": {
+            "tags": {"type": "Tags", "data": {"labels": ["Unit", "P1"]}},
+            "destructible": {"type": "Destructible", "data": {"current_life": 2, "max_life": 2}}}}]}"#,
+    ];
+
+    fn equality_registry() -> ModRegistry {
+        let registry = ModRegistry::default();
+        registry.load_batch(&format!("[{PRESERVATION_PROFILE}]")).unwrap();
+        registry
+    }
+
+    fn built(match_id: &str, map_json: &str, registry: Option<&ModRegistry>) -> GameState {
+        build_map_state(match_id.into(), serde_json::from_str(map_json).unwrap(), registry).unwrap()
+    }
+
+    fn stored_value(match_id: &str) -> serde_json::Value {
+        serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[match_id]).unwrap()
+    }
+
+    #[test]
+    fn legacy_initializers_match_extracted_map_builder() {
+        let registry = equality_registry();
+        for (index, map_json) in EQUALITY_MAPS.iter().enumerate() {
+            let init_id = format!("builder_equality_init_{index}_{}", std::process::id());
+            let reset_id = format!("builder_equality_reset_{index}_{}", std::process::id());
+            try_initialize_from_hexoscape_with_registry(init_id.clone(), map_json, &registry).unwrap();
+            store_match(reset_id.clone(), generate_test_sandbox(reset_id.clone()));
+            process_action(&reset_id, "P1", "S").unwrap();
+            try_reset_from_hexoscape_with_registry(reset_id.clone(), map_json, &registry).unwrap();
+            for match_id in [&init_id, &reset_id] {
+                let staged = built(match_id, map_json, Some(&registry));
+                assert_eq!(stored_value(match_id), serde_json::to_value(&staged).unwrap());
+                assert_eq!(get_match_flow(match_id).unwrap(), MatchFlow::reference(&staged.context).unwrap());
+                remove_match(match_id);
+            }
+        }
+        // The registry-free legacy entry point.
+        let match_id = format!("builder_equality_plain_{}", std::process::id());
+        initialize_from_hexoscape(match_id.clone(), serde_json::from_str(EQUALITY_MAPS[0]).unwrap());
+        assert_eq!(
+            stored_value(&match_id),
+            serde_json::to_value(built(&match_id, EQUALITY_MAPS[0], None)).unwrap()
+        );
+        remove_match(&match_id);
+        assert_eq!(
+            build_map_state("x".into(), serde_json::from_str(EQUALITY_MAPS[1]).unwrap(), None)
+                .unwrap_err(),
+            "Starter unit 'MOD_P2' references mod 'com.example.preservation', but no mod registry was provided"
+        );
+    }
+
+    #[test]
+    fn staged_deployment_matches_deploy_profile_unit_results_errors_and_flow() {
+        let registry = equality_registry();
+        let mod_id = "com.example.preservation";
+        let match_id = format!("staged_deploy_equality_{}", std::process::id());
+        try_initialize_from_hexoscape_with_registry(match_id.clone(), EQUALITY_MAPS[0], &registry).unwrap();
+        let mut staged = built(&match_id, EQUALITY_MAPS[0], Some(&registry));
+
+        for (slot, seat, life) in [("UNIT_P1_1", "P1", 12), ("HERO_P2", "P2", 5), ("UNIT_P1_1", "P1", 3)] {
+            assert_eq!(
+                deploy_profile_unit(&match_id, slot, mod_id, seat, life, &registry),
+                stage_profile_deployment(&mut staged, slot, mod_id, seat, life, &registry)
+            );
+            assert_eq!(stored_value(&match_id), serde_json::to_value(&staged).unwrap());
+        }
+        let before = stored_value(&match_id);
+        for (slot, profile, seat, life) in [
+            ("MISSING_UNIT", mod_id, "P1", 7),
+            ("TILE_g7_0", mod_id, "P1", 7),
+            ("UNIT_P1_1", mod_id, "P2", 7),
+            ("UNIT_P1_1", mod_id, "P3", 7),
+            ("UNIT_P1_1", mod_id, "P1", 0),
+            ("UNIT_P1_1", mod_id, "P1", 13),
+            ("UNIT_P1_1", "com.unknown.preservation", "P1", 7),
+        ] {
+            let live = deploy_profile_unit(&match_id, slot, profile, seat, life, &registry);
+            assert!(live.is_err());
+            assert_eq!(live, stage_profile_deployment(&mut staged, slot, profile, seat, life, &registry));
+            assert_eq!(stored_value(&match_id), before);
+            assert_eq!(serde_json::to_value(&staged).unwrap(), before);
+        }
+        process_action(&match_id, "P1", "S").unwrap();
+        staged.context.setup_locked = true;
+        assert_eq!(
+            deploy_profile_unit(&match_id, "UNIT_P1_2", mod_id, "P1", 7, &registry),
+            stage_profile_deployment(&mut staged, "UNIT_P1_2", mod_id, "P1", 7, &registry)
+        );
+        remove_match(&match_id);
+
+        // A deployment that leaves one seat with no units finishes the match; the flow
+        // derived from the staged context equals the live flow after `finish()`.
+        let solo_id = format!("staged_deploy_victory_{}", std::process::id());
+        try_initialize_from_hexoscape_with_registry(solo_id.clone(), EQUALITY_MAPS[2], &registry).unwrap();
+        let mut solo = built(&solo_id, EQUALITY_MAPS[2], Some(&registry));
+        assert_eq!(
+            deploy_profile_unit(&solo_id, "SOLO_P1", mod_id, "P1", 4, &registry),
+            stage_profile_deployment(&mut solo, "SOLO_P1", mod_id, "P1", 4, &registry)
+        );
+        assert_eq!(solo.context.turn_phase, TurnPhase::Finished);
+        assert_eq!(stored_value(&solo_id), serde_json::to_value(&solo).unwrap());
+        assert_eq!(get_match_flow(&solo_id).unwrap(), MatchFlow::reference(&solo.context).unwrap());
+        remove_match(&solo_id);
+    }
+
+    /// Source check of the documented lock order: in every non-test function of this
+    /// file that locks MATCH_FLOWS, ACTIVE_MATCHES is named earlier in the same function.
+    /// MATCH_FLOWS is private to this file, so no other module can lock it. This is a
+    /// textual check, not a runtime lock-order detector.
+    #[test]
+    fn match_flows_is_never_locked_before_active_matches() {
+        let source = include_str!("engine.rs");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod ").unwrap()];
+        let mut sites = 0;
+        for (position, _) in production.match_indices("MATCH_FLOWS.lock()") {
+            let function_start = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|marker| production[..position].rfind(marker))
+                .max()
+                .unwrap();
+            let body = &production[function_start..position];
+            assert!(
+                body.contains("ACTIVE_MATCHES"),
+                "MATCH_FLOWS locked before ACTIVE_MATCHES in: {}",
+                body.lines().nth(1).unwrap_or_default()
+            );
+            sites += 1;
+        }
+        assert_eq!(sites, 8, "update this check when lock sites change");
     }
 }
