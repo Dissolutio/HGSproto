@@ -51,7 +51,7 @@ pub fn wasm_deploy_profile_unit(
     seat: String,
     starting_life: i32,
 ) -> Result<String, JsValue> {
-    engine::deploy_profile_unit(
+    engine::deploy_profile_unit_recorded(
         &match_id,
         &slot_unit_id,
         &mod_id,

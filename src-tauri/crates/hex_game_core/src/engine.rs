@@ -16,9 +16,20 @@ pub static ACTIVE_MATCHES: LazyLock<Mutex<HashMap<String, GameState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_PLAYER_SESSIONS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-// Always acquire ACTIVE_MATCHES before MATCH_FLOWS so both records commit together.
+// Lock order: mod registry when needed, ACTIVE_MATCHES, MATCH_FLOWS, setup records.
 static MATCH_FLOWS: LazyLock<Mutex<HashMap<String, MatchFlow>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// Setup records are always acquired after ACTIVE_MATCHES and MATCH_FLOWS.
+static MATCH_SETUP_RECORDS: LazyLock<Mutex<HashMap<String, crate::setup::SetupRecord>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn match_flows() -> &'static Mutex<HashMap<String, MatchFlow>> {
+    &MATCH_FLOWS
+}
+
+pub(crate) fn setup_records() -> &'static Mutex<HashMap<String, crate::setup::SetupRecord>> {
+    &MATCH_SETUP_RECORDS
+}
 
 /// Generates a hardcoded test sandbox with a small board and 2 units per player.
 pub fn generate_test_sandbox(match_id: String) -> GameState {
@@ -121,6 +132,10 @@ fn try_store_match(match_id: String, state: GameState) -> Result<(), String> {
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    setup_records.remove(&match_id);
     flows.insert(match_id.clone(), flow);
     matches.insert(match_id, state);
     Ok(())
@@ -141,10 +156,14 @@ pub fn get_match_flow(match_id: &str) -> Result<MatchFlow, String> {
 pub fn remove_match(match_id: &str) {
     if let Ok(mut matches) = ACTIVE_MATCHES.lock() {
         match MATCH_FLOWS.lock() {
-            Ok(mut flows) => {
-                matches.remove(match_id);
-                flows.remove(match_id);
-            }
+            Ok(mut flows) => match MATCH_SETUP_RECORDS.lock() {
+                Ok(mut setup_records) => {
+                    matches.remove(match_id);
+                    flows.remove(match_id);
+                    setup_records.remove(match_id);
+                }
+                Err(_) => eprintln!("Could not remove match: setup registry is unavailable"),
+            },
             Err(_) => eprintln!("Could not remove match: flow registry is unavailable"),
         }
     }
@@ -216,16 +235,29 @@ fn try_initialize_map_file(
     registry: Option<&ModRegistry>,
     replace_existing: bool,
 ) -> Result<(), String> {
+    let mut setup_map = crate::setup::legacy_setup_map(&map_file)?;
+    let legacy_starters = map_file.starter_units.clone();
     let game_state = build_map_state(match_id.clone(), map_file, registry)?;
+    crate::setup::inline_legacy_profile_starters(&mut setup_map, &legacy_starters, &game_state)?;
+    let setup_record = crate::setup::SetupRecord {
+        name: crate::setup::DEFAULT_SETUP_NAME.to_string(),
+        map: setup_map,
+        roster: Vec::new(),
+    };
+    let flow = MatchFlow::reference(&game_state.context)?;
 
     let mut matches = ACTIVE_MATCHES
         .lock()
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
-    if replace_existing || !matches.contains_key(&match_id) {
-        let flow = MatchFlow::reference(&game_state.context)?;
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    let should_insert = replace_existing || !matches.contains_key(&match_id);
+    if should_insert {
         flows.insert(match_id.clone(), flow);
+        setup_records.insert(match_id.clone(), setup_record);
     }
     if replace_existing {
         release_player_session(&match_id, "Player_1");
@@ -373,13 +405,14 @@ pub(crate) fn build_map_state(
 }
 
 /// Commits a fully staged match in one step, replacing any match with the same id.
-/// `commit_with_locks` runs only after ACTIVE_MATCHES and MATCH_FLOWS are both held,
-/// so a caller holding an earlier lock (the mod registry) can mutate its own state
-/// in the same step. Nothing is mutated before every lock is acquired.
+/// `commit_with_locks` runs only after ACTIVE_MATCHES, MATCH_FLOWS, and the setup
+/// records are held, so a caller holding the earlier mod registry lock can commit
+/// its own state in the same step. Nothing is mutated before every lock is acquired.
 pub(crate) fn replace_with_staged_match(
     match_id: String,
     state: GameState,
     flow: MatchFlow,
+    setup_record: crate::setup::SetupRecord,
     commit_with_locks: impl FnOnce(),
 ) -> Result<(), String> {
     let mut matches = ACTIVE_MATCHES
@@ -387,10 +420,14 @@ pub(crate) fn replace_with_staged_match(
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
     commit_with_locks();
     release_player_session(&match_id, "Player_1");
     release_player_session(&match_id, "Player_2");
     flows.insert(match_id.clone(), flow);
+    setup_records.insert(match_id.clone(), setup_record);
     matches.insert(match_id, state);
     Ok(())
 }
@@ -454,7 +491,17 @@ pub fn deploy_profile_unit(
     starting_life: i32,
     registry: &ModRegistry,
 ) -> Result<String, String> {
-    let prepared = prepare_profile_deployment(slot_unit_id, mod_id, seat, starting_life, registry)?;
+    if !matches!(seat, "P1" | "P2") {
+        return Err("seat must be 'P1' or 'P2'".to_string());
+    }
+    let templates = registry
+        .templates
+        .read()
+        .map_err(|_| "mod registry read lock is poisoned".to_string())?;
+    let template = templates.get(mod_id).ok_or_else(|| {
+        format!("Starter unit '{slot_unit_id}' references unknown mod_id '{mod_id}'")
+    })?;
+    let prepared = prepare_profile_deployment_from_template(seat, mod_id, starting_life, template)?;
 
     let mut matches = ACTIVE_MATCHES
         .lock()
@@ -468,11 +515,41 @@ pub fn deploy_profile_unit(
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     let flow = flows.get_mut(match_id)
         .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
     commit_profile_deployment(state, deployed);
+    if let Some(record) = setup_records.get_mut(match_id) {
+        let entry = crate::setup::RosterEntry {
+            slot: slot_unit_id.to_string(),
+            seat: seat.to_string(),
+            profile: mod_id.to_string(),
+            starting_health: starting_life,
+        };
+        if let Some(existing) = record.roster.iter_mut().find(|item| item.slot == slot_unit_id) {
+            *existing = entry;
+        } else {
+            record.roster.push(entry);
+        }
+        record.roster.sort_by(|left, right| left.slot.cmp(&right.slot));
+    }
     if state.context.turn_phase == TurnPhase::Finished {
         flow.finish();
     }
     Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
+}
+
+/// Deploys a profile and keeps the match's setup record in step when one exists.
+/// Restored matches without a setup record retain the legacy deployment behavior.
+pub fn deploy_profile_unit_recorded(
+    match_id: &str,
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    starting_life: i32,
+    registry: &ModRegistry,
+) -> Result<String, String> {
+    deploy_profile_unit(match_id, slot_unit_id, mod_id, seat, starting_life, registry)
 }
 
 /// Applies `deploy_profile_unit`'s rules to a staged state that is not stored
@@ -509,14 +586,36 @@ fn prepare_profile_deployment(
         return Err("seat must be 'P1' or 'P2'".to_string());
     }
 
-    let starter = StarterUnitDefinition {
-        id: slot_unit_id.to_string(),
-        mod_id: Some(mod_id.to_string()),
-        seat: Some(seat.to_string()),
-        components: HashMap::new(),
+    let template = registry.get_template(mod_id).map_err(|error| {
+        if error.starts_with("unknown mod_id") {
+            format!("Starter unit '{slot_unit_id}' references {error}")
+        } else {
+            error
+        }
+    })?;
+    prepare_profile_deployment_from_template(seat, mod_id, starting_life, &template)
+}
+
+fn prepare_profile_deployment_from_template(
+    seat: &str,
+    mod_id: &str,
+    starting_life: i32,
+    template: &crate::mod_registry::UnitTemplate,
+) -> Result<PreparedDeployment, String> {
+    let mut components = HashMap::new();
+    for key in ["destructible", "tags"] {
+        if let Some(component) = template.components.get(key) {
+            components.insert(key.to_string(), component.clone());
+        }
+    }
+    let labels = match components.remove("tags") {
+        Some(Component::Tags { labels }) => labels,
+        _ => Vec::new(),
     };
-    let (mut components, visual_primitive, display_name) =
-        starter_unit_components(&starter, Some(registry))?;
+    let mut labels = labels;
+    labels.retain(|label| label != "P1" && label != "P2");
+    labels.push(seat.to_string());
+    components.insert("tags".to_string(), Component::Tags { labels });
     let Component::Destructible {
         current_life,
         max_life,
@@ -532,7 +631,11 @@ fn prepare_profile_deployment(
         return Err(format!("starting health must be within 1..={max_life}"));
     }
     *current_life = starting_life;
-    Ok(PreparedDeployment { components, visual_primitive, display_name })
+    Ok(PreparedDeployment {
+        components,
+        visual_primitive: Some(template.visual_primitive.clone()),
+        display_name: Some(template.display_name.clone()),
+    })
 }
 
 fn check_profile_deployment(
@@ -579,7 +682,7 @@ fn commit_profile_deployment(state: &mut GameState, deployed: Entity) {
     evaluate_victory(state);
 }
 
-fn starter_unit_seat(unit: &StarterUnitDefinition) -> Result<&'static str, String> {
+pub(crate) fn starter_unit_seat(unit: &StarterUnitDefinition) -> Result<&'static str, String> {
     let seat_from_value = |value: &str| match value {
         "P1" | "Player_1" => Some("P1"),
         "P2" | "Player_2" => Some("P2"),
