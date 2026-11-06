@@ -5,5 +5,6 @@ pub mod local_sandbox;
 pub mod mod_registry;
 pub mod models;
 pub mod query;
+pub mod setup;
 pub mod templates;
 pub mod wasm_bridge;
