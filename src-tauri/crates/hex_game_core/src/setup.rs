@@ -1,0 +1,1458 @@
+//! Self-contained setup v1 validation. Only scratch registries are used here.
+use crate::engine::get_hex_footprint_offsets;
+use crate::mod_registry::{ModRegistry, UnitTemplate};
+use crate::models::Component;
+use serde::de::{DeserializeSeed, Error, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Number, Value};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+const MAX_SETUP_BYTES: usize = 1_048_576;
+const MAX_DEPTH: usize = 32;
+
+#[derive(Debug, Clone)]
+pub struct ValidatedSetup {
+    pub setup_version: u32,
+    pub name: String,
+    pub map: SetupMap,
+    pub profiles: Vec<UnitTemplate>,
+    pub roster: Vec<RosterEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupMap {
+    #[serde(rename = "hexMap")]
+    pub hex_map: Map<String, Value>,
+    #[serde(rename = "boardPieces")]
+    pub board_pieces: Vec<SetupBoardPiece>,
+    #[serde(rename = "starterUnits", default)]
+    pub starter_units: Vec<SetupStarterUnit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupBoardPiece {
+    pub uid: String,
+    #[serde(rename = "inventoryID")]
+    pub inventory_id: String,
+    pub altitude: i32,
+    pub rotation: i32,
+    #[serde(rename = "pieceCoords")]
+    pub piece_coords: SetupPieceCoords,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupPieceCoords {
+    pub q: i32,
+    pub r: i32,
+    pub s: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupStarterUnit {
+    pub id: String,
+    #[serde(alias = "player", alias = "owner")]
+    pub seat: String,
+    pub components: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RosterEntry {
+    pub slot: String,
+    pub seat: String,
+    pub profile: String,
+    pub starting_health: i32,
+}
+
+// Count containers, not scalar values: the root object is depth one. Refuse
+// duplicate keys before inserting into Value, including opaque metadata.
+struct JsonSeed {
+    depth: usize,
+    location: String,
+}
+
+impl<'de> DeserializeSeed<'de> for JsonSeed {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
+        de.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for JsonSeed {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+    fn visit_i64<E: Error>(self, value: i64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+    fn visit_u64<E: Error>(self, value: u64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+    fn visit_f64<E: Error>(self, value: f64) -> Result<Value, E> {
+        Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom(format!("{}: invalid JSON number", self.location)))
+    }
+    fn visit_str<E: Error>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.into()))
+    }
+    fn visit_string<E: Error>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+    fn visit_unit<E: Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E: Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        self.check_depth()?;
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(JsonSeed {
+            depth: self.depth + 1,
+            location: format!("{}[{}]", self.location, values.len()),
+        })? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        self.check_depth()?;
+        let mut values = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(A::Error::custom(format!(
+                    "{}: duplicate key '{}'",
+                    self.location, key
+                )));
+            }
+            let location = if key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                if self.location == "invalid setup" {
+                    key.clone()
+                } else {
+                    format!("{}.{}", self.location, key)
+                }
+            } else {
+                format!("{}[{}]", self.location, Value::String(key.clone()))
+            };
+            let value = map.next_value_seed(JsonSeed {
+                depth: self.depth + 1,
+                location,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
+impl JsonSeed {
+    fn check_depth<E: Error>(&self) -> Result<(), E> {
+        if self.depth >= MAX_DEPTH {
+            Err(E::custom(format!(
+                "{}: JSON nesting depth exceeds {MAX_DEPTH}",
+                self.location
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn fields<'a>(
+    value: &'a Value,
+    location: &str,
+    allowed: &[&str],
+    required: &[&str],
+) -> Result<&'a Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{location}: expected an object"))?;
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "{location}: unknown field '{key}', expected one of {}",
+            allowed
+                .iter()
+                .map(|key| format!("'{key}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for key in required {
+        if !object.contains_key(*key) {
+            return Err(format!("{location}: missing field '{key}'"));
+        }
+    }
+    Ok(object)
+}
+
+fn array<'a>(value: &'a Value, location: &str) -> Result<&'a Vec<Value>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| format!("{location}: expected an array"))
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: &Value, location: &str) -> Result<T, String> {
+    serde_json::from_value(value.clone()).map_err(|error| format!("{location}: {error}"))
+}
+
+fn identifier(id: &str, location: &str, field: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(format!(
+            "{location}: {field} must be 1 to 64 bytes of ASCII letters, digits, '_' or '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn seat(seat: &str, location: &str) -> Result<(), String> {
+    if !matches!(seat, "P1" | "P2") {
+        return Err(format!("{location}: seat must be 'P1' or 'P2'"));
+    }
+    Ok(())
+}
+
+fn load_profiles(registry: &ModRegistry, profiles: &[Value]) -> Result<u32, String> {
+    registry
+        .load_batch(&Value::Array(profiles.to_vec()).to_string())
+        .map_err(|error| {
+            // The existing component deserializer iterates a HashMap. When
+            // several components are malformed, select the diagnostic in key
+            // order using that same deserializer, without duplicating rules.
+            for (index, profile) in profiles.iter().enumerate() {
+                let prefix = format!("profile {index}: invalid profile: ");
+                if !error.starts_with(&prefix) {
+                    continue;
+                }
+                let Some(object) = profile.as_object() else {
+                    break;
+                };
+                let Some(components) = object.get("components").and_then(Value::as_object) else {
+                    break;
+                };
+                let mut header = profile.clone();
+                header["components"] = Value::Object(Map::new());
+                if let Err(error) = serde_json::from_value::<UnitTemplate>(header.clone()) {
+                    return format!("{prefix}{error}");
+                }
+                let mut names: Vec<_> = components.keys().collect();
+                names.sort_unstable();
+                for name in names {
+                    header["components"] =
+                        Value::Object(Map::from_iter([(name.clone(), components[name].clone())]));
+                    if let Err(error) = serde_json::from_value::<UnitTemplate>(header.clone()) {
+                        return format!("{prefix}{error}");
+                    }
+                }
+                break;
+            }
+            error
+        })
+}
+
+/// Checks the entire file without accessing any live match or global registry.
+pub fn validate_setup(json: &str) -> Result<ValidatedSetup, String> {
+    if json.len() > MAX_SETUP_BYTES {
+        return Err("invalid setup: file exceeds the 1 MiB setup limit (1048576 bytes)".into());
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let value = JsonSeed {
+        depth: 0,
+        location: "invalid setup".into(),
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| format!("invalid setup JSON: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("invalid setup JSON: {error}"))?;
+
+    let root = value
+        .as_object()
+        .ok_or_else(|| "invalid setup: expected an object".to_string())?;
+    let version = root
+        .get("setup_version")
+        .ok_or_else(|| "setup_version must be the integer 1".to_string())?;
+    if let Some(version) = version.as_u64() {
+        if version > 1 {
+            return Err(format!(
+                "setup_version {version} is newer than this game supports (1)"
+            ));
+        }
+        if version != 1 {
+            return Err("setup_version must be the integer 1".into());
+        }
+    } else {
+        return Err("setup_version must be the integer 1".into());
+    }
+    let envelope_fields = ["setup_version", "name", "map", "profiles", "roster"];
+    let root = fields(&value, "invalid setup", &envelope_fields, &envelope_fields)?;
+    let name: String = decode(&root["name"], "name")?;
+    if name.len() > 128 {
+        return Err("name: exceeds the 128-byte limit".into());
+    }
+
+    let map_fields = ["hexMap", "boardPieces", "starterUnits"];
+    let raw_map = fields(&root["map"], "map", &map_fields, &["hexMap", "boardPieces"])?;
+    let metadata = raw_map["hexMap"]
+        .as_object()
+        .ok_or_else(|| "map.hexMap: expected an object".to_string())?;
+    crate::flow::reject_metadata_flow(metadata).map_err(|error| format!("map.hexMap: {error}"))?;
+    for key in ["rules", "terrain", "health_cap"] {
+        if metadata.contains_key(key) {
+            return Err(format!(
+                "map.hexMap: reserved M3 rule field '{key}' is not supported in setup_version 1"
+            ));
+        }
+    }
+    let mut board_pieces = Vec::new();
+    for (index, value) in array(&raw_map["boardPieces"], "map.boardPieces")?
+        .iter()
+        .enumerate()
+    {
+        let location = format!("map.boardPieces[{index}]");
+        let keys = ["uid", "inventoryID", "altitude", "rotation", "pieceCoords"];
+        let object = fields(value, &location, &keys, &keys)?;
+        let coords = fields(
+            &object["pieceCoords"],
+            &format!("{location}.pieceCoords"),
+            &["q", "r", "s"],
+            &["q", "r", "s"],
+        )?;
+        for key in ["q", "r", "s"] {
+            let n = coords[key]
+                .as_i64()
+                .ok_or_else(|| format!("{location}: pieceCoords.{key} must be an integer"))?;
+            if !(-1000..=1000).contains(&n) {
+                return Err(format!(
+                    "{location}: pieceCoords.{key} out of range (allowed -1000 to 1000)"
+                ));
+            }
+        }
+        let altitude = object["altitude"]
+            .as_i64()
+            .ok_or_else(|| format!("{location}: altitude must be an integer"))?;
+        if !(0..=1000).contains(&altitude) {
+            return Err(format!(
+                "{location}: altitude out of range (allowed 0 to 1000)"
+            ));
+        }
+        let piece: SetupBoardPiece = decode(value, &location)?;
+        identifier(&piece.uid, &location, "uid")?;
+        board_pieces.push(piece);
+    }
+    let mut starter_units = Vec::new();
+    if let Some(units) = raw_map.get("starterUnits") {
+        for (index, value) in array(units, "map.starterUnits")?.iter().enumerate() {
+            let location = format!("map.starterUnits[{index}]");
+            let object = fields(
+                value,
+                &location,
+                &["id", "seat", "player", "owner", "components"],
+                &["id", "components"],
+            )?;
+            let seats = ["seat", "player", "owner"]
+                .iter()
+                .filter(|key| object.contains_key(**key))
+                .count();
+            if seats == 0 {
+                return Err(format!("{location}: missing field 'seat'"));
+            }
+            if seats > 1 {
+                return Err(format!(
+                    "{location}: duplicate field 'seat' (including player/owner aliases)"
+                ));
+            }
+            let unit: SetupStarterUnit = decode(value, &location)?;
+            identifier(&unit.id, &location, "id")?;
+            seat(&unit.seat, &location)?;
+            starter_units.push(unit);
+        }
+    }
+    let mut roster = Vec::new();
+    for (index, value) in array(&root["roster"], "roster")?.iter().enumerate() {
+        let location = format!("roster[{index}]");
+        let keys = ["slot", "seat", "profile", "starting_health"];
+        fields(value, &location, &keys, &keys)?;
+        let entry: RosterEntry = decode(value, &location)?;
+        identifier(&entry.slot, &location, "slot")?;
+        seat(&entry.seat, &location)?;
+        roster.push(entry);
+    }
+
+    let raw_profiles = array(&root["profiles"], "profiles")?;
+    let registry = ModRegistry::default();
+    if !raw_profiles.is_empty() {
+        load_profiles(&registry, raw_profiles).map_err(|error| format!("profiles: {error}"))?;
+    }
+    let profiles = raw_profiles
+        .iter()
+        .map(|profile| decode::<UnitTemplate>(profile, "profiles"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (index, unit) in starter_units.iter().enumerate() {
+        let location = format!("map.starterUnits[{index}]");
+        let scratch = ModRegistry::default();
+        let synthetic = serde_json::json!({
+            "schema_version": 1, "mod_id": "setup.inline",
+            "display_name": "Inline starter", "visual_primitive": "CUBE",
+            "components": unit.components,
+        });
+        load_profiles(&scratch, &[synthetic]).map_err(|error| format!("{location}: {error}"))?;
+        let template = scratch.get_template("setup.inline")?;
+        let Some(Component::Tags { labels }) = template.components.get("tags") else {
+            unreachable!("load_batch requires tags");
+        };
+        let seats: Vec<_> = labels
+            .iter()
+            .filter(|label| matches!(label.as_str(), "P1" | "P2"))
+            .collect();
+        if seats.len() != 1 {
+            return Err(format!(
+                "{location}: tags must include exactly one seat ('P1' or 'P2')"
+            ));
+        }
+        if seats[0] != &unit.seat {
+            return Err(format!(
+                "{location}: tags seat '{}' does not match seat '{}'",
+                seats[0], unit.seat
+            ));
+        }
+    }
+
+    let mut tile_ids = HashSet::new();
+    let mut piece_ids = HashSet::new();
+    let mut spawns = HashSet::new();
+    for (index, piece) in board_pieces.iter().enumerate() {
+        let location = format!("map.boardPieces[{index}]");
+        if !piece_ids.insert(&piece.uid) {
+            return Err(format!("{location}: duplicate uid '{}'", piece.uid));
+        }
+        for (offset_index, (q, r)) in get_hex_footprint_offsets(&piece.inventory_id, piece.rotation)
+            .into_iter()
+            .enumerate()
+        {
+            let q = piece
+                .piece_coords
+                .q
+                .checked_add(q)
+                .ok_or_else(|| format!("{location}: expanded q coordinate overflows"))?;
+            let r = piece
+                .piece_coords
+                .r
+                .checked_add(r)
+                .ok_or_else(|| format!("{location}: expanded r coordinate overflows"))?;
+            tile_ids.insert(format!("TILE_{}_{}", piece.uid, offset_index));
+            spawns.insert((q, r, piece.altitude));
+        }
+    }
+    // The unchanged legacy loader uses these six slots when starterUnits is
+    // absent or empty. Keep that compatibility without calling a state builder.
+    let mut slots: HashMap<&str, &str> = HashMap::new();
+    if starter_units.is_empty() {
+        slots.extend([
+            ("UNIT_P1_1", "P1"),
+            ("UNIT_P1_2", "P1"),
+            ("UNIT_P2_1", "P2"),
+            ("UNIT_P2_2", "P2"),
+            ("HERO_P1", "P1"),
+            ("HERO_P2", "P2"),
+        ]);
+    } else {
+        for (index, unit) in starter_units.iter().enumerate() {
+            let location = format!("map.starterUnits[{index}]");
+            if slots.insert(&unit.id, &unit.seat).is_some() {
+                return Err(format!("{location}: duplicate slot id '{}'", unit.id));
+            }
+            if tile_ids.contains(&unit.id) {
+                return Err(format!(
+                    "{location}: slot id '{}' collides with a board tile",
+                    unit.id
+                ));
+            }
+        }
+    }
+    if slots.len() > spawns.len() {
+        return Err(format!(
+            "map.starterUnits: {} starter units exceed {} unique spawn hexes",
+            slots.len(),
+            spawns.len()
+        ));
+    }
+    let mut roster_slots = HashSet::new();
+    let mut used_profiles = HashSet::new();
+    for (index, entry) in roster.iter().enumerate() {
+        let location = format!("roster[{index}]");
+        if !roster_slots.insert(&entry.slot) {
+            return Err(format!(
+                "{location}: duplicate roster slot '{}'",
+                entry.slot
+            ));
+        }
+        let Some(slot_seat) = slots.get(entry.slot.as_str()) else {
+            return Err(if tile_ids.contains(&entry.slot) {
+                format!("{location}: slot '{}' is not a unit", entry.slot)
+            } else {
+                format!("{location}: unknown slot '{}'", entry.slot)
+            });
+        };
+        if slot_seat != &entry.seat {
+            return Err(format!(
+                "{location}: slot '{}' does not belong to seat '{}'",
+                entry.slot, entry.seat
+            ));
+        }
+        let template = registry.get_template(&entry.profile).map_err(|_| {
+            format!(
+                "{location}: profile '{}' is not in this setup's profiles",
+                entry.profile
+            )
+        })?;
+        let Some(Component::Destructible { max_life, .. }) =
+            template.components.get("destructible")
+        else {
+            unreachable!("load_batch requires destructible");
+        };
+        if !(1..=*max_life).contains(&entry.starting_health) {
+            return Err(format!(
+                "{location}: starting_health must be within 1..={max_life}"
+            ));
+        }
+        used_profiles.insert(&entry.profile);
+    }
+    for (index, profile) in profiles.iter().enumerate() {
+        if !used_profiles.contains(&profile.mod_id) {
+            return Err(format!("profiles[{index}]: profile '{}' is not used by this setup's roster; share unused profiles as a profile batch", profile.mod_id));
+        }
+    }
+    Ok(ValidatedSetup {
+        setup_version: 1,
+        name,
+        map: SetupMap {
+            hex_map: metadata.clone(),
+            board_pieces,
+            starter_units,
+        },
+        profiles,
+        roster,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{engine, wasm_bridge};
+    use serde_json::json;
+
+    // Verbatim JSON from design section 2.6.
+    const VALID: &str = r#"{
+  "setup_version": 1,
+  "name": "Goliath skirmish",
+  "map": {
+    "hexMap": { "name": "Seven-hex arena" },
+    "boardPieces": [
+      { "uid": "arena", "inventoryID": "g7", "altitude": 0, "rotation": 0,
+        "pieceCoords": { "q": 0, "r": 0, "s": 0 } }
+    ],
+    "starterUnits": [
+      { "id": "UNIT_P1_1", "seat": "P1", "components": {
+          "tags": { "type": "Tags", "data": { "labels": ["Unit", "P1"] } },
+          "destructible": { "type": "Destructible", "data": { "current_life": 4, "max_life": 4 } } } },
+      { "id": "HERO_P1", "seat": "P1", "components": {
+          "tags": { "type": "Tags", "data": { "labels": ["Unit", "P1", "Hero"] } },
+          "destructible": { "type": "Destructible", "data": { "current_life": 8, "max_life": 8 } } } },
+      { "id": "UNIT_P2_1", "seat": "P2", "components": {
+          "tags": { "type": "Tags", "data": { "labels": ["Unit", "P2"] } },
+          "destructible": { "type": "Destructible", "data": { "current_life": 4, "max_life": 4 } } } },
+      { "id": "HERO_P2", "seat": "P2", "components": {
+          "tags": { "type": "Tags", "data": { "labels": ["Unit", "P2", "Hero"] } },
+          "destructible": { "type": "Destructible", "data": { "current_life": 8, "max_life": 8 } } } }
+    ]
+  },
+  "profiles": [
+    {
+      "schema_version": 1,
+      "mod_id": "com.community.goliath",
+      "display_name": "Goliath",
+      "visual_primitive": "CUBE",
+      "components": {
+        "destructible": { "current_life": 12, "max_life": 12 },
+        "tags": ["Unit", "Heavy"]
+      }
+    }
+  ],
+  "roster": [
+    { "slot": "UNIT_P1_1", "seat": "P1", "profile": "com.community.goliath", "starting_health": 12 },
+    { "slot": "HERO_P2",   "seat": "P2", "profile": "com.community.goliath", "starting_health": 10 }
+  ]
+}"#;
+
+    fn example() -> Value {
+        serde_json::from_str(VALID).unwrap()
+    }
+
+    fn check(value: &Value) -> Result<ValidatedSetup, String> {
+        validate_setup(&value.to_string())
+    }
+
+    fn rejected(value: &Value, expected: &str) {
+        let error = check(value).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "expected {expected:?}, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn design_section_2_6_valid_example_verbatim() {
+        let setup = validate_setup(VALID).unwrap();
+        assert_eq!(setup.setup_version, 1);
+        assert_eq!(setup.name, "Goliath skirmish");
+        assert_eq!(setup.map.board_pieces.len(), 1);
+        assert_eq!(setup.map.starter_units.len(), 4);
+        assert_eq!(setup.profiles[0].mod_id, "com.community.goliath");
+        assert_eq!(setup.roster[1].starting_health, 10);
+    }
+
+    #[test]
+    fn invalid_example_a_exact_missing_embedded_profile_error() {
+        let mut value = example();
+        value["roster"].as_array_mut().unwrap().push(json!(
+            { "slot": "UNIT_P2_1", "seat": "P2", "profile": "com.community.titan", "starting_health": 6 }
+        ));
+        assert_eq!(
+            check(&value).unwrap_err(),
+            "roster[2]: profile 'com.community.titan' is not in this setup's profiles"
+        );
+    }
+
+    #[test]
+    fn invalid_example_b_exact_rules_error_and_newer_version_gate() {
+        let mut value = json!({
+          "setup_version": 1,
+          "name": "Lava field",
+          "map": { "hexMap": {}, "boardPieces": [] },
+          "profiles": [],
+          "roster": [],
+          "rules": { "terrain": [] }
+        });
+        assert_eq!(check(&value).unwrap_err(), "invalid setup: unknown field 'rules', expected one of 'setup_version', 'name', 'map', 'profiles', 'roster'");
+        value["setup_version"] = 2.into();
+        assert_eq!(
+            check(&value).unwrap_err(),
+            "setup_version 2 is newer than this game supports (1)"
+        );
+    }
+
+    #[test]
+    fn version_zero_string_missing_negative_float_and_future_are_refused_before_shape() {
+        for (version, expected) in [
+            (json!(0), "setup_version must be the integer 1"),
+            (json!("1"), "setup_version must be the integer 1"),
+            (json!(1.0), "setup_version must be the integer 1"),
+            (json!(-1), "setup_version must be the integer 1"),
+            (
+                json!(2),
+                "setup_version 2 is newer than this game supports (1)",
+            ),
+            (
+                json!(u64::MAX),
+                "setup_version 18446744073709551615 is newer than this game supports (1)",
+            ),
+        ] {
+            assert_eq!(
+                check(&json!({"setup_version": version, "rules": {}})).unwrap_err(),
+                expected
+            );
+        }
+        assert_eq!(
+            check(&json!({})).unwrap_err(),
+            "setup_version must be the integer 1"
+        );
+        rejected(
+            &json!({"hexMap": {}, "boardPieces": []}),
+            "setup_version must be the integer 1",
+        );
+    }
+
+    #[test]
+    fn strict_fields_unknown_and_every_required_missing_at_each_level() {
+        for (path, location, required) in [
+            (
+                "",
+                "invalid setup",
+                vec!["name", "map", "profiles", "roster"],
+            ),
+            ("/map", "map", vec!["hexMap", "boardPieces"]),
+            (
+                "/map/boardPieces/0",
+                "map.boardPieces[0]",
+                vec!["uid", "inventoryID", "altitude", "rotation", "pieceCoords"],
+            ),
+            (
+                "/map/boardPieces/0/pieceCoords",
+                "map.boardPieces[0].pieceCoords",
+                vec!["q", "r", "s"],
+            ),
+            (
+                "/map/starterUnits/0",
+                "map.starterUnits[0]",
+                vec!["id", "seat", "components"],
+            ),
+            (
+                "/roster/0",
+                "roster[0]",
+                vec!["slot", "seat", "profile", "starting_health"],
+            ),
+        ] {
+            let mut value = example();
+            value
+                .pointer_mut(path)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".into(), json!(true));
+            rejected(&value, &format!("{location}: unknown field 'unexpected'"));
+            for field in required {
+                let mut value = example();
+                value
+                    .pointer_mut(path)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                rejected(&value, &format!("{location}: missing field '{field}'"));
+            }
+        }
+    }
+
+    #[test]
+    fn strict_field_types_refuse_null_arrays_scalars_and_non_i32_rotation_or_health() {
+        for path in [
+            "/name",
+            "/map",
+            "/map/hexMap",
+            "/map/boardPieces",
+            "/map/starterUnits",
+            "/map/boardPieces/0",
+            "/map/boardPieces/0/pieceCoords",
+            "/map/starterUnits/0/components",
+            "/profiles",
+            "/roster",
+            "/roster/0",
+        ] {
+            let mut value = example();
+            *value.pointer_mut(path).unwrap() = Value::Null;
+            assert!(check(&value).is_err(), "{path}");
+        }
+        for path in ["/map/boardPieces/0/rotation", "/roster/0/starting_health"] {
+            for invalid in [json!("0"), json!(0.5), json!(i64::MAX)] {
+                let mut value = example();
+                *value.pointer_mut(path).unwrap() = invalid;
+                assert!(check(&value).is_err(), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_size_exact_boundary_and_plus_one_whitespace_checked_before_json() {
+        let mut exact = VALID.to_string();
+        exact.push_str(&" ".repeat(MAX_SETUP_BYTES - exact.len()));
+        assert_eq!(exact.len(), MAX_SETUP_BYTES);
+        validate_setup(&exact).unwrap();
+        exact.push(' ');
+        let expected = "invalid setup: file exceeds the 1 MiB setup limit (1048576 bytes)";
+        assert_eq!(validate_setup(&exact).unwrap_err(), expected);
+        assert_eq!(
+            validate_setup(&" ".repeat(MAX_SETUP_BYTES + 1)).unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn metadata_depth_32_passes_33_fails_for_arrays_and_objects() {
+        for object in [false, true] {
+            for (depth, succeeds) in [(32, true), (33, false)] {
+                let mut nested = json!(null);
+                // root, map and hexMap already contribute three containers.
+                for _ in 3..depth {
+                    nested = if object {
+                        json!({"nested": nested})
+                    } else {
+                        json!([nested])
+                    };
+                }
+                let mut value = example();
+                value["map"]["hexMap"]["metadata"] = nested;
+                if succeeds {
+                    check(&value).unwrap();
+                } else {
+                    rejected(&value, "JSON nesting depth exceeds 32");
+                }
+            }
+        }
+        let bomb = format!("{}0{}", "[".repeat(10000), "]".repeat(10000));
+        assert!(validate_setup(&bomb)
+            .unwrap_err()
+            .contains("JSON nesting depth exceeds 32"));
+    }
+
+    #[test]
+    fn duplicate_json_keys_anywhere_are_rejected_before_value_collapse() {
+        for (source, expected) in [
+            (
+                r#"{"setup_version":1,"setup_version":2}"#.to_string(),
+                "invalid setup: duplicate key 'setup_version'",
+            ),
+            (
+                VALID.replace(
+                    r#""name": "Seven-hex arena""#,
+                    r#""name": "first", "name": "second""#,
+                ),
+                "map.hexMap: duplicate key 'name'",
+            ),
+            (
+                VALID.replace(
+                    r#""mod_id": "com.community.goliath""#,
+                    r#""mod_id":"com.example.first","mod_id":"com.community.goliath""#,
+                ),
+                "profiles[0]: duplicate key 'mod_id'",
+            ),
+            (
+                VALID.replace(
+                    r#""labels": ["Unit", "P1"]"#,
+                    r#""labels":["Unit","P1"],"labels":["Unit","P2"]"#,
+                ),
+                "map.starterUnits[0].components.tags.data: duplicate key 'labels'",
+            ),
+            (
+                VALID.replace(r#""q": 0, "r": 0"#, r#""q": 1, "q": 0, "r": 0"#),
+                "map.boardPieces[0].pieceCoords: duplicate key 'q'",
+            ),
+            (
+                VALID.replace(
+                    r#""slot": "UNIT_P1_1""#,
+                    r#""slot":"OTHER","slot": "UNIT_P1_1""#,
+                ),
+                "roster[0]: duplicate key 'slot'",
+            ),
+        ] {
+            let error = validate_setup(&source).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let mut value = example();
+        value["profiles"][0]["components"]["tags"] =
+            json!({"type":"Tags", "data":{"labels":["Unit"]}});
+        let source = value.to_string().replace(
+            r#""labels":["Unit"]"#,
+            r#""labels":["Unit"],"labels":["Unit","Heavy"]"#,
+        );
+        assert!(validate_setup(&source)
+            .unwrap_err()
+            .contains("profiles[0].components.tags.data: duplicate key 'labels'"));
+        let mut value = example();
+        value["map"]["hexMap"]["arbitrary"] = json!([{"nested":{"key":1}}]);
+        let source = value
+            .to_string()
+            .replace(r#""key":1"#, r#""key":1,"key":2"#);
+        assert!(validate_setup(&source)
+            .unwrap_err()
+            .contains("map.hexMap.arbitrary[0].nested: duplicate key 'key'"));
+    }
+
+    #[test]
+    fn identifiers_64_pass_65_empty_invalid_ascii_unicode_and_colon_fail() {
+        for id in ["a".repeat(64), "Az09_-".repeat(10)] {
+            let mut value = example();
+            value["map"]["boardPieces"][0]["uid"] = id.clone().into();
+            value["map"]["starterUnits"][0]["id"] = id.clone().into();
+            value["roster"][0]["slot"] = id.into();
+            check(&value).unwrap();
+        }
+        for id in [
+            "a".repeat(65),
+            "".into(),
+            "with:colon".into(),
+            "with.dot".into(),
+            "with space".into(),
+            "é".into(),
+        ] {
+            for path in [
+                "/map/boardPieces/0/uid",
+                "/map/starterUnits/0/id",
+                "/roster/0/slot",
+            ] {
+                let mut value = example();
+                *value.pointer_mut(path).unwrap() = id.clone().into();
+                rejected(&value, "must be 1 to 64 bytes of ASCII");
+            }
+        }
+    }
+
+    #[test]
+    fn name_128_bytes_pass_129_fail_including_multibyte_text() {
+        for name in ["x".repeat(128), "é".repeat(64), "".into()] {
+            let mut value = example();
+            value["name"] = name.into();
+            check(&value).unwrap();
+        }
+        for name in ["x".repeat(129), format!("{}x", "é".repeat(64))] {
+            let mut value = example();
+            value["name"] = name.into();
+            assert_eq!(
+                check(&value).unwrap_err(),
+                "name: exceeds the 128-byte limit"
+            );
+        }
+    }
+
+    #[test]
+    fn per_profile_64_kib_exact_boundary_and_plus_one_use_existing_limit() {
+        let mut value = example();
+        let size = value["profiles"][0].to_string().len();
+        let old_len = value["profiles"][0]["display_name"].as_str().unwrap().len();
+        value["profiles"][0]["display_name"] = "x".repeat(64 * 1024 - size + old_len).into();
+        assert_eq!(value["profiles"][0].to_string().len(), 64 * 1024);
+        check(&value).unwrap();
+        let name = value["profiles"][0]["display_name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        value["profiles"][0]["display_name"] = format!("{name}x").into();
+        assert_eq!(value["profiles"][0].to_string().len(), 64 * 1024 + 1);
+        rejected(
+            &value,
+            "profiles: profile 0 exceeds the 64 KiB profile limit",
+        );
+    }
+
+    #[test]
+    fn q_r_s_inclusive_bounds_and_i32_extrema_have_exact_errors_without_panics() {
+        for axis in ["q", "r", "s"] {
+            for n in [-1000, 1000] {
+                let mut value = example();
+                value["map"]["boardPieces"][0]["pieceCoords"][axis] = n.into();
+                check(&value).unwrap();
+            }
+            for n in [-1001, 1001, i32::MIN, i32::MAX] {
+                let mut value = example();
+                value["map"]["boardPieces"][0]["pieceCoords"][axis] = n.into();
+                assert_eq!(check(&value).unwrap_err(), format!("map.boardPieces[0]: pieceCoords.{axis} out of range (allowed -1000 to 1000)"));
+            }
+        }
+    }
+
+    #[test]
+    fn altitude_inclusive_bounds_and_i32_extrema_have_exact_errors() {
+        for n in [0, 1000] {
+            let mut value = example();
+            value["map"]["boardPieces"][0]["altitude"] = n.into();
+            check(&value).unwrap();
+        }
+        for n in [-1, 1001, i32::MIN, i32::MAX] {
+            let mut value = example();
+            value["map"]["boardPieces"][0]["altitude"] = n.into();
+            assert_eq!(
+                check(&value).unwrap_err(),
+                "map.boardPieces[0]: altitude out of range (allowed 0 to 1000)"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_extrema_and_inconsistent_s_are_accepted() {
+        for rotation in [i32::MIN, i32::MAX, -7, 6] {
+            let mut value = example();
+            value["map"]["boardPieces"][0]["rotation"] = rotation.into();
+            value["map"]["boardPieces"][0]["pieceCoords"] = json!({"q":1000,"r":1000,"s":1000});
+            check(&value).unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_slots_piece_uids_and_tile_colliding_slots_are_refused() {
+        let mut value = example();
+        value["map"]["starterUnits"][1]["id"] = "UNIT_P1_1".into();
+        rejected(&value, "map.starterUnits[1]: duplicate slot id 'UNIT_P1_1'");
+        let mut value = example();
+        value["map"]["starterUnits"][0]["id"] = "TILE_arena_0".into();
+        rejected(
+            &value,
+            "map.starterUnits[0]: slot id 'TILE_arena_0' collides with a board tile",
+        );
+        let mut value = example();
+        let piece = value["map"]["boardPieces"][0].clone();
+        value["map"]["boardPieces"]
+            .as_array_mut()
+            .unwrap()
+            .push(piece);
+        rejected(&value, "map.boardPieces[1]: duplicate uid 'arena'");
+    }
+
+    #[test]
+    fn spawn_count_deduplicates_exact_hexes_but_not_distinct_altitudes() {
+        let mut value = example();
+        value["map"]["boardPieces"][0]["inventoryID"] = "g1".into();
+        rejected(&value, "4 starter units exceed 1 unique spawn hexes");
+        let mut value = example();
+        value["map"]["boardPieces"][0]["inventoryID"] = "g1".into();
+        let mut pieces = Vec::new();
+        for i in 0..4 {
+            let mut piece = value["map"]["boardPieces"][0].clone();
+            piece["uid"] = format!("piece_{i}").into();
+            pieces.push(piece);
+        }
+        value["map"]["boardPieces"] = pieces.into();
+        rejected(&value, "4 starter units exceed 1 unique spawn hexes");
+        for i in 0..4 {
+            value["map"]["boardPieces"][i]["altitude"] = (i as i32).into();
+        }
+        check(&value).unwrap();
+    }
+
+    #[test]
+    fn inline_health_unit_tags_seats_and_starter_mod_id_are_strict() {
+        for health in [-3, 0, 5, 500] {
+            let mut value = example();
+            value["map"]["starterUnits"][0]["components"]["destructible"]["data"]["current_life"] =
+                health.into();
+            rejected(&value, "map.starterUnits[0]:");
+            rejected(
+                &value,
+                "destructible.current_life must be within 1..=max_life",
+            );
+        }
+        for labels in [
+            json!(["P1"]),
+            json!(["Unit"]),
+            json!(["Unit", "P1", "P2"]),
+            json!(["Unit", "P2"]),
+            json!(["Unit", "P1", "P1"]),
+            json!(["Unit", "P1", ""]),
+        ] {
+            let mut value = example();
+            value["map"]["starterUnits"][0]["components"]["tags"]["data"]["labels"] = labels;
+            rejected(&value, "map.starterUnits[0]:");
+        }
+        let mut value = example();
+        value["map"]["starterUnits"][0]["mod_id"] = "com.community.goliath".into();
+        rejected(&value, "map.starterUnits[0]: unknown field 'mod_id'");
+    }
+
+    #[test]
+    fn starter_seat_aliases_preserved_without_silent_conflicts() {
+        for alias in ["player", "owner"] {
+            let mut value = example();
+            let object = value["map"]["starterUnits"][0].as_object_mut().unwrap();
+            object.remove("seat");
+            object.insert(alias.into(), json!("P1"));
+            check(&value).unwrap();
+            value["map"]["starterUnits"][0]["seat"] = "P2".into();
+            rejected(&value, "duplicate field 'seat'");
+        }
+    }
+
+    #[test]
+    fn profile_and_inline_component_strictness_unknown_missing_and_legacy_shapes() {
+        let profile_keys = [
+            "schema_version",
+            "mod_id",
+            "display_name",
+            "visual_primitive",
+            "components",
+        ];
+        for key in profile_keys {
+            let mut value = example();
+            value["profiles"][0].as_object_mut().unwrap().remove(key);
+            rejected(&value, &format!("missing field `{key}`"));
+        }
+        let mut value = example();
+        value["profiles"][0]["movement_speed"] = 4.into();
+        rejected(
+            &value,
+            "profiles: profile 0: invalid profile: unknown field `movement_speed`",
+        );
+        for path in ["/profiles/0/components", "/map/starterUnits/0/components"] {
+            for component in ["tags", "destructible"] {
+                let mut value = example();
+                value
+                    .pointer_mut(path)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(component);
+                rejected(&value, &format!("require a {component} component"));
+            }
+            let mut value = example();
+            value.pointer_mut(path).unwrap()["movement"] = json!({"speed":4});
+            rejected(&value, "unsupported unit component 'movement'");
+            for component in ["destructible", "tags"] {
+                let base = if component == "destructible" {
+                    json!({"current_life":4,"max_life":4})
+                } else {
+                    json!({"labels":["Unit","P1"]})
+                };
+                for tagged in [false, true] {
+                    let mut value = example();
+                    let mut data = base.clone();
+                    data["extra"] = true.into();
+                    value.pointer_mut(path).unwrap()[component] = if tagged {
+                        json!({"type":if component == "tags" {"Tags"} else {"Destructible"},"data":data})
+                    } else {
+                        data
+                    };
+                    rejected(&value, &format!("unsupported {component} field 'extra'"));
+                }
+            }
+            for key in ["current_life", "max_life"] {
+                let mut value = example();
+                value.pointer_mut(path).unwrap()["destructible"] =
+                    json!({"current_life":4,"max_life":4});
+                value.pointer_mut(path).unwrap()["destructible"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+                rejected(
+                    &value,
+                    &format!("destructible.{key} must be a 32-bit integer"),
+                );
+            }
+            for invalid in [
+                json!({"type":"Tags","data":{}}),
+                json!({"type":"Tags"}),
+                json!({"type":"Wrong","data":{"labels":["Unit"]}}),
+                json!({"type":"Tags","data":{"labels":["Unit"]},"extra":1}),
+            ] {
+                let mut value = example();
+                value.pointer_mut(path).unwrap()["tags"] = invalid;
+                assert!(check(&value).is_err());
+            }
+        }
+        // Both established compact and tagged component representations work.
+        let mut value = example();
+        value["map"]["starterUnits"][0]["components"] = json!({
+            "destructible":{"current_life":1,"max_life":4}, "tags":["Unit","P1"]
+        });
+        value["profiles"][0]["components"] = json!({
+            "destructible":{"type":"Destructible","data":{"current_life":12,"max_life":12}},
+            "tags":{"type":"Tags","data":{"labels":["Unit","Heavy"]}}
+        });
+        check(&value).unwrap();
+    }
+
+    #[test]
+    fn profiles_unused_duplicate_and_roster_slot_seat_health_checks() {
+        let mut value = example();
+        value["roster"] = json!([]);
+        rejected(
+            &value,
+            "profiles[0]: profile 'com.community.goliath' is not used",
+        );
+        let mut value = example();
+        let profile = value["profiles"][0].clone();
+        value["profiles"].as_array_mut().unwrap().push(profile);
+        rejected(
+            &value,
+            "profiles: profile batch contains duplicate mod_id 'com.community.goliath'",
+        );
+        for (field, invalid, message) in [
+            ("slot", json!("MISSING"), "unknown slot 'MISSING'"),
+            (
+                "slot",
+                json!("TILE_arena_0"),
+                "slot 'TILE_arena_0' is not a unit",
+            ),
+            (
+                "seat",
+                json!("P2"),
+                "slot 'UNIT_P1_1' does not belong to seat 'P2'",
+            ),
+            ("seat", json!("P3"), "seat must be 'P1' or 'P2'"),
+            (
+                "starting_health",
+                json!(0),
+                "starting_health must be within 1..=12",
+            ),
+            (
+                "starting_health",
+                json!(-1),
+                "starting_health must be within 1..=12",
+            ),
+            (
+                "starting_health",
+                json!(13),
+                "starting_health must be within 1..=12",
+            ),
+        ] {
+            let mut value = example();
+            value["roster"][0][field] = invalid;
+            rejected(&value, &format!("roster[0]: {message}"));
+        }
+        for health in [1, 12] {
+            let mut value = example();
+            value["roster"][0]["starting_health"] = health.into();
+            check(&value).unwrap();
+        }
+        let mut value = example();
+        let entry = value["roster"][0].clone();
+        value["roster"].as_array_mut().unwrap().push(entry);
+        rejected(&value, "roster[2]: duplicate roster slot 'UNIT_P1_1'");
+    }
+
+    #[test]
+    fn legacy_default_fallback_empty_or_absent_supports_all_six_roster_slots() {
+        for absent in [false, true] {
+            let mut value = example();
+            if absent {
+                value["map"].as_object_mut().unwrap().remove("starterUnits");
+            } else {
+                value["map"]["starterUnits"] = json!([]);
+            }
+            value["roster"] = json!([]);
+            value["profiles"] = json!([]);
+            check(&value).unwrap();
+            for (id, seat) in [
+                ("UNIT_P1_1", "P1"),
+                ("UNIT_P1_2", "P1"),
+                ("UNIT_P2_1", "P2"),
+                ("UNIT_P2_2", "P2"),
+                ("HERO_P1", "P1"),
+                ("HERO_P2", "P2"),
+            ] {
+                value["profiles"] = example()["profiles"].clone();
+                value["roster"] = json!([{"slot":id,"seat":seat,"profile":"com.community.goliath","starting_health":1}]);
+                check(&value).unwrap();
+            }
+            value["map"]["boardPieces"][0]["inventoryID"] = "g1".into();
+            rejected(&value, "6 starter units exceed 1 unique spawn hexes");
+        }
+        let mut value = example();
+        value["map"]["starterUnits"] = json!([]);
+        value["profiles"] = json!([]);
+        value["roster"] = json!([]);
+        let mut pieces = Vec::new();
+        for i in 0..6 {
+            let mut piece = value["map"]["boardPieces"][0].clone();
+            piece["uid"] = format!("piece_{i}").into();
+            piece["inventoryID"] = "g1".into();
+            piece["pieceCoords"]["q"] = i.into();
+            pieces.push(piece);
+        }
+        value["map"]["boardPieces"] = pieces.into();
+        check(&value).unwrap();
+        value["map"]["boardPieces"].as_array_mut().unwrap().pop();
+        rejected(&value, "6 starter units exceed 5 unique spawn hexes");
+    }
+
+    #[test]
+    fn embedded_profile_rules_are_delegated_to_existing_registry_validation() {
+        for (path, invalid, expected) in [
+            (
+                "/schema_version",
+                json!(2),
+                "unsupported schema_version 2; expected 1",
+            ),
+            ("/mod_id", json!("Invalid/Mod"), "invalid mod_id"),
+            (
+                "/display_name",
+                json!(" "),
+                "display_name must not be empty",
+            ),
+            (
+                "/visual_primitive",
+                json!(" "),
+                "visual_primitive must not be empty",
+            ),
+            (
+                "/components/destructible/max_life",
+                json!(0),
+                "destructible.max_life must be within",
+            ),
+            (
+                "/components/destructible/max_life",
+                json!(-1),
+                "destructible.max_life must be within",
+            ),
+            (
+                "/components/destructible/current_life",
+                json!(13),
+                "destructible.current_life must be within",
+            ),
+            (
+                "/components/destructible/current_life",
+                json!(0),
+                "destructible.current_life must be within",
+            ),
+            (
+                "/components/destructible/current_life",
+                json!(12.0),
+                "must be a 32-bit integer",
+            ),
+            (
+                "/components/tags",
+                json!(["Heavy"]),
+                "tags must include the 'Unit' label",
+            ),
+            (
+                "/components/tags",
+                json!(["Unit", "Unit"]),
+                "tag labels must not contain duplicates",
+            ),
+            (
+                "/components/tags",
+                json!(["Unit", ""]),
+                "tag labels must not be empty",
+            ),
+            (
+                "/components/tags",
+                json!(["Unit", 1]),
+                "tags entries must be strings",
+            ),
+        ] {
+            let mut value = example();
+            *value["profiles"][0].pointer_mut(path).unwrap() = invalid;
+            rejected(&value, expected);
+            rejected(&value, "profiles:");
+        }
+    }
+
+    #[test]
+    fn opaque_metadata_allowed_but_all_existing_flow_and_reserved_rule_keys_refused() {
+        for key in [
+            "flow",
+            "flow_definition",
+            "flow_schema_version",
+            "stages",
+            "active_players",
+            "activePlayers",
+            "phases",
+            "turn_order",
+            "turn_steps",
+            "scripts",
+            "expressions",
+            "timers",
+            "rules",
+            "terrain",
+            "health_cap",
+        ] {
+            let mut value = example();
+            value["map"]["hexMap"][key] = json!({});
+            rejected(&value, "map.hexMap:");
+        }
+        let mut value = example();
+        value["map"]["hexMap"]["editor_metadata"] = json!({"arbitrary":[true,1,"value",null]});
+        check(&value).unwrap();
+    }
+
+    #[test]
+    fn multiple_malformed_components_have_deterministic_located_errors() {
+        for path in ["/profiles/0/components", "/map/starterUnits/0/components"] {
+            let mut value = example();
+            *value.pointer_mut(path).unwrap() = json!({
+                "destructible": {"current_life":"bad", "max_life":4},
+                "tags": {"type":"Wrong", "data":{"labels":[]}},
+                "unsupported": {}
+            });
+            let error = check(&value).unwrap_err();
+            assert!(
+                error.contains("destructible.current_life must be a 32-bit integer"),
+                "{error}"
+            );
+            for _ in 0..20 {
+                assert_eq!(check(&value).unwrap_err(), error);
+            }
+        }
+    }
+
+    #[test]
+    fn success_and_failure_preserve_changed_running_match_flow_and_registries() {
+        let match_id = format!("setup_validator_preservation_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry
+            .load_batch(&example()["profiles"].to_string())
+            .unwrap();
+        engine::store_match(
+            match_id.clone(),
+            engine::generate_test_sandbox(match_id.clone()),
+        );
+        engine::deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.community.goliath",
+            "P1",
+            7,
+            &registry,
+        )
+        .unwrap();
+        engine::process_action(&match_id, "P1", "S").unwrap();
+        engine::process_action(&match_id, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
+        let flow_before = engine::get_match_flow(&match_id).unwrap();
+        let local_before = serde_json::to_value(&*registry.templates.read().unwrap()).unwrap();
+        let global_before: Value = serde_json::from_str(
+            &wasm_bridge::wasm_export_local_sandbox(match_id.clone()).unwrap(),
+        )
+        .unwrap();
+        let mut candidate = example();
+        let private_profile = "com.example.setup_validator_private";
+        candidate["profiles"][0]["mod_id"] = private_profile.into();
+        for entry in candidate["roster"].as_array_mut().unwrap() {
+            entry["profile"] = private_profile.into();
+        }
+        {
+            let matches = engine::ACTIVE_MATCHES.lock().unwrap();
+            let before = serde_json::to_value(&matches[&match_id]).unwrap();
+            assert_eq!(before["context"]["setup_locked"], true);
+            assert_eq!(
+                before["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]
+                    ["current_life"],
+                3
+            );
+            check(&candidate).unwrap();
+            candidate["roster"][0]["profile"] = "com.example.not_embedded".into();
+            rejected(&candidate, "not in this setup's profiles");
+            assert_eq!(serde_json::to_value(&matches[&match_id]).unwrap(), before);
+        }
+        assert_eq!(engine::get_match_flow(&match_id).unwrap(), flow_before);
+        assert_eq!(
+            serde_json::to_value(&*registry.templates.read().unwrap()).unwrap(),
+            local_before
+        );
+        let global_after: Value = serde_json::from_str(
+            &wasm_bridge::wasm_export_local_sandbox(match_id.clone()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(global_after["snapshot"], global_before["snapshot"]);
+        // Existing bridge tests concurrently add their own unique profiles.
+        // Compare every preexisting definition without racing those additions.
+        for profile in global_before["profiles"].as_array().unwrap() {
+            let after = global_after["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|after| after["mod_id"] == profile["mod_id"])
+                .unwrap();
+            assert_eq!(after, profile);
+        }
+        assert!(!global_after["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["mod_id"] == private_profile));
+        engine::remove_match(&match_id);
+    }
+}
