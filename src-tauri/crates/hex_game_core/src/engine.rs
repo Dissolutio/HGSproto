@@ -154,24 +154,30 @@ pub fn remove_match(match_id: &str) {
 }
 
 pub fn get_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Vec<(i32, i32)> {
+    // Built-in templates contain only small offsets, independent of map coordinates.
+    checked_hex_footprint_offsets(inventory_id, rotation)
+        .expect("Built-in footprint offsets must fit in i32 coordinates")
+}
+
+fn checked_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Option<Vec<(i32, i32)>> {
     let templates_list = crate::templates::get_template_offsets(inventory_id);
     templates_list
         .iter()
         .map(|offset| {
             let mut current_q = offset.q;
             let mut current_r = offset.r;
-            let mut current_s = -offset.q - offset.r;
+            let mut current_s = offset.q.checked_neg()?.checked_sub(offset.r)?;
             let normalized_steps = rotation.rem_euclid(6);
 
             for _ in 0..normalized_steps {
-                let next_q = -current_r;
-                let next_r = -current_s;
-                let next_s = -next_q - next_r;
+                let next_q = current_r.checked_neg()?;
+                let next_r = current_s.checked_neg()?;
+                let next_s = next_q.checked_neg()?.checked_sub(next_r)?;
                 current_q = next_q;
                 current_r = next_r;
                 current_s = next_s;
             }
-            (current_q, current_r)
+            Some((current_q, current_r))
         })
         .collect()
 }
@@ -229,11 +235,15 @@ fn try_initialize_map_file(
         let base_r = piece.piece_coords.r;
         let base_z = piece.altitude;
         let (face_texture, side_texture) = terrain_textures(&piece.inventory_id);
-        let offsets = get_hex_footprint_offsets(&piece.inventory_id, piece.rotation);
+        let coordinate_error = || {
+            format!("Hexoscape map coordinate out of range: piece '{}'", piece.uid)
+        };
+        let offsets = checked_hex_footprint_offsets(&piece.inventory_id, piece.rotation)
+            .ok_or_else(coordinate_error)?;
 
         for (index, (rotated_q, rotated_r)) in offsets.into_iter().enumerate() {
-            let final_q = base_q + rotated_q;
-            let final_r = base_r + rotated_r;
+            let final_q = base_q.checked_add(rotated_q).ok_or_else(coordinate_error)?;
+            let final_r = base_r.checked_add(rotated_r).ok_or_else(coordinate_error)?;
             let entity_id = format!("TILE_{}_{}", piece.uid, index);
             let entity = Entity {
                 id: entity_id.clone(),
@@ -1114,6 +1124,137 @@ mod tests {
         assert_eq!(positions.len(), 7);
     }
 
+    fn coordinate_test_map(inventory_id: &str, q: i32, r: i32, altitude: i32, rotation: i32) -> String {
+        serde_json::json!({
+            "hexMap": {},
+            "boardPieces": [
+                {
+                    "uid": "valid-piece",
+                    "inventoryID": "g1",
+                    "altitude": 0,
+                    "rotation": 0,
+                    "pieceCoords": {"q": 0, "r": 0, "s": 0}
+                },
+                {
+                    "uid": "extreme-piece",
+                    "inventoryID": inventory_id,
+                    "altitude": altitude,
+                    "rotation": rotation,
+                    "pieceCoords": {"q": q, "r": r, "s": 0}
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    fn assert_legacy_map_coordinate_overflow(name: &str, q: i32, r: i32, rotation: i32) {
+        let match_id = format!("{name}_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry.load_batch(&format!("[{PRESERVATION_PROFILE}]")).unwrap();
+        let before = serde_json::to_value(&*registry.templates.read().unwrap()).unwrap();
+
+        let error = try_initialize_from_hexoscape_with_registry(
+            match_id.clone(),
+            &coordinate_test_map("g7", q, r, 0, rotation),
+            &registry,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Hexoscape map coordinate out of range: piece 'extreme-piece'");
+        assert!(!match_exists(&match_id));
+        assert!(!MATCH_FLOWS.lock().unwrap().contains_key(&match_id));
+        assert_eq!(serde_json::to_value(&*registry.templates.read().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_map_rejects_i32_max_q_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_max_q", i32::MAX, 0, 0);
+    }
+
+    #[test]
+    fn legacy_map_rejects_i32_min_q_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_min_q", i32::MIN, 0, 0);
+    }
+
+    #[test]
+    fn legacy_map_rejects_i32_max_r_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_max_r", 0, i32::MAX, 0);
+    }
+
+    #[test]
+    fn legacy_map_rejects_rotated_i32_min_r_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_min_r", 0, i32::MIN, 3);
+    }
+
+    #[test]
+    fn legacy_map_rotation_preserves_offsets_for_all_steps_and_extreme_rotations() {
+        let expected = [
+            vec![(0, 0), (1, 0), (0, 1)],
+            vec![(0, 0), (0, 1), (-1, 1)],
+            vec![(0, 0), (-1, 1), (-1, 0)],
+            vec![(0, 0), (-1, 0), (0, -1)],
+            vec![(0, 0), (0, -1), (1, -1)],
+            vec![(0, 0), (1, -1), (1, 0)],
+        ];
+        for rotation in [-7, -6, -1, 0, 1, 2, 3, 4, 5, 6, 7, i32::MIN, i32::MAX] {
+            assert_eq!(
+                get_hex_footprint_offsets("g3", rotation),
+                expected[rotation.rem_euclid(6) as usize]
+            );
+        }
+        for inventory_id in [
+            "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g24",
+            "straight3", "straight4", "wallWalk7", "wallWalk9",
+        ] {
+            for rotation in 0..6 {
+                assert!(checked_hex_footprint_offsets(inventory_id, rotation).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_map_accepts_large_valid_coordinates_and_extreme_altitudes() {
+        for (index, (inventory_id, q, r, altitude, rotation)) in [
+            ("g7", i32::MAX - 1, i32::MAX - 2, i32::MAX, 0),
+            ("g7", i32::MIN + 1, i32::MIN, i32::MIN, 0),
+            ("g1", i32::MAX, i32::MIN, i32::MAX, i32::MAX),
+            ("g1", i32::MIN, i32::MAX, i32::MIN, i32::MIN),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let match_id = format!("legacy_map_valid_{index}_{}", std::process::id());
+            let registry = ModRegistry::default();
+            try_initialize_from_hexoscape_with_registry(
+                match_id.clone(),
+                &coordinate_test_map(inventory_id, q, r, altitude, rotation),
+                &registry,
+            )
+            .unwrap();
+
+            {
+                let matches = ACTIVE_MATCHES.lock().unwrap();
+                let state = &matches[&match_id];
+                let offsets = get_hex_footprint_offsets(inventory_id, rotation);
+                for (tile_index, (dq, dr)) in offsets.iter().enumerate() {
+                    let spatial = &state.entities[&format!("TILE_extreme-piece_{tile_index}")].spatial;
+                    assert_eq!(i64::from(spatial.q), i64::from(q) + i64::from(*dq));
+                    assert_eq!(i64::from(spatial.r), i64::from(r) + i64::from(*dr));
+                    assert_eq!(spatial.z, altitude);
+                }
+                let units: Vec<_> = state.entities.values().filter(|entity| is_unit(entity)).collect();
+                assert_eq!(units.len(), (offsets.len() + 1).min(6));
+                assert!(units.iter().any(|unit| unit.spatial.z == altitude));
+                assert!(units.iter().all(|unit| state.entities.values().any(|tile| {
+                    matches!(tile.components.get("terrain"), Some(Component::Terrain { .. }))
+                        && (tile.spatial.q, tile.spatial.r, tile.spatial.z)
+                            == (unit.spatial.q, unit.spatial.r, unit.spatial.z)
+                })));
+            }
+            remove_match(&match_id);
+        }
+    }
+
     #[test]
     fn test_mod_aware_setup_fails_on_missing_registry_profile() {
         let match_id = format!("missing_mod_profile_test_{}", std::process::id());
@@ -1239,6 +1380,41 @@ mod tests {
         );
         assert_eq!(state["context"]["setup_locked"], true);
         assert_eq!(state["context"]["turn_phase"], "end");
+    }
+
+    fn assert_legacy_map_overflow_preserves_damaged_match(name: &str, reset: bool) {
+        let (match_id, registry) = changed_preservation_match(name);
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        for (q, r, rotation) in [
+            (i32::MAX, 0, 0),
+            (i32::MIN, 0, 0),
+            (0, i32::MAX, 0),
+            (0, i32::MIN, 3),
+        ] {
+            let map_json = coordinate_test_map("g7", q, r, 0, rotation);
+            let error = if reset {
+                try_reset_from_hexoscape_with_registry(match_id.clone(), &map_json, &registry)
+            } else {
+                try_initialize_from_hexoscape_with_registry(match_id.clone(), &map_json, &registry)
+            }
+            .unwrap_err();
+
+            assert_eq!(error, "Hexoscape map coordinate out of range: piece 'extreme-piece'");
+            assert_eq!(preservation_state(&match_id, &registry), before);
+        }
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn legacy_map_overflow_setup_preserves_damaged_match_flow_and_registry() {
+        assert_legacy_map_overflow_preserves_damaged_match("legacy_map_failed_setup", false);
+    }
+
+    #[test]
+    fn legacy_map_overflow_reset_preserves_damaged_match_flow_and_registry() {
+        assert_legacy_map_overflow_preserves_damaged_match("legacy_map_failed_reset", true);
     }
 
     #[test]
