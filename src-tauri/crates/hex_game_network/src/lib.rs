@@ -189,8 +189,8 @@ async fn wait_with_connection_diagnostics<T>(
     let mut report_at = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     let mut previous_route = None;
     loop {
-        tokio::select! {
-            result = &mut future => {
+        match tokio::time::timeout_at(report_at, &mut future).await {
+            Ok(result) => {
                 if let Some(node_id) = node_id {
                     let observation = observe_route(endpoint, node_id).await;
                     if previous_route != Some(observation.route) {
@@ -200,7 +200,7 @@ async fn wait_with_connection_diagnostics<T>(
                 }
                 return result;
             }
-            _ = tokio::time::sleep_until(report_at) => {
+            Err(_) => {
                 if let Some(node_id) = node_id {
                     let observation = observe_route(endpoint, node_id).await;
                     if previous_route != Some(observation.route) {
@@ -232,12 +232,12 @@ fn monitor_route_changes(
         let closed = connection.closed();
         tokio::pin!(closed);
         loop {
-            tokio::select! {
-                _ = &mut closed => {
+            match tokio::time::timeout_at(report_at, &mut closed).await {
+                Ok(_) => {
                     diagnostics.event(&attempt, "connection_lifetime", "connection_closed", "closed", previous_route.unwrap_or("unknown"));
                     break;
                 }
-                _ = tokio::time::sleep_until(report_at) => {
+                Err(_) => {
                     let observation = observe_route(&endpoint, node_id).await;
                     if previous_route != Some(observation.route) {
                         let event = if previous_route.is_some() { "route_change_first_observed" } else { "route_observed" };
