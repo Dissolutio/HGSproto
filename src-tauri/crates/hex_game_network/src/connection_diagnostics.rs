@@ -142,6 +142,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn route_observation_does_not_log_endpoint_id() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap();
+            let node_id = endpoint.id();
+            let directory = std::env::temp_dir().join(format!(
+                "hgs-we3-node-id-test-{}-{}",
+                std::process::id(),
+                timestamp_ms().unwrap()
+            ));
+            let diagnostics = ConnectionDiagnostics::open_in(directory.clone(), "host").unwrap();
+            let attempt = diagnostics.begin_attempt("host");
+            let observation = observe_route(&endpoint, node_id).await;
+            diagnostics.observation(&attempt, "quic_handshake", "route_observed", observation);
+            drop(diagnostics);
+            let file = fs::read_dir(&directory).unwrap().next().unwrap().unwrap().path();
+            let content = fs::read_to_string(&file).unwrap();
+            assert!(content.contains("event=route_observed"));
+            assert!(!content.contains(&node_id.to_string()));
+            endpoint.close().await;
+            fs::remove_file(file).unwrap();
+            fs::remove_dir(directory).unwrap();
+        });
+    }
+
+    #[test]
     fn logs_timestamps_route_stages_version_and_elapsed_without_payloads() {
         let directory = PathBuf::from("target").join(format!(
             "hgs-we3-diagnostics-THROWAWAY_TICKET-PRIVATE_KEY_MATERIAL-{}-{}",
