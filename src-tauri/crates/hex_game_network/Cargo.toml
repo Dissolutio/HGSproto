@@ -8,6 +8,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
 recovery-diagnostics = []
+connection-diagnostics = []
 
 [dependencies]
 hex_game_core = { path = "../hex_game_core" }
