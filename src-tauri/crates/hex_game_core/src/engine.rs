@@ -700,6 +700,13 @@ pub fn deploy_profile_unit(
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     let flow = flows.get_mut(match_id)
         .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    let combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    if combat_records.contains_key(match_id)
+        && !template.components.values().any(|component| matches!(component, Component::Combat { .. }))
+    {
+        return Err(format!("profile {mod_id} has no combat values; version 2 matches need schema 2 profiles"));
+    }
     let mut setup_records = MATCH_SETUP_RECORDS
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
@@ -1063,7 +1070,7 @@ pub fn process_action(match_id: &str, acting_seat: &str, action: &str) -> Result
         .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
     let mut records = MATCH_COMBAT_RECORDS.lock()
         .map_err(|_| "Match combat registry is unavailable".to_string())?;
-    apply_referee_action_with_combat(state, flow, acting_seat, action, records.get_mut(match_id))
+    apply_referee_action_with_combat(state, flow, acting_seat, action, records.get_mut(match_id), None)
         .map_err(|error| error.message)
 }
 
@@ -1078,6 +1085,9 @@ pub fn query_actions(match_id: &str, seat: &str, candidate: Option<&str>) -> Res
     let flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     let flow = flows.get(match_id).ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    let combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    let rules = combat_records.get(match_id).map(|record| &record.ruleset);
     let actor = normalize_seat(seat)
         .map_err(|message| Rejection::new(ReasonCode::UnknownSeat, message));
     let actions = [ActionKind::Move, ActionKind::Attack, ActionKind::Skip, ActionKind::EndTurn]
@@ -1093,7 +1103,7 @@ pub fn query_actions(match_id: &str, seat: &str, candidate: Option<&str>) -> Res
         }).collect();
     let candidate = candidate.map(|token| {
         let result = actor.as_ref().map_err(Clone::clone).and_then(|seat| {
-            apply_referee_action(&mut state.clone(), &mut flow.clone(), seat, token)
+            apply_referee_action_with_combat(&mut state.clone(), &mut flow.clone(), seat, token, None, rules)
         });
         CandidateLegality { token: token.into(), legal: result.is_ok(), rejection: result.err() }
     });
@@ -1179,13 +1189,14 @@ fn validate_action_context(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_referee_action(
     state: &mut GameState,
     flow: &mut MatchFlow,
     acting_seat: &str,
     action: &str,
 ) -> Result<(), Rejection> {
-    apply_referee_action_with_combat(state, flow, acting_seat, action, None)
+    apply_referee_action_with_combat(state, flow, acting_seat, action, None, None)
 }
 
 fn face_counts(die: &crate::dice::Die, faces: &[u8]) -> FaceCounts {
@@ -1200,12 +1211,26 @@ fn face_counts(die: &crate::dice::Die, faces: &[u8]) -> FaceCounts {
     counts
 }
 
-fn resolve_combat_attack(
+struct CombatInputs {
+    attack_base: i32,
+    defense_base: i32,
+    damage_per_strike: i32,
+    attack_height: i32,
+    defense_height: i32,
+    terrain_bonus: i32,
+    attack_total: i32,
+    defense_total: i32,
+    attack_dice: crate::dice::DiceCount,
+    defense_dice: crate::dice::DiceCount,
+    damage_value: crate::dice::DamagePerStrike,
+}
+
+fn combat_inputs(
     attacker: &Entity,
     defender: &Entity,
     terrain: Option<&str>,
-    record: &CombatRecord,
-) -> Result<AttackReport, Rejection> {
+    rules: &CombatRuleset,
+) -> Result<CombatInputs, Rejection> {
     let invalid = || Rejection::new(ReasonCode::InvalidState, "Invalid combat data");
     let combat = |entity: &Entity| entity.components.values().find_map(|component| match component {
         Component::Combat { attack, defense, damage_per_strike } => Some((*attack, *defense, *damage_per_strike)),
@@ -1213,14 +1238,10 @@ fn resolve_combat_attack(
     });
     let (attack_base, _, damage_per_strike) = combat(attacker).ok_or_else(invalid)?;
     let (_, defense_base, _) = combat(defender).ok_or_else(invalid)?;
-    let health = defender.components.values().find_map(|component| match component {
-        Component::Destructible { current_life, .. } => Some(*current_life),
-        _ => None,
-    }).ok_or_else(invalid)?;
     let attack_height = i32::from(attacker.spatial.z > defender.spatial.z);
     let defense_height = i32::from(defender.spatial.z > attacker.spatial.z);
-    let terrain_type = terrain.and_then(|id| record.ruleset.terrain_types.iter().find(|t| t.id == id));
-    let terrain_bonus = record.ruleset.rules.terrain_defense_bonus.iter().find(|bonus| {
+    let terrain_type = terrain.and_then(|id| rules.terrain_types.iter().find(|t| t.id == id));
+    let terrain_bonus = rules.rules.terrain_defense_bonus.iter().find(|bonus| {
         terrain_type.is_some_and(|t| bonus.terrain.as_deref() == Some(t.id.as_str())
             || bonus.tag.as_ref().is_some_and(|tag| t.tags.contains(tag)))
     }).map_or(0, |bonus| bonus.dice);
@@ -1230,6 +1251,24 @@ fn resolve_combat_attack(
     let attack_dice = u16::try_from(attack_total).ok().and_then(crate::dice::DiceCount::new).ok_or_else(invalid)?;
     let defense_dice = u16::try_from(defense_total).ok().and_then(crate::dice::DiceCount::new).ok_or_else(invalid)?;
     let damage_value = u8::try_from(damage_per_strike).ok().and_then(crate::dice::DamagePerStrike::new).ok_or_else(invalid)?;
+    Ok(CombatInputs { attack_base, defense_base, damage_per_strike, attack_height, defense_height,
+        terrain_bonus, attack_total, defense_total, attack_dice, defense_dice, damage_value })
+}
+
+fn resolve_combat_attack(
+    attacker: &Entity,
+    defender: &Entity,
+    terrain: Option<&str>,
+    record: &CombatRecord,
+) -> Result<AttackReport, Rejection> {
+    let invalid = || Rejection::new(ReasonCode::InvalidState, "Invalid combat data");
+    let CombatInputs { attack_base, defense_base, damage_per_strike, attack_height, defense_height,
+        terrain_bonus, attack_total, defense_total, attack_dice, defense_dice, damage_value } =
+        combat_inputs(attacker, defender, terrain, &record.ruleset)?;
+    let health = defender.components.values().find_map(|component| match component {
+        Component::Destructible { current_life, .. } => Some(*current_life),
+        _ => None,
+    }).ok_or_else(invalid)?;
     let sequence = record.dice.attacks_resolved.checked_add(1).ok_or_else(invalid)?;
     let from = record.dice.draws_used;
     let (outcome, to) = crate::dice::resolve_attack(attack_dice, defense_dice, damage_value, &record.ruleset.die, record.dice.seed, from);
@@ -1262,6 +1301,7 @@ fn apply_referee_action_with_combat(
     acting_seat: &str,
     action: &str,
     combat: Option<&mut CombatRecord>,
+    query_rules: Option<&CombatRuleset>,
 ) -> Result<(), Rejection> {
     validate_action_context(state, flow, acting_seat, ActionKind::from_token(action))?;
     let next = flow.advance().map_err(|message| Rejection::new(ReasonCode::InvalidState, message))?;
@@ -1364,8 +1404,7 @@ fn apply_referee_action_with_combat(
                 {
                     return Err(Rejection::new(ReasonCode::InvalidTarget, format!("Target is not destructible: {target_id}")));
                 }
-                let report = if let Some(record) = combat.as_ref() {
-                    let terrain = state.entities.values().find_map(|entity| {
+                let terrain = state.entities.values().find_map(|entity| {
                         (entity.spatial.q == target.spatial.q && entity.spatial.r == target.spatial.r
                             && entity.spatial.z == target.spatial.z).then(|| {
                             entity.components.values().find_map(|component| match component {
@@ -1374,6 +1413,10 @@ fn apply_referee_action_with_combat(
                             })
                         }).flatten()
                     });
+                if let Some(rules) = query_rules {
+                    combat_inputs(attacker, target, terrain, rules)?;
+                }
+                let report = if let Some(record) = combat.as_ref() {
                     Some(resolve_combat_attack(attacker, target, terrain, record)?)
                 } else {
                     None
@@ -1630,6 +1673,69 @@ mod dice_combat_tests {
         let report = get_combat_record(id).unwrap().unwrap().dice.last_attack.unwrap();
         assert_eq!((report.damage, report.defender_health_after, report.defender_removed), (0, 10, false));
         remove_match(id);
+    }
+
+    #[test]
+    fn v2_deployment_rejects_v1_profiles_without_mutation() {
+        let id = "b5_v2_deploy_guard";
+        start(id, &setup(1, json!(["strike"]), false));
+        let registry = ModRegistry::default();
+        let profile = json!({"schema_version":1,"mod_id":"com.example.legacy",
+            "display_name":"Legacy","visual_primitive":"CUBE",
+            "components":{"tags":["Unit"],"destructible":{"current_life":4,"max_life":4}}});
+        registry.load_batch(&json!([profile]).to_string()).unwrap();
+        let before = preserved(id);
+        let setup_before = {
+            let records = MATCH_SETUP_RECORDS.lock().unwrap();
+            let record = &records[id];
+            json!([record.name, record.map, record.roster])
+        };
+        let registry_before = serde_json::to_value(registry.get_template("com.example.legacy").unwrap()).unwrap();
+        for deploy in [deploy_profile_unit, deploy_profile_unit_recorded] {
+            assert_eq!(deploy(id, "UNIT_P1_1", "com.example.legacy", "P1", 4, &registry).unwrap_err(),
+                "profile com.example.legacy has no combat values; version 2 matches need schema 2 profiles");
+            assert_eq!(preserved(id), before);
+            let records = MATCH_SETUP_RECORDS.lock().unwrap();
+            let record = &records[id];
+            assert_eq!(json!([record.name, record.map, record.roster]), setup_before);
+            assert_eq!(serde_json::to_value(registry.get_template("com.example.legacy").unwrap()).unwrap(), registry_before);
+        }
+        remove_match(id);
+        let legacy = "b5_v1_deploy_guard";
+        store_match(legacy.into(), generate_test_sandbox(legacy.into()));
+        deploy_profile_unit(legacy, "UNIT_P1_1", "com.example.legacy", "P1", 4, &registry).unwrap();
+        remove_match(legacy);
+    }
+
+    #[test]
+    fn v2_query_and_execution_reject_invalid_combat_without_mutation() {
+        for (id, unit, oversized) in [
+            ("b5_missing_attacker", "UNIT_P1_1", false),
+            ("b5_missing_defender", "UNIT_P2_1", false),
+            ("b5_oversized_defender", "UNIT_P2_1", true),
+        ] {
+            start(id, &setup(1, json!(["strike"]), false));
+            {
+                let mut matches = ACTIVE_MATCHES.lock().unwrap();
+                let entity = matches.get_mut(id).unwrap().entities.get_mut(unit).unwrap();
+                if oversized {
+                    if let Component::Combat { defense, .. } = entity.components.get_mut("combat").unwrap() {
+                        *defense = 1000;
+                    }
+                } else {
+                    entity.components.remove("combat");
+                }
+            }
+            process_action(id, "P1", "S").unwrap();
+            let before = preserved(id);
+            let token = "A:UNIT_P1_1:UNIT_P2_1";
+            let query = query_actions(id, "P1", Some(token)).unwrap().candidate.unwrap();
+            assert!(!query.legal);
+            assert_eq!(query.rejection.unwrap().message, "Invalid combat data");
+            assert_eq!(process_action(id, "P1", token).unwrap_err(), "Invalid combat data");
+            assert_eq!(preserved(id), before);
+            remove_match(id);
+        }
     }
 
     #[test]
