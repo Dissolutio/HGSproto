@@ -15,7 +15,7 @@ import init, {
   wasm_process_token_for_match,
   wasm_query_deploy,
   wasm_reset_match,
-  wasm_restore_local_sandbox,
+  wasm_restore_local_sandbox_report,
 } from "../../wasm/hex_game_core";
 import {
   ACTIVE_MATCH_ID_STORAGE_KEY,
@@ -39,6 +39,7 @@ import {
 import {
   discardSavedSandbox,
   openSandboxStorage,
+  restoreNoticeWithSetupWarning,
   restoreSavedSandbox,
   saveSandbox,
   type SandboxStorage,
@@ -118,9 +119,16 @@ export function useGameRuntime() {
     sandboxRestoreAttempted.current = true;
     const storage = openSandboxStorage(() => window.sessionStorage);
     sandboxStorage.current = storage;
+    let setupDropped: string | null = null;
     const startup = restoreSavedSandbox(
       storage,
-      (record) => wasm_restore_local_sandbox(WASM_MATCH_ID, record),
+      (record) => {
+        const report = JSON.parse(wasm_restore_local_sandbox_report(WASM_MATCH_ID, record)) as {
+          profiles: number; setup_dropped: string | null;
+        };
+        setupDropped = report.setup_dropped;
+        return report.profiles;
+      },
     );
     sandboxSavingEnabled.current = startup.savingEnabled;
     if (startup.kind === "empty") return null;
@@ -132,9 +140,9 @@ export function useGameRuntime() {
     try {
       showLoadedProfiles(loadedProfilesFromSetup(startup.record), false);
     } catch (error) {
-      return `Saved sandbox restored, but its profile list could not be shown: ${error instanceof Error ? error.message : String(error)}`;
+      return restoreNoticeWithSetupWarning(`Saved sandbox restored, but its profile list could not be shown: ${error instanceof Error ? error.message : String(error)}`, setupDropped);
     }
-    return `Saved sandbox restored with ${startup.profileCount} profile${startup.profileCount === 1 ? "" : "s"}`;
+    return restoreNoticeWithSetupWarning(`Saved sandbox restored with ${startup.profileCount} profile${startup.profileCount === 1 ? "" : "s"}`, setupDropped);
   };
 
   const saveLocalSandbox = () => {
