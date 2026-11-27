@@ -6,6 +6,40 @@ use crate::dice::{Die, FaceKind};
 pub struct ValidatedSetupV2 {
     pub source: Value,
     pub die: Die,
+    pub terrain_types: Vec<TerrainDefinition>,
+    pub rules: ScenarioRules,
+    pub(super) common: ValidatedSetup,
+    pub(super) profiles: Vec<UnitTemplate>,
+    pub(super) inline: Vec<UnitTemplate>,
+    pub(super) piece_terrain: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TerrainDefinition {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TerrainBonus {
+    pub tag: Option<String>,
+    pub terrain: Option<String>,
+    pub dice: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct HealthCap {
+    pub starting_health: Option<i32>,
+    pub max_health: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ScenarioRules {
+    #[serde(default)]
+    pub terrain_defense_bonus: Vec<TerrainBonus>,
+    pub health_cap: Option<HealthCap>,
 }
 
 pub fn validate_setup_v2(json: &str) -> Result<ValidatedSetupV2, String> {
@@ -466,6 +500,16 @@ pub(super) fn validate_value(value: &Value) -> Result<ValidatedSetupV2, String> 
     Ok(ValidatedSetupV2 {
         source: value.clone(),
         die,
+        terrain_types: decode(&root["terrain_types"], "terrain_types")?,
+        rules: decode(&root["rules"], "rules")?,
+        common,
+        profiles: profiles.iter().enumerate()
+            .map(|(index, profile)| decode(profile, &format!("profiles[{index}]")))
+            .collect::<Result<_, _>>()?,
+        inline,
+        piece_terrain: pieces.iter()
+            .map(|piece| piece["terrain"].as_str().expect("terrain checked").to_owned())
+            .collect(),
     })
 }
 
