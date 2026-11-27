@@ -12,6 +12,10 @@ use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+#[path = "setup_v2.rs"]
+mod v2;
+pub use v2::{ValidatedSetupV2, validate_setup_v2};
+
 const MAX_SETUP_BYTES: usize = 1_048_576;
 const MAX_DEPTH: usize = 32;
 const MAX_STAGED_SNAPSHOT_BYTES: usize = 1_048_576;
@@ -348,10 +352,14 @@ pub fn validate_setup(json: &str) -> Result<ValidatedSetup, String> {
         .get("setup_version")
         .ok_or_else(|| "setup_version must be the integer 1".to_string())?;
     if let Some(version) = version.as_u64() {
-        if version > 1 {
+        if version > 2 {
             return Err(format!(
-                "setup_version {version} is newer than this game supports (1)"
+                "setup_version {version} is newer than this game supports (2)"
             ));
+        }
+        if version == 2 {
+            v2::validate_value(&value)?;
+            return Err("setup_version 2 needs a seed; not supported yet".into());
         }
         if version != 1 {
             return Err("setup_version must be the integer 1".into());
@@ -359,8 +367,12 @@ pub fn validate_setup(json: &str) -> Result<ValidatedSetup, String> {
     } else {
         return Err("setup_version must be the integer 1".into());
     }
+    validate_v1(&value)
+}
+
+fn validate_v1(value: &Value) -> Result<ValidatedSetup, String> {
     let envelope_fields = ["setup_version", "name", "map", "profiles", "roster"];
-    let root = fields(&value, "invalid setup", &envelope_fields, &envelope_fields)?;
+    let root = fields(value, "invalid setup", &envelope_fields, &envelope_fields)?;
     let name: String = decode(&root["name"], "name")?;
     if name.len() > 128 {
         return Err("name: exceeds the 128-byte limit".into());
@@ -891,10 +903,10 @@ mod tests {
           "rules": { "terrain": [] }
         });
         assert_eq!(check(&value).unwrap_err(), "invalid setup: unknown field 'rules', expected one of 'setup_version', 'name', 'map', 'profiles', 'roster'");
-        value["setup_version"] = 2.into();
+        value["setup_version"] = 3.into();
         assert_eq!(
             check(&value).unwrap_err(),
-            "setup_version 2 is newer than this game supports (1)"
+            "setup_version 3 is newer than this game supports (2)"
         );
     }
 
@@ -906,12 +918,12 @@ mod tests {
             (json!(1.0), "setup_version must be the integer 1"),
             (json!(-1), "setup_version must be the integer 1"),
             (
-                json!(2),
-                "setup_version 2 is newer than this game supports (1)",
+                json!(3),
+                "setup_version 3 is newer than this game supports (2)",
             ),
             (
                 json!(u64::MAX),
-                "setup_version 18446744073709551615 is newer than this game supports (1)",
+                "setup_version 18446744073709551615 is newer than this game supports (2)",
             ),
         ] {
             assert_eq!(
@@ -2268,6 +2280,27 @@ mod tests {
                 "Player seat is already active: Player_1"
             );
         }
+        engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn valid_v2_apply_preserves_changed_match_and_records() {
+        let (match_id, registry) = changed_running_match("apply_v2_refused");
+        let before = apply_preservation(&match_id, &registry);
+        let mut candidate = example();
+        candidate["setup_version"] = 2.into();
+        candidate["terrain_types"] = json!([{"id":"grass","name":"Grass"}]);
+        candidate["map"]["boardPieces"][0]["terrain"] = "grass".into();
+        candidate["rules"] = json!({});
+        candidate["profiles"][0]["schema_version"] = 2.into();
+        candidate["profiles"][0]["components"]["combat"] = json!({"attack":2,"defense":2});
+        for unit in candidate["map"]["starterUnits"].as_array_mut().unwrap() {
+            unit["components"]["combat"] = json!({"attack":2,"defense":2});
+        }
+        validate_setup_v2(&candidate.to_string()).unwrap();
+        assert_eq!(apply_setup(match_id.clone(), &candidate.to_string(), &registry).unwrap_err(),
+            "setup_version 2 needs a seed; not supported yet");
+        assert_eq!(apply_preservation(&match_id, &registry), before);
         engine::remove_match(&match_id);
     }
 
