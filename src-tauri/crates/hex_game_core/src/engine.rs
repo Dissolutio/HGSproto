@@ -660,24 +660,11 @@ fn starter_unit_components(
         }
     })?;
     let seat = starter_unit_seat(unit)?;
-    let mut components = HashMap::new();
-    for key in ["destructible", "tags", "combat"] {
-        if let Some(component) = template.components.get(key) {
-            components.insert(key.to_string(), component.clone());
-        }
-    }
-    let labels = match components.remove("tags") {
-        Some(Component::Tags { labels }) => labels,
-        _ => Vec::new(),
-    };
-    let mut labels = labels;
-    labels.retain(|label| label != "P1" && label != "P2");
-    labels.push(seat.to_string());
-    components.insert("tags".to_string(), Component::Tags { labels });
+    let prepared = build_profile_components(&template, seat, None);
     Ok((
-        components,
-        Some(template.visual_primitive),
-        Some(template.display_name),
+        prepared.components,
+        prepared.visual_primitive,
+        prepared.display_name,
     ))
 }
 
@@ -858,10 +845,41 @@ pub(crate) fn stage_v2_roster(
     Ok(())
 }
 
-struct PreparedDeployment {
+pub(crate) struct PreparedDeployment {
     components: HashMap<String, Component>,
     visual_primitive: Option<String>,
     display_name: Option<String>,
+}
+
+pub(crate) fn build_profile_components(
+    template: &crate::mod_registry::UnitTemplate,
+    seat: &str,
+    starting_life: Option<i32>,
+) -> PreparedDeployment {
+    let mut components = HashMap::new();
+    for key in ["destructible", "tags", "combat"] {
+        if let Some(component) = template.components.get(key) {
+            components.insert(key.to_string(), component.clone());
+        }
+    }
+    let labels = match components.remove("tags") {
+        Some(Component::Tags { labels }) => labels,
+        _ => Vec::new(),
+    };
+    let mut labels = labels;
+    labels.retain(|label| label != "P1" && label != "P2");
+    labels.push(seat.to_string());
+    components.insert("tags".to_string(), Component::Tags { labels });
+    if let (Some(starting_life), Some(Component::Destructible { current_life, .. })) =
+        (starting_life, components.get_mut("destructible"))
+    {
+        *current_life = starting_life;
+    }
+    PreparedDeployment {
+        components,
+        visual_primitive: Some(template.visual_primitive.clone()),
+        display_name: Some(template.display_name.clone()),
+    }
 }
 
 fn prepare_profile_deployment(
@@ -891,25 +909,8 @@ fn prepare_profile_deployment_from_template(
     starting_life: i32,
     template: &crate::mod_registry::UnitTemplate,
 ) -> Result<PreparedDeployment, String> {
-    let mut components = HashMap::new();
-    for key in ["destructible", "tags", "combat"] {
-        if let Some(component) = template.components.get(key) {
-            components.insert(key.to_string(), component.clone());
-        }
-    }
-    let labels = match components.remove("tags") {
-        Some(Component::Tags { labels }) => labels,
-        _ => Vec::new(),
-    };
-    let mut labels = labels;
-    labels.retain(|label| label != "P1" && label != "P2");
-    labels.push(seat.to_string());
-    components.insert("tags".to_string(), Component::Tags { labels });
-    let Component::Destructible {
-        current_life,
-        max_life,
-    } = components
-        .get_mut("destructible")
+    let Component::Destructible { max_life, .. } = template.components
+        .get("destructible")
         .ok_or_else(|| format!("Profile '{mod_id}' has no destructible component"))?
     else {
         return Err(format!(
@@ -919,12 +920,7 @@ fn prepare_profile_deployment_from_template(
     if !(1..=*max_life).contains(&starting_life) {
         return Err(format!("starting health must be within 1..={max_life}"));
     }
-    *current_life = starting_life;
-    Ok(PreparedDeployment {
-        components,
-        visual_primitive: Some(template.visual_primitive.clone()),
-        display_name: Some(template.display_name.clone()),
-    })
+    Ok(build_profile_components(template, seat, Some(starting_life)))
 }
 
 fn check_profile_deployment(
