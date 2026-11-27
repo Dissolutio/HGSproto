@@ -88,12 +88,17 @@ impl OverCap {
     }
 
     pub(crate) fn house_rule(&self, approval: Approval) -> Value {
-        let suffix = format!(" in {} allowed above the health cap", self.slot);
-        let mut end = self.display_name.len().min(128 - suffix.len());
-        while !self.display_name.is_char_boundary(end) { end -= 1; }
+        let name = if self.profile.is_some() {
+            let suffix = format!(" in {} allowed above the health cap", self.slot);
+            let mut end = self.display_name.len().min(128 - suffix.len());
+            while !self.display_name.is_char_boundary(end) { end -= 1; }
+            format!("{}{}", &self.display_name[..end], suffix)
+        } else {
+            format!("Unit {} allowed above the health cap", self.slot)
+        };
         let mode = match approval { Approval::LocalSandbox => "local_sandbox" };
         serde_json::json!({"kind":"allow_over_health_cap", "slot":self.slot,
-            "name":format!("{}{}", &self.display_name[..end], suffix),
+            "name":name,
             "starting_health":self.starting_health, "max_health":self.max_health,
             "approval":{"mode":mode}})
     }
