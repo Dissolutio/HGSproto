@@ -9,7 +9,7 @@
 - **[Doc]**: stated in an existing document in this repository (cited). Not re-checked unless also marked [Code] or [Run].
 - **[Inferred]**: reasoned from code, docs, or library documentation, but not checked by running or by a direct line of code.
 - **[2M]**: depends on the two-machine cross-network test (WE-3), which **has not been run**. This design does not assume its outcome.
-- **[Q-n]**: an open question for the PM (section 11). Where an answer is needed, this design names a recommended default and says which build issue waits.
+- **[Q-n]**: a PM question with its answer recorded in section 11. Where an answer is needed, this design names a recommended default and says which build issue waits.
 
 ## Summary for a non-engineer
 
@@ -23,7 +23,7 @@ M4 fixes this with five ideas:
 4. **Fair dice.** Before each attack, both computers have already locked in a secret random number without showing it. When the attack is accepted, both secrets are revealed and mixed together to make the dice. Neither player can choose the roll, and neither can know it before the attack is committed.
 5. **Saved to disk, not just remembered.** Every accepted move is written to a match file on disk **before** the result is sent. A dropped connection, a closed browser, or a restarted game can resume from that file. It can't undo accepted moves or bring dead units back.
 
-The work is fourteen small issues (section 10). **The first issue, N1, can start today.** It builds and tests the move-numbering and duplicate-handling logic on its own, with no networking and no new dependency. Some later issues wait on PM answers. The most important: what we promise when a connection drops (D11, section 6.4), how long a save lasts (D10, section 7.4), and permission to add a direct dependency on the `blake3` hash crate. That crate is already compiled into the game through Iroh, but adding it changes one entry in `Cargo.lock` (Q-1).
+The work is fourteen small issues (section 10). **The first issue, N1, can start today.** It builds and tests the move-numbering and duplicate-handling logic on its own, with no networking and no new dependency. The PM answers needed for later issues are now recorded in section 11. The most important decisions are what we promise when a connection drops (D11, section 6.4), how long a save lasts (D10, section 7.4), and permission to add direct `blake3` and `getrandom` dependencies to `hex_game_network` (Q-1). `blake3` is already compiled into the game through Iroh, but adding direct dependencies changes the `Cargo.lock` entry.
 
 ---
 
@@ -667,22 +667,22 @@ Each issue is one pull request, in dependency order, with its own test. The colu
 
 ## 11. Questions for the PM
 
-| ID | Question | Recommendation | What waits |
-|---|---|---|---|
-| **Q-1** | May `hex_game_network` add direct dependencies on `blake3` (already in `Cargo.lock` through Iroh) and `getrandom` (also already present)? This adds lines to `hex_game_network`'s `Cargo.lock` entry, but no new packages. | Yes. Use `blake3` for all hashing, for the reasons in 5.4. | N6, N8 (N1–N5 don't) |
-| **D10** | How long should a network match save last? (7.4) | D10-b: until the match ends, then 30 days, with "Delete" always available. | N9's retention rule |
-| **D11** | What do we promise when a connection drops? (6.4) | D11-a: pause and resume, nothing accepted is lost or undone, no forfeit. | N10, N11 wording |
-| Q-3 | If the guest's computer is lost, may the host hand seat 2 to a new computer? | Yes, host-initiated only, with confirmation, recorded in the log. | Part of N5 (can be split out) |
-| Q-4 | Should the host confirm each new guest ("Accept player 7f3a…?"), or is the invite secret enough? | The invite secret is enough for M4. The guest's short ID is shown to the host. | N5 |
-| Q-5 | Should both players need the same **rules revision** or the exact same **build**? | Rules revision (4.1). | N4 |
-| Q-6 | When the guest's check disagrees with the host's result (1.6), may the guest continue on the host's copy? | Offer "Load host's copy" or "Leave", and record the choice. | N7 |
-| Q-7 | Are house rules allowed in network matches, with both players approving? | Yes, with `all_players` approval on the accept screen. | N12 |
-| Q-8 | How is a match scored when a player abandons it, including refusing to reveal a dice secret? | No automatic result in M4. The match stays paused and unfinished (fits D11-a). | Only if D11-c is chosen |
-| Q-9 | Can either player end or restart a network match on their own? | Either player can **leave** (keeps the file). Only the host can **end**. **Restart** needs both. | N10 |
-| Q-10 | Is "Export a local copy" of a network match wanted (needs saved record v4)? | Not in M4. | Nothing in the plan |
-| Q-11 | May a later issue add a manual-trigger workflow that runs the R02 loop on a GitHub-hosted runner? | Yes, as a separate, non-gating, manually triggered job. | N13 in CI form; a laptop run doesn't wait |
-| Q-12 | If the two-machine test shows cross-network joins fail, may M4's device evidence use two machines on one local network? | Yes, as an interim result, clearly labelled, with cross-network moved to a follow-up. | N14 |
-| Q-13 | Shorten the ~35 s abrupt-loss detection? (`iroh-upgrade-report.md`, PM decision 3) | Not until the two-machine test reports numbers. 2.2 makes it matter less. | Nothing |
+| ID | Question | Recommendation | PM answer (2026-11-27) | What waits |
+|---|---|---|---|---|
+| **Q-1** | May `hex_game_network` add direct dependencies on `blake3` (already in `Cargo.lock` through Iroh) and `getrandom` (also already present)? This adds lines to `hex_game_network`'s `Cargo.lock` entry, but no new packages. | Yes. Use `blake3` for all hashing, for the reasons in 5.4. | Yes: add direct `blake3` and `getrandom` dependencies to `hex_game_network`. | N6, N8 (N1–N5 don't) |
+| **D10** | How long should a network match save last? (7.4) | D10-b: until the match ends, then 30 days, with "Delete" always available. | D10-b: retain the save until the match ends, then for 30 days; "Delete" is always available. | N9's retention rule |
+| **D11** | What do we promise when a connection drops? (6.4) | D11-a: pause and resume, nothing accepted is lost or undone, no forfeit. | D11-a: pause and resume, with no time limit and no forfeit. | N10, N11 wording |
+| Q-3 | If the guest's computer is lost, may the host hand seat 2 to a new computer? | Yes, host-initiated only, with confirmation, recorded in the log. | Yes: host-initiated handover with confirmation, recorded in the log. | Part of N5 (can be split out) |
+| Q-4 | Should the host confirm each new guest ("Accept player 7f3a…?"), or is the invite secret enough? | The invite secret is enough for M4. The guest's short ID is shown to the host. | The invite secret is enough; show the guest's short ID. | N5 |
+| Q-5 | Should both players need the same **rules revision** or the exact same **build**? | Rules revision (4.1). | Rules revision. | N4 |
+| Q-6 | When the guest's check disagrees with the host's result (1.6), may the guest continue on the host's copy? | Offer "Load host's copy" or "Leave", and record the choice. | Offer "Load host's copy" or "Leave", and record the choice. | N7 |
+| Q-7 | Are house rules allowed in network matches, with both players approving? | Yes, with `all_players` approval on the accept screen. | Yes, with `all_players` approval. | N12 |
+| Q-8 | How is a match scored when a player abandons it, including refusing to reveal a dice secret? | No automatic result in M4. The match stays paused and unfinished (fits D11-a). | No automatic result. | Only if D11-c is chosen |
+| Q-9 | Can either player end or restart a network match on their own? | Either player can **leave** (keeps the file). Only the host can **end**. **Restart** needs both. | Leaving keeps the file; only the host ends; restart needs both players. | N10 |
+| Q-10 | Is "Export a local copy" of a network match wanted (needs saved record v4)? | Not in M4. | Not in M4. | Nothing in the plan |
+| Q-11 | May a later issue add a manual-trigger workflow that runs the R02 loop on a GitHub-hosted runner? | Yes, as a separate, non-gating, manually triggered job. | Yes, as a separate, manual, non-gating job. | N13 in CI form; a laptop run doesn't wait |
+| Q-12 | If the two-machine test shows cross-network joins fail, may M4's device evidence use two machines on one local network? | Yes, as an interim result, clearly labelled, with cross-network moved to a follow-up. | Yes, as a labelled interim result; cross-network moves to a follow-up. | N14 |
+| Q-13 | Shorten the ~35 s abrupt-loss detection? (`iroh-upgrade-report.md`, PM decision 3) | Not until the two-machine test reports numbers. 2.2 makes it matter less. | Keep the default until two-machine numbers exist. | Nothing |
 
 ---
 

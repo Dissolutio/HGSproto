@@ -24,7 +24,7 @@ is identified.
 | Rust and Cargo versions | | |
 | Node and npm versions | | |
 | wasm-pack version | | |
-| Test commit (`git rev-parse HEAD`) | | |
+| Build commit (`git rev-parse HEAD`) | | |
 | Session start date/time (local) | | |
 | Network type/provider (name only; no addresses) | Home broadband provider/router name: | Phone hotspot cellular carrier name: |
 | VPN or tunnel active? (must be no) | No / explain: | No / explain: |
@@ -34,11 +34,51 @@ is identified.
 | Existing firewall rule name, direction, action, profile, enabled state | | |
 | Firewall prompt shown? Exact app/publisher/profiles/button clicked | | |
 | Diagnostic log directory | | |
+| Iroh version | | |
 
 For each connection attempt, include the host and guest log filename(s) for that
 attempt. Never paste the connection ticket, node ID, or match ID into this
 sheet. Attach screenshots only after checking that they do not show the ticket
 or node ID. Never include tickets, node IDs, or keys in screenshots or logs.
+
+## M4 §8.3 measurements
+
+Record the build commit and Iroh version for both machines in Batch setup.
+Complete the join row for each fresh join; use the local logs to record whether
+each side used a relay (`unknown` is fine if the logs do not show it). Use a
+stopwatch or phone timer for elapsed times. If a join or reconnect stalls,
+write the phase shown on screen or in the logs and how long it remained there.
+
+| Fresh join attempt | Machine 1 network type | Machine 2 network type | Relay used (M1 / M2: yes/no/unknown) | Join click to joined (seconds) | Stalled phase and duration, if any |
+|---|---|---|---|---:|---|
+| | | | | | |
+| | | | | | |
+| | | | | | |
+| | | | | | |
+| | | | | | |
+
+Use one row per leave or loss measurement. For graceful leave, start timing
+when the guest uses the normal leave control, and stop when the host's Peer
+Status shows `(Disconnected)`. For abrupt loss, note whether you stopped the
+guest process or turned off its Wi-Fi; start timing at that action and stop
+when the host's Peer Status shows `(Disconnected)`. After restoring the guest
+process or Wi-Fi, time until the guest shows **Joined and synchronized with the
+host**. Record a stalled phase and its duration for either detection or
+reconnection.
+
+| Attempt | Event (graceful leave / abrupt loss) | Abrupt method (process / Wi-Fi / N/A) | Seconds to host detection | Restore action | Seconds from restore to reconnected | Stalled phase and duration |
+|---|---|---|---:|---|---:|---|
+| | | | | | | |
+| | | | | | | |
+| | | | | | | |
+
+For one move, start the timer when the acting player sends it and stop when it
+appears on the other player's screen. Record the elapsed time as the observed
+move round trip.
+
+| Attempt | Acting seat | Move sent | Seconds from send to shown on other screen |
+|---|---|---|---:|
+| | | | |
 
 ## Short-match observations
 

@@ -1,5 +1,7 @@
 # WE-3 Cross-Network Test Package
 
+Run this on `dev` at the commit you record. M4 network changes have not started, so the behavior tested is today's network play.
+
 This package prepares a two-laptop test of the current native-assisted peer
 connection. It is a test procedure, not a packaged game distribution.
 
