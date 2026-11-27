@@ -99,6 +99,12 @@ pub fn export_local_sandbox(match_id: &str, registry: &ModRegistry) -> Result<St
     if let Some(combat) = combat.get(match_id) {
         let record = setup_records.get(match_id)
             .ok_or_else(|| "setup: this match has no setup record".to_string())?;
+        if !profiles.is_empty() {
+            let batch = serde_json::to_string(&profiles)
+                .map_err(|error| format!("Could not prepare saved profiles: {error}"))?;
+            ModRegistry::default().load_batch(&batch)
+                .map_err(|error| format!("Saved profiles are invalid: {error}"))?;
+        }
         let mut setup = setup::export_v2_setup(record, &templates, &combat.ruleset)?;
         if let Some(house_rules) = record.map.get("house_rules") {
             setup["house_rules"] = house_rules.clone();
@@ -188,10 +194,13 @@ pub fn restore_local_sandbox(
             .map_err(|error| format!("Saved profiles are invalid: {error}"))?
     };
 
-    let state: GameState = serde_json::from_value(snapshot)
+    let mut state: GameState = serde_json::from_value(snapshot)
         .map_err(|error| format!("Invalid match snapshot: {error}"))?;
-    if state.context.match_id != match_id {
+    if record_version != 3 && state.context.match_id != match_id {
         return Err("Saved snapshot match ID does not match the local sandbox".into());
+    }
+    if record_version == 3 {
+        state.context.match_id = match_id.to_string();
     }
     let mut referenced: Vec<&str> = state
         .entities
