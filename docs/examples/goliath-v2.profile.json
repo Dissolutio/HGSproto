@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "mod_id": "com.community.goliath",
+  "display_name": "Goliath",
+  "visual_primitive": "CUBE",
+  "components": {
+    "destructible": { "current_life": 12, "max_life": 12 },
+    "combat": { "attack": 3, "defense": 3, "damage_per_strike": 1 },
+    "tags": ["Unit", "Heavy"]
+  }
+}

@@ -1033,6 +1033,216 @@ mod tests {
     use crate::local_sandbox::{export_local_sandbox, restore_local_sandbox};
     use serde_json::json;
 
+    const B9_DEMO: &str = include_str!("../../../../docs/examples/m3-dice-demo.setup.json");
+    const B9_GOLIATH: &str = include_str!("../../../../docs/examples/goliath-v2.profile.json");
+    const B9_SEED: u64 = 0x0123456789abcdef;
+
+    fn b9_play_token(id: &str, seat: &str, token: &str) {
+        let before = match_value(id);
+        let combat_before = engine::get_combat_record(id).unwrap().unwrap();
+        assert!(engine::query_actions(id, seat, Some(token))
+            .unwrap().candidate.unwrap().legal, "{seat}: {token}");
+        assert_eq!(engine::get_combat_record(id).unwrap().unwrap(), combat_before);
+        engine::process_action(id, seat, token).unwrap();
+        let combat = engine::get_combat_record(id).unwrap().unwrap();
+        let Some(target) = token.strip_prefix("A:UNIT_P1_2:") else {
+            assert_eq!(combat, combat_before);
+            return;
+        };
+        let (terrain, bonus) = match target {
+            "UNIT_P2_1" => ("shadow", 1),
+            "UNIT_P2_2" => ("grass", 0),
+            _ => panic!("unexpected demo target"),
+        };
+        let die = crate::dice::Die::default();
+        let from = combat_before.dice.draws_used;
+        let mut draws = from;
+        let attack: Vec<_> = (0..3)
+            .map(|_| crate::dice::roll_die(B9_SEED, &mut draws, &die)).collect();
+        let defense: Vec<_> = (0..3 + bonus)
+            .map(|_| crate::dice::roll_die(B9_SEED, &mut draws, &die)).collect();
+        let counts = |faces: &[u8]| {
+            let count = |kind| faces.iter()
+                .filter(|&&face| die.faces()[face as usize] == kind).count();
+            json!({
+                "strike": count(crate::dice::FaceKind::Strike),
+                "block": count(crate::dice::FaceKind::Block),
+                "blank": count(crate::dice::FaceKind::Blank)
+            })
+        };
+        let attack_counts = counts(&attack);
+        let defense_counts = counts(&defense);
+        let strikes = attack_counts["strike"].as_u64().unwrap();
+        let blocks = defense_counts["block"].as_u64().unwrap();
+        let damage = strikes.saturating_sub(blocks);
+        let health_before = component(&before, target, "destructible")["current_life"]
+            .as_i64().unwrap();
+        let health_after = health_before - damage as i64;
+        let sequence = combat_before.dice.attacks_resolved + 1;
+        let expected = json!({
+            "sequence": sequence, "attacker": "UNIT_P1_2", "defender": target,
+            "attack": {
+                "base": 3, "height_bonus": 0, "total": 3,
+                "faces": attack, "counts": attack_counts, "strikes": strikes
+            },
+            "defense": {
+                "base": 3, "height_bonus": 0, "terrain_bonus": bonus,
+                "terrain": terrain, "total": 3 + bonus,
+                "faces": defense, "counts": defense_counts, "blocks": blocks
+            },
+            "unblocked_strikes": damage, "damage_per_strike": 1, "damage": damage,
+            "defender_health_before": health_before, "defender_health_after": health_after,
+            "defender_removed": health_after <= 0, "draws": {"from": from, "to": draws}
+        });
+        assert_eq!(serde_json::to_value(&combat.dice.last_attack).unwrap(), expected);
+        assert_eq!(combat.dice.draws_used, draws);
+        assert_eq!(combat.dice.attacks_resolved, sequence);
+        let public: Value = serde_json::from_str(&engine::combat_state(id).unwrap()).unwrap();
+        assert_eq!(public["last_attack"], expected);
+        let after = match_value(id);
+        if health_after <= 0 {
+            assert!(after["entities"].get(target).is_none());
+        } else {
+            assert_eq!(component(&after, target, "destructible")["current_life"], health_after);
+            assert_eq!(component(&after, target, "destructible")["max_life"], 4);
+        }
+    }
+
+    #[test]
+    fn b9_shipped_demo_plays_replays_and_restores_to_identical_winner() {
+        validate_setup_v2(B9_DEMO).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&check_setup(B9_DEMO)).unwrap(),
+            json!({"ok":true,"error":null,"over_cap":[],"house_rules":[]}));
+        let ids = ["b9_uninterrupted", "b9_replay", "b9_restored"];
+        let registry = ModRegistry::default();
+        for id in &ids[..2] {
+            apply_setup_with_seed((*id).into(), B9_DEMO, &registry, B9_SEED,
+                Approval::LocalSandbox).unwrap();
+            let combat = engine::get_combat_record(id).unwrap().unwrap();
+            assert_eq!(combat.ruleset.die, crate::dice::Die::default());
+            assert_eq!(combat.dice.seed, B9_SEED);
+            assert_eq!(combat.dice.draws_used, 0);
+            let snapshot = match_value(id);
+            for (unit, q) in [("UNIT_P1_1", 0), ("UNIT_P1_2", 1),
+                ("UNIT_P2_1", 3), ("UNIT_P2_2", 4)] {
+                assert_eq!(snapshot["entities"][unit]["spatial"], json!({"q":q,"r":0,"z":0}));
+                assert_eq!(component(&snapshot, unit, "destructible"),
+                    &json!({"current_life":4,"max_life":4}));
+                assert_eq!(component(&snapshot, unit, "combat"),
+                    &json!({"attack":3,"defense":3,"damage_per_strike":1}));
+            }
+        }
+        let mut script = Vec::new();
+        for (movement, attack, rounds) in [
+            ("M:UNIT_P1_2:Q2R0Z0", "A:UNIT_P1_2:UNIT_P2_1", 13),
+            ("M:UNIT_P1_2:Q3R0Z0", "A:UNIT_P1_2:UNIT_P2_2", 6),
+        ] {
+            for round in 0..rounds {
+                script.push(("P1", if round == 0 { movement } else { "S" }));
+                script.push(("P1", attack));
+                if attack.ends_with("UNIT_P2_2") && round == rounds - 1 {
+                    break;
+                }
+                script.extend([("P1", "E"), ("P2", "S"), ("P2", "S"), ("P2", "E")]);
+            }
+        }
+        let checkpoint = 13; // Immediately after the third attack: the defender is damaged.
+        let restored_registry = ModRegistry::default();
+        for (index, &(seat, token)) in script.iter().enumerate() {
+            for id in &ids[..if index > checkpoint { 3 } else { 2 }] {
+                b9_play_token(id, seat, token);
+                let mut snapshot = match_value(id);
+                snapshot["context"]["match_id"] = ids[0].into();
+                assert_eq!(snapshot, match_value(ids[0]));
+                assert_eq!(engine::get_combat_record(id).unwrap(),
+                    engine::get_combat_record(ids[0]).unwrap());
+            }
+            if index == checkpoint {
+                let before = apply_preservation(ids[0], &registry);
+                let combat_before = engine::get_combat_record(ids[0]).unwrap();
+                let setup_before = export_setup(ids[0], &registry).unwrap();
+                let mut invalid: Value = serde_json::from_str(B9_DEMO).unwrap();
+                invalid["rules"]["unknown"] = json!(1);
+                assert!(apply_setup_with_seed(ids[0].into(), &invalid.to_string(), &registry,
+                    99, Approval::LocalSandbox).unwrap_err().contains("unknown"));
+                assert_eq!(apply_preservation(ids[0], &registry), before);
+                assert_eq!(engine::get_combat_record(ids[0]).unwrap(), combat_before);
+                assert_eq!(export_setup(ids[0], &registry).unwrap(), setup_before);
+
+                let saved = export_local_sandbox(ids[1], &registry).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&saved).unwrap()["record_version"], 3);
+                let mut snapshot = match_value(ids[1]);
+                assert_eq!(component(&snapshot, "UNIT_P2_1", "destructible")["current_life"], 3);
+                snapshot["context"]["match_id"] = ids[2].into();
+                restore_local_sandbox(ids[2], &saved, &restored_registry).unwrap();
+                assert_eq!(match_value(ids[2]), snapshot);
+                assert_eq!(engine::get_combat_record(ids[2]).unwrap(), combat_before);
+                assert_eq!(engine::get_match_flow(ids[2]).unwrap(),
+                    engine::get_match_flow(ids[1]).unwrap());
+                assert_eq!(export_setup(ids[2], &restored_registry).unwrap(), setup_before);
+            }
+        }
+        for id in ids {
+            assert_eq!(match_value(id)["context"]["winner"], "P1");
+            assert_eq!(match_value(id)["context"]["turn_phase"], "finished");
+            assert_eq!(engine::get_combat_record(id).unwrap().unwrap().dice.attacks_resolved, 19);
+            engine::remove_match(id);
+        }
+    }
+
+    #[test]
+    fn b9_shipped_goliath_requires_and_exports_one_exact_house_rule() {
+        let id = "b9_goliath";
+        let reapplied = "b9_house_rule_reapplied";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), B9_DEMO, &registry, B9_SEED,
+            Approval::LocalSandbox).unwrap();
+        registry.load_batch(&format!("[{B9_GOLIATH}]")).unwrap();
+        let query: Value = serde_json::from_str(&engine::query_deploy(
+            id, "UNIT_P1_1", "com.community.goliath", "P1", 12, &registry)).unwrap();
+        assert_eq!(query["legal"], false);
+        assert_eq!(query["over_cap"], json!({
+            "slot":"UNIT_P1_1","profile":"com.community.goliath",
+            "starting_health":12,"max_health":12,
+            "cap":{"starting_health":null,"max_health":10}
+        }));
+        assert!(query["error"].as_str().unwrap().contains("max_health 12"));
+        assert!(query["error"].as_str().unwrap().contains("max_health 10"));
+        let before = apply_preservation(id, &registry);
+        let combat_before = engine::get_combat_record(id).unwrap();
+        let setup_before = export_setup(id, &registry).unwrap();
+        assert!(engine::deploy_profile_unit(id, "UNIT_P1_1", "com.community.goliath",
+            "P1", 12, &registry).is_err());
+        assert_eq!(apply_preservation(id, &registry), before);
+        assert_eq!(engine::get_combat_record(id).unwrap(), combat_before);
+        assert_eq!(export_setup(id, &registry).unwrap(), setup_before);
+        engine::deploy_profile_unit_allowing_over_cap(id, "UNIT_P1_1",
+            "com.community.goliath", "P1", 12, &registry, Approval::LocalSandbox).unwrap();
+        assert_eq!(component(&match_value(id), "UNIT_P1_1", "destructible"),
+            &json!({"current_life":12,"max_life":12}));
+        let exported = export_setup(id, &registry).unwrap();
+        let value: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(value["house_rules"], json!([{
+            "kind":"allow_over_health_cap","slot":"UNIT_P1_1",
+            "name":"Goliath in UNIT_P1_1 allowed above the health cap",
+            "starting_health":12,"max_health":12,"approval":{"mode":"local_sandbox"}
+        }]));
+        let profile: crate::mod_registry::UnitTemplate = serde_json::from_str(B9_GOLIATH).unwrap();
+        assert_eq!(value["profiles"], json!([profile]));
+        assert!(value.get("seed").is_none());
+        assert!(value.get("dice").is_none());
+        assert_eq!(serde_json::from_str::<Value>(&check_setup(&exported)).unwrap()["ok"], true);
+        let second_registry = ModRegistry::default();
+        apply_setup_with_seed(reapplied.into(), &exported, &second_registry, 99,
+            Approval::LocalSandbox).unwrap();
+        assert_eq!(export_setup(reapplied, &second_registry).unwrap(), exported);
+        assert_eq!(engine::get_combat_record(reapplied).unwrap().unwrap().dice.seed, 99);
+        assert_eq!(component(&match_value(reapplied), "UNIT_P1_1", "destructible"),
+            &json!({"current_life":12,"max_life":12}));
+        engine::remove_match(id);
+        engine::remove_match(reapplied);
+    }
+
     fn seeded_example() -> Value {
         json!({
             "setup_version": 2, "name": "Shadow skirmish",
