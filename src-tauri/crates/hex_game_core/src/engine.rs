@@ -1535,6 +1535,25 @@ mod dice_combat_tests {
         (snapshot(id), get_match_flow(id).unwrap(), get_combat_record(id).unwrap().unwrap())
     }
 
+    fn assert_roll(report: &AttackReport, record: &CombatRecord, from: u64) {
+        let die = &record.ruleset.die;
+        let mut draws = from;
+        let attack: Vec<_> = (0..report.attack.total)
+            .map(|_| crate::dice::roll_die(record.dice.seed, &mut draws, die)).collect();
+        let defense: Vec<_> = (0..report.defense.total)
+            .map(|_| crate::dice::roll_die(record.dice.seed, &mut draws, die)).collect();
+        let strikes = attack.iter().filter(|&&face| die.faces()[face as usize] == crate::dice::FaceKind::Strike).count() as u16;
+        let blocks = defense.iter().filter(|&&face| die.faces()[face as usize] == crate::dice::FaceKind::Block).count() as u16;
+        assert_eq!(report.attack.faces, attack);
+        assert_eq!(report.defense.faces, defense);
+        assert_eq!(report.attack.strikes, strikes);
+        assert_eq!(report.defense.blocks, blocks);
+        assert_eq!(report.unblocked_strikes, strikes.saturating_sub(blocks));
+        assert_eq!(report.damage, u32::from(strikes.saturating_sub(blocks)) * report.damage_per_strike as u32);
+        assert_eq!((report.draws.from, report.draws.to), (from, draws));
+        assert_eq!(record.dice.draws_used, draws);
+    }
+
     #[test]
     fn dice_attacks_record_replay_queries_and_rejections() {
         let ids = ["b5_dice_replay_a", "b5_dice_replay_b"];
@@ -1561,10 +1580,11 @@ mod dice_combat_tests {
             assert_eq!(preserved(id), before);
             process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
             let record = get_combat_record(id).unwrap().unwrap();
-            let report = record.dice.last_attack.unwrap();
+            let report = record.dice.last_attack.as_ref().unwrap();
+            assert_roll(report, &record, 0);
             assert_eq!(report.attack.faces, [3, 5, 2]);
-            assert_eq!(report.defense.faces, [2, 2, 2]);
-            assert_eq!((report.attack.strikes, report.defense.blocks, report.damage), (1, 0, 1));
+            assert_eq!(report.defense.faces, [2, 2, 4]);
+            assert_eq!((report.attack.strikes, report.defense.blocks, report.damage), (1, 1, 0));
             assert_eq!((report.defense.terrain.as_deref(), report.defense.terrain_bonus), (Some("shadow"), 1));
             assert_eq!((record.dice.draws_used, record.dice.attacks_resolved, report.sequence, report.draws.from, report.draws.to), (6, 1, 1, 0, 6));
             let public: Value = serde_json::from_str(&combat_state(id).unwrap()).unwrap();
@@ -1576,7 +1596,8 @@ mod dice_combat_tests {
                 process_action(id, seat, token).unwrap();
             }
             let record = get_combat_record(id).unwrap().unwrap();
-            let report = record.dice.last_attack.unwrap();
+            let report = record.dice.last_attack.as_ref().unwrap();
+            assert_roll(report, &record, 6);
             assert_eq!((report.defense.terrain.as_deref(), report.defense.terrain_bonus), (Some("grass"), 0));
             assert_eq!((record.dice.draws_used, record.dice.attacks_resolved, report.sequence, report.draws.from, report.draws.to), (11, 2, 2, 6, 11));
         }
