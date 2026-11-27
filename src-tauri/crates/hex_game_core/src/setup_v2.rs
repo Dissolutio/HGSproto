@@ -352,7 +352,7 @@ pub(super) fn validate_value(value: &Value) -> Result<ValidatedSetupV2, String> 
             .expect("profile validated")
             .remove("combat");
     }
-    let common = validate_setup(&projected.to_string())?;
+    let common = validate_v1(&projected)?;
 
     let houses = match root.get("house_rules") {
         Some(value) => array(value, "house_rules")?.as_slice(),
@@ -638,6 +638,8 @@ mod tests {
     #[test]
     fn die_and_combat_limits() {
         let mut value = example();
+        value["die"]["faces"] = json!(["blank"]);
+        check(&value).unwrap();
         value["die"]["faces"] = json!(vec!["strike"; 64]);
         check(&value).unwrap();
         value["die"]["faces"] = json!(vec!["strike"; 65]);
@@ -672,6 +674,12 @@ mod tests {
             check(&value).unwrap_err(),
             "profiles: profile com.community.goliath: combat.damage_per_strike must be within 0..=100"
         );
+        value["profiles"][0]["components"]["combat"]["damage_per_strike"] = 0.into();
+        value["profiles"][0]["components"]["combat"]["defense"] = 1000.into();
+        assert_eq!(
+            check(&value).unwrap_err(),
+            "profiles: profile com.community.goliath: combat.defense must be within 0..=999"
+        );
         value = example();
         value["map"]["starterUnits"][0]["components"]["combat"]["defense"] = 999.into();
         assert_eq!(
@@ -688,7 +696,14 @@ mod tests {
         value["map"]["boardPieces"][0]["terrain"] = id.into();
         value["terrain_types"][0]["tags"] =
             json!((0..16).map(|i| format!("tag{i}")).collect::<Vec<_>>());
+        value["terrain_types"][0]["tags"][0] = "t".repeat(64).into();
         check(&value).unwrap();
+        value["terrain_types"][0]["tags"][0] = "t".repeat(65).into();
+        assert_eq!(
+            check(&value).unwrap_err(),
+            "terrain_types[0].tags[0]: tag must be 1 to 64 bytes of ASCII letters, digits, '_' or '-'"
+        );
+        value["terrain_types"][0]["tags"][0] = "t".repeat(64).into();
         value["terrain_types"][0]["tags"]
             .as_array_mut()
             .unwrap()
@@ -862,5 +877,26 @@ mod tests {
             check(&value).unwrap_err(),
             "rules.health_cap: starting_health must not exceed max_health"
         );
+    }
+
+    #[test]
+    fn original_size_limit_does_not_depend_on_json_reserialization() {
+        let value = example();
+        let json = value.to_string().replace(
+            r#""hexMap":{"name":"Two-piece arena"}"#,
+            &format!(
+                r#""hexMap":{{"numbers":[{}]}}"#,
+                vec!["1e4"; 140_000].join(",")
+            ),
+        );
+        assert!(json.len() < MAX_SETUP_BYTES);
+        assert!(
+            serde_json::from_str::<Value>(&json)
+                .unwrap()
+                .to_string()
+                .len()
+                > MAX_SETUP_BYTES
+        );
+        validate_setup_v2(&json).unwrap();
     }
 }

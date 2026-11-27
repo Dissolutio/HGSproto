@@ -367,8 +367,12 @@ pub fn validate_setup(json: &str) -> Result<ValidatedSetup, String> {
     } else {
         return Err("setup_version must be the integer 1".into());
     }
+    validate_v1(&value)
+}
+
+fn validate_v1(value: &Value) -> Result<ValidatedSetup, String> {
     let envelope_fields = ["setup_version", "name", "map", "profiles", "roster"];
-    let root = fields(&value, "invalid setup", &envelope_fields, &envelope_fields)?;
+    let root = fields(value, "invalid setup", &envelope_fields, &envelope_fields)?;
     let name: String = decode(&root["name"], "name")?;
     if name.len() > 128 {
         return Err("name: exceeds the 128-byte limit".into());
