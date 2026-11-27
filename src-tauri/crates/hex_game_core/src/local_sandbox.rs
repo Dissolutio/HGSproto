@@ -1,7 +1,7 @@
 use crate::engine;
 use crate::flow::MatchFlow;
 use crate::mod_registry::{ModRegistry, UnitTemplate};
-use crate::models::GameState;
+use crate::models::{Component, GameState};
 use crate::setup::{self, RosterEntry, SetupRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,6 +45,27 @@ struct LocalSandboxRecordV2 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LocalSandboxRecordV3 {
+    record_version: u32,
+    profiles: Vec<Value>,
+    snapshot: Value,
+    setup: Value,
+    dice: DiceIn,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiceIn {
+    seed: String,
+    draws_used: u64,
+    attacks_resolved: u64,
+    last_attack: Value,
+}
+
+const MAX_SAFE_COUNTER: u64 = (1_u64 << 53) - 1;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LocalSandboxSetupIn {
     setup_version: Value,
     name: Value,
@@ -72,12 +93,30 @@ pub fn export_local_sandbox(match_id: &str, registry: &ModRegistry) -> Result<St
     let combat = engine::combat_records()
         .lock()
         .map_err(|_| "Match combat registry is unavailable".to_string())?;
-    if combat.contains_key(match_id) {
-        return Err("saving setup_version 2 matches is not supported yet".into());
-    }
     let setup_records = engine::setup_records()
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    if let Some(combat) = combat.get(match_id) {
+        let record = setup_records.get(match_id)
+            .ok_or_else(|| "setup: this match has no setup record".to_string())?;
+        let mut setup = setup::export_v2_setup(record, &templates, &combat.ruleset)?;
+        setup.as_object_mut().unwrap().remove("profiles");
+        if combat.dice.draws_used > MAX_SAFE_COUNTER || combat.dice.attacks_resolved > MAX_SAFE_COUNTER {
+            return Err("Saved dice counters exceed the safe integer limit".into());
+        }
+        return serde_json::to_string(&serde_json::json!({
+            "record_version": 3,
+            "profiles": profiles,
+            "snapshot": snapshot,
+            "setup": setup,
+            "dice": {
+                "seed": format!("{:016x}", combat.dice.seed),
+                "draws_used": combat.dice.draws_used,
+                "attacks_resolved": combat.dice.attacks_resolved,
+                "last_attack": combat.dice.last_attack,
+            },
+        })).map_err(|error| format!("Local sandbox record serialization failed: {error}"));
+    }
     let setup = setup_records.get(match_id).map(|record| LocalSandboxSetupOut {
         setup_version: 1,
         name: &record.name,
@@ -108,25 +147,31 @@ pub fn restore_local_sandbox(
         .get("record_version")
         .ok_or_else(|| "Saved sandbox record has no record_version".to_string())?;
     let version_number = version.as_u64();
-    if !matches!(version_number, Some(1 | 2)) {
+    if !matches!(version_number, Some(1 | 2 | 3)) {
         return Err(format!(
-            "Unsupported saved sandbox record_version {version}; expected 1 or 2"
+            "Unsupported saved sandbox record_version {version}; expected 1 or 2 or 3"
         ));
     }
-    let (record_version, profiles, snapshot, embedded_setup) = match version_number.unwrap() {
+    let (record_version, profiles, snapshot, embedded_setup, dice) = match version_number.unwrap() {
         1 => {
             let record: LocalSandboxRecordV1 = serde_json::from_value(value)
                 .map_err(|error| format!("Invalid saved sandbox record: {error}"))?;
             debug_assert_eq!(record.record_version, 1);
-            (1, record.profiles, record.snapshot, None)
+            (1, record.profiles, record.snapshot, None, None)
         }
         2 => {
             let record: LocalSandboxRecordV2 = serde_json::from_value(value)
                 .map_err(|error| format!("Invalid saved sandbox record: {error}"))?;
             debug_assert_eq!(record.record_version, 2);
-            (2, record.profiles, record.snapshot, Some(record.setup))
+            (2, record.profiles, record.snapshot, Some(record.setup), None)
         }
-        _ => unreachable!("version gate accepts only versions 1 and 2"),
+        3 => {
+            let record: LocalSandboxRecordV3 = serde_json::from_value(value)
+                .map_err(|error| format!("Invalid saved sandbox record: {error}"))?;
+            debug_assert_eq!(record.record_version, 3);
+            (3, record.profiles, record.snapshot, Some(record.setup), Some(record.dice))
+        }
+        _ => unreachable!("version gate accepts only versions 1, 2 and 3"),
     };
 
     let staging = ModRegistry::default();
@@ -160,7 +205,42 @@ pub fn restore_local_sandbox(
         ));
     }
     MatchFlow::reference(&state.context)?;
-    let setup_record = if record_version == 2 {
+    let mut combat_record = None;
+    let setup_record = if record_version == 3 {
+        let (record, ruleset) = setup::restore_v2_setup(embedded_setup.unwrap(), &profiles)?;
+        let dice = dice.unwrap();
+        if dice.seed.len() != 16 || !dice.seed.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+            return Err("Saved dice seed must be exactly 16 lowercase hexadecimal characters".into());
+        }
+        if dice.draws_used > MAX_SAFE_COUNTER || dice.attacks_resolved > MAX_SAFE_COUNTER {
+            return Err("Saved dice counters exceed the safe integer limit".into());
+        }
+        let last_attack = serde_json::from_value(dice.last_attack)
+            .map_err(|error| format!("Invalid saved last attack: {error}"))?;
+        for entity in state.entities.values() {
+            let unit = entity.components.values().any(|component|
+                matches!(component, Component::Tags { labels } if labels.iter().any(|label| label == "Unit")));
+            let tile = entity.components.values().any(|component|
+                matches!(component, Component::Terrain { .. } | Component::TerrainType { .. }));
+            if unit && !entity.components.values().any(|component| matches!(component, Component::Combat { .. })) {
+                return Err(format!("Saved unit '{}' lacks Combat", entity.id));
+            }
+            if tile && !entity.components.values().any(|component| matches!(component,
+                Component::TerrainKind { id } if ruleset.terrain_types.iter().any(|terrain| terrain.id == *id))) {
+                return Err(format!("Saved tile '{}' lacks a declared TerrainKind", entity.id));
+            }
+        }
+        combat_record = Some(engine::CombatRecord {
+            ruleset,
+            dice: engine::DiceRecord {
+                seed: u64::from_str_radix(&dice.seed, 16).map_err(|error| error.to_string())?,
+                draws_used: dice.draws_used,
+                attacks_resolved: dice.attacks_resolved,
+                last_attack,
+            },
+        });
+        Some(record)
+    } else if record_version == 2 {
         embedded_setup
             .filter(|setup| !setup.is_null())
             .map(|setup| restored_setup_record(setup, &profiles))
@@ -182,12 +262,17 @@ pub fn restore_local_sandbox(
     if !templates.is_empty() {
         return Err("Saved sandbox can only be restored into an empty profile registry".into());
     }
-    engine::restore_staged_match_snapshot(
-        match_id.to_string(),
-        state,
-        setup_record,
-        || templates.extend(staged_templates),
-    )?;
+    if let Some(combat) = combat_record {
+        engine::restore_staged_combat_match_snapshot(
+            match_id.to_string(), state, combat, setup_record.unwrap(),
+            || templates.extend(staged_templates),
+        )?;
+    } else {
+        engine::restore_staged_match_snapshot(
+            match_id.to_string(), state, setup_record,
+            || templates.extend(staged_templates),
+        )?;
+    }
     Ok(profile_count)
 }
 
@@ -467,7 +552,7 @@ mod tests {
         let record = damaged_custom_match_record(match_id);
         for version in [
             Value::from(0),
-            Value::from(3),
+            Value::from(4),
             Value::from("1"),
             serde_json::json!(2.5),
         ] {
@@ -645,7 +730,7 @@ mod tests {
 
         for version in [
             Value::from(0),
-            Value::from(3),
+            Value::from(4),
             Value::from("2"),
             serde_json::json!(2.5),
         ] {

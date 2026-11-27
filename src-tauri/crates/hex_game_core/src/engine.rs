@@ -7,7 +7,7 @@ use crate::models::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const REFEREE_ATTACK_DAMAGE: i32 = 1;
 
@@ -45,14 +45,14 @@ pub struct DiceRecord {
     pub last_attack: Option<AttackReport>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaceCounts {
     pub strike: u16,
     pub block: u16,
     pub blank: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttackDiceReport {
     pub base: i32,
     pub height_bonus: i32,
@@ -62,7 +62,7 @@ pub struct AttackDiceReport {
     pub strikes: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefenseDiceReport {
     pub base: i32,
     pub height_bonus: i32,
@@ -74,13 +74,13 @@ pub struct DefenseDiceReport {
     pub blocks: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrawRange {
     pub from: u64,
     pub to: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttackReport {
     pub sequence: u64,
     pub attacker: String,
@@ -617,6 +617,19 @@ pub(crate) fn restore_staged_match_snapshot(
     )
 }
 
+pub(crate) fn restore_staged_combat_match_snapshot(
+    match_id: String,
+    state: GameState,
+    combat_record: CombatRecord,
+    setup_record: crate::setup::SetupRecord,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    let flow = MatchFlow::reference(&state.context)?;
+    commit_staged_match(
+        match_id, state, flow, Some(combat_record), Some(setup_record), false, commit_with_locks,
+    )
+}
+
 pub(crate) fn reject_explicit_scenario_flow(json: &str) -> Result<(), String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|error| format!("Invalid Hexoscape map JSON: {error}"))?;
@@ -966,6 +979,7 @@ pub fn restore_match_snapshot(match_id: &str, snapshot: &str) -> Result<(), Stri
     if state.context.match_id != match_id {
         return Err("Snapshot match ID does not match the requested match".into());
     }
+    reject_combat_snapshot(&state)?;
     evaluate_victory(&mut state);
     try_store_match(match_id.to_string(), state)
 }
@@ -980,9 +994,19 @@ pub fn restore_match_snapshot_as(
     if state.context.match_id != expected_match_id {
         return Err("Snapshot match ID does not match the expected host match".into());
     }
+    reject_combat_snapshot(&state)?;
     state.context.match_id = match_id.to_string();
     evaluate_victory(&mut state);
     try_store_match(match_id.to_string(), state)
+}
+
+fn reject_combat_snapshot(state: &GameState) -> Result<(), String> {
+    if state.entities.values().any(|entity| entity.components.values().any(
+        |component| matches!(component, Component::Combat { .. } | Component::TerrainKind { .. })
+    )) {
+        return Err("Snapshot contains combat or terrain kind components; use a saved sandbox record".into());
+    }
+    Ok(())
 }
 
 /// Helper function to view if a match is actively running

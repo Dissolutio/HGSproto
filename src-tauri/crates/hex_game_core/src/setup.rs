@@ -83,7 +83,7 @@ pub(crate) const DEFAULT_SETUP_NAME: &str = "Default sandbox";
 #[derive(Debug, Clone)]
 pub(crate) struct SetupRecord {
     pub(crate) name: String,
-    // For v2 matches this holds the complete original setup until v2 export exists.
+    // For v2 matches this holds the complete original setup.
     pub(crate) map: Value,
     pub(crate) roster: Vec<RosterEntry>,
 }
@@ -839,9 +839,6 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
     let combat = crate::engine::combat_records()
         .lock()
         .map_err(|_| "Match combat registry is unavailable".to_string())?;
-    if combat.contains_key(match_id) {
-        return Err("export of setup_version 2 is not supported yet".into());
-    }
     let records = crate::engine::setup_records()
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
@@ -849,6 +846,11 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
         .get(match_id)
         .ok_or_else(|| "setup: this match has no setup record".to_string())?
         .clone();
+    if let Some(combat) = combat.get(match_id) {
+        let output = export_v2_setup(&record, &templates, &combat.ruleset)?;
+        return serde_json::to_string(&output)
+            .map_err(|error| format!("setup: export serialization failed: {error}"));
+    }
 
     let profile_ids: std::collections::BTreeSet<_> = record
         .roster
@@ -880,6 +882,68 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
     validate_setup(&json)
         .map_err(|error| format!("setup: recorded setup is not valid: {error}"))?;
     Ok(json)
+}
+
+pub(crate) fn export_v2_setup(
+    record: &SetupRecord,
+    templates: &HashMap<String, UnitTemplate>,
+    ruleset: &crate::engine::CombatRuleset,
+) -> Result<Value, String> {
+    let mut output = record.map.clone();
+    let root = output.as_object_mut().ok_or_else(|| "setup: invalid recorded setup".to_string())?;
+    let mut roster = record.roster.clone();
+    roster.sort_by(|left, right| left.slot.cmp(&right.slot));
+    let ids: std::collections::BTreeSet<_> = roster.iter().map(|entry| entry.profile.as_str()).collect();
+    let profiles = ids.into_iter().map(|id| templates.get(id).cloned()
+        .ok_or_else(|| format!("setup: profile '{id}' is missing from the registry")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let faces: Vec<&str> = ruleset.die.faces().iter().map(|face| match face {
+        crate::dice::FaceKind::Strike => "strike",
+        crate::dice::FaceKind::Block => "block",
+        crate::dice::FaceKind::Blank => "blank",
+    }).collect();
+    root.insert("name".into(), Value::String(record.name.clone()));
+    root.insert("profiles".into(), serde_json::to_value(profiles).map_err(|e| e.to_string())?);
+    root.insert("roster".into(), serde_json::to_value(roster).map_err(|e| e.to_string())?);
+    root.insert("die".into(), serde_json::json!({"faces": faces}));
+    let house_rules = root.entry("house_rules").or_insert_with(|| serde_json::json!([]));
+    if let Some(rules) = house_rules.as_array_mut() {
+        rules.sort_by(|a, b| a["slot"].as_str().cmp(&b["slot"].as_str()));
+    }
+    let json = serde_json::to_string(&output)
+        .map_err(|error| format!("setup: export serialization failed: {error}"))?;
+    validate_setup_v2(&json)
+        .map_err(|error| format!("setup: recorded setup is not valid: {error}"))?;
+    Ok(output)
+}
+
+pub(crate) fn restore_v2_setup(
+    mut setup: Value,
+    saved_profiles: &[Value],
+) -> Result<(SetupRecord, crate::engine::CombatRuleset), String> {
+    let root = setup.as_object_mut().ok_or_else(|| "Invalid saved setup: expected an object".to_string())?;
+    if root.contains_key("profiles") {
+        return Err("Invalid saved setup: profiles must be stored separately".into());
+    }
+    let ids: std::collections::BTreeSet<_> = root.get("roster").and_then(Value::as_array)
+        .into_iter().flatten().filter_map(|entry| entry.get("profile").and_then(Value::as_str))
+        .collect();
+    let profiles: Vec<Value> = ids.into_iter().filter_map(|id| saved_profiles.iter()
+        .find(|profile| profile.get("mod_id").and_then(Value::as_str) == Some(id)).cloned()).collect();
+    root.insert("profiles".into(), Value::Array(profiles));
+    let validated = validate_setup_v2(&setup.to_string())
+        .map_err(|error| format!("Invalid saved setup: {error}"))?;
+    let record = SetupRecord {
+        name: validated.common.name,
+        map: validated.source,
+        roster: validated.common.roster,
+    };
+    let ruleset = crate::engine::CombatRuleset {
+        die: validated.die,
+        terrain_types: validated.terrain_types,
+        rules: validated.rules,
+    };
+    Ok((record, ruleset))
 }
 
 #[cfg(test)]
@@ -971,8 +1035,8 @@ mod tests {
             assert_eq!(engine::get_combat_record(&id).unwrap(), combat);
             assert_eq!(engine::setup_records().lock().unwrap()[&id].map, recorded_source);
         }
-        assert_eq!(export_setup(&id, &registry).unwrap_err(), "export of setup_version 2 is not supported yet");
-        assert_eq!(export_local_sandbox(&id, &registry).unwrap_err(), "saving setup_version 2 matches is not supported yet");
+        export_setup(&id, &registry).unwrap();
+        export_local_sandbox(&id, &registry).unwrap();
         assert_eq!(apply_preservation(&id, &registry), before);
         assert_eq!(engine::get_combat_record(&id).unwrap(), combat);
         assert_eq!(engine::setup_records().lock().unwrap()[&id].map, recorded_source);
