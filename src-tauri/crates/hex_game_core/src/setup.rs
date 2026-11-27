@@ -1857,6 +1857,63 @@ mod tests {
         serde_json::from_str(VALID).unwrap()
     }
 
+    #[test]
+    fn profile_deployment_matches_setup_rosters_for_both_schemas() {
+        for version in [1, 2] {
+            let roster_id = format!("profile_roster_schema_{version}");
+            let live_id = format!("profile_live_schema_{version}");
+            let roster_registry = ModRegistry::default();
+            let live_registry = ModRegistry::default();
+            let mut profile = example()["profiles"][0].clone();
+            profile["schema_version"] = version.into();
+            profile["components"]["tags"] = json!(["Unit", "Heavy", "P2"]);
+            if version == 2 {
+                profile["components"]["combat"] = json!({"attack": 4, "defense": 3});
+            }
+            let mut roster_setup = if version == 1 { example() } else { b6_combat_setup() };
+            roster_setup["profiles"] = json!([profile]);
+            roster_setup["roster"] = json!([{
+                "slot": "UNIT_P1_1", "seat": "P1",
+                "profile": "com.community.goliath", "starting_health": 7
+            }]);
+            let mut live_setup = roster_setup.clone();
+            live_setup["profiles"] = json!([]);
+            live_setup["roster"] = json!([]);
+            if version == 1 {
+                apply_setup(roster_id.clone(), &roster_setup.to_string(), &roster_registry).unwrap();
+                apply_setup(live_id.clone(), &live_setup.to_string(), &live_registry).unwrap();
+            } else {
+                apply_setup_with_seed(roster_id.clone(), &roster_setup.to_string(),
+                    &roster_registry, 42, Approval::LocalSandbox).unwrap();
+                apply_setup_with_seed(live_id.clone(), &live_setup.to_string(),
+                    &live_registry, 42, Approval::LocalSandbox).unwrap();
+            }
+            live_registry.load_batch(&json!([profile]).to_string()).unwrap();
+            engine::deploy_profile_unit(&live_id, "UNIT_P1_1", "com.community.goliath",
+                "P1", 7, &live_registry).unwrap();
+
+            let roster = match_value(&roster_id);
+            let live = match_value(&live_id);
+            let roster_unit = &roster["entities"]["UNIT_P1_1"];
+            let live_unit = &live["entities"]["UNIT_P1_1"];
+            for field in ["components", "display_name", "visual_primitive", "mod_id"] {
+                assert_eq!(roster_unit[field], live_unit[field], "schema {version}: {field}");
+            }
+            assert_eq!(roster_unit["components"]["destructible"]["data"],
+                json!({"current_life": 7, "max_life": 12}));
+            assert_eq!(roster_unit["components"]["tags"]["data"]["labels"],
+                json!(["Unit", "Heavy", "P1"]));
+            if version == 2 {
+                assert_eq!(roster_unit["components"]["combat"]["data"],
+                    json!({"attack": 4, "defense": 3, "damage_per_strike": 1}));
+            } else {
+                assert!(roster_unit["components"].get("combat").is_none());
+            }
+            engine::remove_match(&roster_id);
+            engine::remove_match(&live_id);
+        }
+    }
+
     fn check(value: &Value) -> Result<ValidatedSetup, String> {
         validate_setup(&value.to_string())
     }
