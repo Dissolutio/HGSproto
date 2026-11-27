@@ -1465,7 +1465,7 @@ mod tests {
         let value: Value = serde_json::from_str(&exported).unwrap();
         assert_eq!(value["house_rules"].as_array().unwrap().len(), 2);
         assert_eq!(value["house_rules"][0], json!({"kind":"allow_over_health_cap","slot":"UNIT_P1_1","name":"Goliath in UNIT_P1_1 allowed above the health cap","starting_health":11,"max_health":12,"approval":{"mode":"local_sandbox"}}));
-        assert_eq!(value["house_rules"][1], json!({"kind":"allow_over_health_cap","slot":"UNIT_P2_1","name":"UNIT_P2_1 in UNIT_P2_1 allowed above the health cap","starting_health":11,"max_health":11,"approval":{"mode":"local_sandbox"}}));
+        assert_eq!(value["house_rules"][1], json!({"kind":"allow_over_health_cap","slot":"UNIT_P2_1","name":"Unit UNIT_P2_1 allowed above the health cap","starting_health":11,"max_health":11,"approval":{"mode":"local_sandbox"}}));
         apply_setup_with_seed("b7_roundtrip".into(), &exported, &ModRegistry::default(), 2, Approval::LocalSandbox).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&check_setup(&exported)).unwrap()["ok"], true);
         source["rules"]["unknown"] = json!(1);
@@ -1487,6 +1487,37 @@ mod tests {
         assert!(apply_setup_with_seed_allowing_over_cap("unused".into(), &oversized, &registry, 1, Approval::LocalSandbox).unwrap_err().contains("1 MiB"));
         engine::remove_match(id);
         engine::remove_match("b7_roundtrip");
+    }
+
+    #[test]
+    fn b7_profile_name_matching_slot_still_uses_profile_wording() {
+        let id = "b7_profile_name_matching_slot";
+        let registry = ModRegistry::default();
+        let mut source = seeded_example();
+        source["house_rules"] = json!([]);
+        source["profiles"][0]["display_name"] = json!("UNIT_P1_1");
+        apply_setup_with_seed_allowing_over_cap(id.into(), &source.to_string(), &registry, 1, Approval::LocalSandbox).unwrap();
+        let exported: Value = serde_json::from_str(&export_setup(id, &registry).unwrap()).unwrap();
+        assert_eq!(exported["house_rules"][0]["name"], "UNIT_P1_1 in UNIT_P1_1 allowed above the health cap");
+        engine::remove_match(id);
+    }
+
+    #[test]
+    fn b7_legacy_inline_house_rule_name_is_preserved() {
+        let id = "b7_legacy_inline_name";
+        let registry = ModRegistry::default();
+        let mut source = seeded_example();
+        source["map"]["starterUnits"][1]["components"]["destructible"] = json!({"current_life":11,"max_life":11});
+        source["house_rules"].as_array_mut().unwrap().push(json!({
+            "kind":"allow_over_health_cap","slot":"UNIT_P2_1",
+            "name":"UNIT_P2_1 in UNIT_P2_1 allowed above the health cap",
+            "starting_health":11,"max_health":11,"approval":{"mode":"local_sandbox"}
+        }));
+        assert_eq!(serde_json::from_str::<Value>(&check_setup(&source.to_string())).unwrap()["ok"], true);
+        apply_setup_with_seed(id.into(), &source.to_string(), &registry, 1, Approval::LocalSandbox).unwrap();
+        let exported: Value = serde_json::from_str(&export_setup(id, &registry).unwrap()).unwrap();
+        assert_eq!(exported["house_rules"], source["house_rules"]);
+        engine::remove_match(id);
     }
 
     #[test]
