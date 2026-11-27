@@ -1,7 +1,7 @@
 export type CombatState = {
   combat?: null;
   die: { faces: string[] };
-  terrain_types: { id: string; name: string; tags: string[] }[];
+  terrain_types: { id: string; name: string; tags?: string[] }[];
   house_rules: { name: string }[];
   last_attack: {
     sequence: number;
@@ -40,7 +40,7 @@ export function formatAttackReport(state: CombatState | null): string[] {
   if (!attack) return ["No attacks yet"];
   const terrain = state.terrain_types.find((item) => item.id === attack.defense.terrain);
   const terrainLabel = terrain
-    ? `${terrain.name}${terrain.tags.length ? ` (${terrain.tags.join(", ")})` : ""}`
+    ? `${terrain.name}${terrain.tags?.length ? ` (${terrain.tags.join(", ")})` : ""}`
     : attack.defense.terrain;
   const faces = (indices: number[]) => indices.map((index) => state.die.faces[index]).join(", ");
   return [

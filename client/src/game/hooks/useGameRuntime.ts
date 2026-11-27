@@ -2,13 +2,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ThreeEvent } from "@react-three/fiber";
 import init, {
   wasm_apply_setup,
+  wasm_apply_setup_v2,
+  wasm_check_setup,
   wasm_deploy_profile_unit,
+  wasm_deploy_profile_unit_allowing_over_cap,
   wasm_export_local_sandbox,
   wasm_export_setup,
   wasm_get_current_state,
+  wasm_get_combat_state,
   wasm_initialize_match,
   wasm_load_mod_profiles,
   wasm_process_token_for_match,
+  wasm_query_deploy,
   wasm_reset_match,
   wasm_restore_local_sandbox,
 } from "../../wasm/hex_game_core";
@@ -38,7 +43,8 @@ import {
   saveSandbox,
   type SandboxStorage,
 } from "../sandboxPersistence";
-import { loadedProfilesFromSetup, loadSetupFile, setupFileName } from "../setupFiles";
+import { loadedProfilesFromSetup, readSetupFile, setupFileName } from "../setupFiles";
+import { isV2Setup, seedHex, type CombatState } from "../diceDisplay";
 import type {
   ConnectionState,
   EngineState,
@@ -55,6 +61,7 @@ export function useGameRuntime() {
   const [tabId] = useState(getTabId);
   const [mode, setMode] = useState<Mode>("wasm");
   const [gameState, setGameState] = useState<EngineState | null>(null);
+  const [combatState, setCombatState] = useState<CombatState | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
   const [endTurnAfterSkip, setEndTurnAfterSkip] = useState<{
@@ -71,6 +78,10 @@ export function useGameRuntime() {
   const [profileDeployFeedback, setProfileDeployFeedback] = useState<ProfileFeedback | null>(null);
   const [setupFeedback, setSetupFeedback] = useState<ProfileFeedback | null>(null);
   const [setupBusy, setSetupBusy] = useState(false);
+  const [pendingSetup, setPendingSetup] = useState<string | null>(null);
+  const [pendingDeploy, setPendingDeploy] = useState<{
+    slot: string; modId: string; seat: PlayerSeat; life: number; maxHealth: number;
+  } | null>(null);
   const [loadedModProfiles, setLoadedModProfiles] = useState<ModProfileSummary[]>([]);
   const [selectedModId, setSelectedModId] = useState("");
   const [deploymentSeat, setDeploymentSeat] = useState<PlayerSeat>("P1");
@@ -139,6 +150,11 @@ export function useGameRuntime() {
     return warning ? ` · ${warning}` : "";
   };
 
+  const refreshCombatState = () => {
+    const state = JSON.parse(wasm_get_combat_state(WASM_MATCH_ID)) as CombatState;
+    setCombatState(state.combat === null ? null : state);
+  };
+
   useEffect(() => {
     let cancelled = false;
     let ws: WebSocket | null = null;
@@ -159,6 +175,7 @@ export function useGameRuntime() {
           const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
           if (cancelled) return;
           setGameState(state);
+          refreshCombatState();
           setConnection("ready");
           setNotice(restoreNotice ?? "Autonomous WASM sandbox ready");
         } catch (error) {
@@ -490,6 +507,7 @@ export function useGameRuntime() {
 
   const sync3DCanvasWithWasmState = () => {
     setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
+    refreshCombatState();
   };
 
   const handleExportSetup = () => {
@@ -513,41 +531,77 @@ export function useGameRuntime() {
     }
   };
 
+  const applyLoadedSetup = (text: string, v2: boolean, allowOverCap: boolean, houseRules: string[] = []) => {
+    if (!setupActionsEnabled.current || !window.confirm(
+      "Load setup? This replaces the whole current local sandbox and any profiles loaded. There is no merge." +
+      (houseRules.length ? `\nHouse rules:\n${houseRules.join("\n")}` : ""),
+    )) return;
+    if (v2) {
+      wasm_apply_setup_v2(WASM_MATCH_ID, text, seedHex(crypto.getRandomValues(new Uint8Array(8))), allowOverCap);
+    } else {
+      wasm_apply_setup(WASM_MATCH_ID, text);
+    }
+    const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
+    const profiles = loadedProfilesFromSetup(wasm_export_local_sandbox(WASM_MATCH_ID));
+    setGameState(state);
+    refreshCombatState();
+    showLoadedProfiles(profiles, false);
+    setSelectedUnitId(null);
+    setInspectedEntity(null);
+    setActionPending(false);
+    setEndTurnAfterSkip(null);
+    setDeploymentSeat("P1");
+    setDeploymentSlotId("");
+    setModProfileText("");
+    setProfileLoadFeedback(null);
+    setProfileDeployFeedback(null);
+    setPendingSetup(null);
+    setPendingDeploy(null);
+    const message = `Setup loaded${saveLocalSandbox()}`;
+    setSetupFeedback({ kind: "success", text: message });
+    setNotice(message);
+  };
+
   const handleLoadSetup = async (file: File) => {
     if (!setupActionsEnabled.current || setupLoadPending.current) return;
     setupLoadPending.current = true;
     setSetupBusy(true);
+    setPendingSetup(null);
     try {
-      await loadSetupFile(
-        file,
-        () => setupActionsEnabled.current && window.confirm(
-          "Load setup? This replaces the whole current local sandbox and any profiles loaded. There is no merge.",
-        ),
-        (text) => wasm_apply_setup(WASM_MATCH_ID, text),
-        () => {
-          const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
-          const profiles = loadedProfilesFromSetup(wasm_export_local_sandbox(WASM_MATCH_ID));
-          setGameState(state);
-          showLoadedProfiles(profiles, false);
-          setSelectedUnitId(null);
-          setInspectedEntity(null);
-          setActionPending(false);
-          setEndTurnAfterSkip(null);
-          setDeploymentSeat("P1");
-          setDeploymentSlotId("");
-          setModProfileText("");
-          setProfileLoadFeedback(null);
-          setProfileDeployFeedback(null);
-          const message = `Setup loaded${saveLocalSandbox()}`;
-          setSetupFeedback({ kind: "success", text: message });
-          setNotice(message);
-        },
-      );
+      const text = await readSetupFile(file);
+      if (!isV2Setup(text)) {
+        applyLoadedSetup(text, false, false);
+        return;
+      }
+      const check = JSON.parse(wasm_check_setup(text)) as {
+        ok: boolean; error: string | null;
+        over_cap: { slot: string; starting_health: number; max_health: number; cap: { starting_health: number | null; max_health: number | null } }[];
+        house_rules: { name: string }[];
+      };
+      if (!check.ok) {
+        const lines = check.over_cap.map((item) =>
+          `${item.slot}: starting health ${item.starting_health}, max health ${item.max_health}; cap starting health ${item.cap.starting_health ?? "none"}, max health ${item.cap.max_health ?? "none"}`);
+        setSetupFeedback({ kind: "error", text: [check.error ?? "", ...lines].join("\n") });
+        if (check.over_cap.length) setPendingSetup(text);
+        return;
+      }
+      applyLoadedSetup(text, true, false, check.house_rules.map((rule) => rule.name));
     } catch (error) {
       setSetupFeedback({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
       setupLoadPending.current = false;
       setSetupBusy(false);
+    }
+  };
+
+  const handleAllowSetup = () => {
+    if (!pendingSetup || setupLoadPending.current || !setupActionsEnabled.current) return;
+    try {
+      const check = JSON.parse(wasm_check_setup(pendingSetup)) as { house_rules: { name: string }[] };
+      applyLoadedSetup(pendingSetup, true, true, check.house_rules.map((rule) => rule.name));
+    } catch (error) {
+      setSetupFeedback({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+      setPendingSetup(null);
     }
   };
 
@@ -575,6 +629,7 @@ export function useGameRuntime() {
         }
         setSelectedUnitId(null);
         sync3DCanvasWithWasmState();
+        setPendingDeploy(null);
         setNotice(`Applied locally: ${token}${saveLocalSandbox()}`);
         return true;
       } catch (error) {
@@ -704,7 +759,7 @@ export function useGameRuntime() {
     }
   };
 
-  const handleDeployProfile = () => {
+  const handleDeployProfile = (allowOverCap = false) => {
     setProfileDeployFeedback(null);
     if (mode !== "wasm" || connection !== "ready") {
       setProfileDeployFeedback({ kind: "error", text: "Switch to Autonomous Sandbox Mode before deploying a profile" });
@@ -728,7 +783,29 @@ export function useGameRuntime() {
     }
 
     try {
-      const displayName = wasm_deploy_profile_unit(
+      if (allowOverCap && (!pendingDeploy || pendingDeploy.slot !== deploymentSlot.id ||
+        pendingDeploy.modId !== selectedProfile.modId || pendingDeploy.seat !== deploymentSeat ||
+        pendingDeploy.life !== life || pendingDeploy.maxHealth !== selectedProfile.maxHealth)) {
+        setPendingDeploy(null);
+        return;
+      }
+      if (combatState) {
+        const query = JSON.parse(wasm_query_deploy(WASM_MATCH_ID, deploymentSlot.id, selectedProfile.modId, deploymentSeat, life)) as {
+          legal: boolean; error: string | null; over_cap: unknown;
+        };
+        if (!query.legal && !(allowOverCap && query.over_cap)) {
+          setProfileDeployFeedback({ kind: "error", text: query.error ?? "" });
+          setPendingDeploy(query.over_cap ? {
+            slot: deploymentSlot.id, modId: selectedProfile.modId, seat: deploymentSeat, life,
+            maxHealth: selectedProfile.maxHealth,
+          } : null);
+          return;
+        }
+      }
+      const deploy = allowOverCap && combatState
+        ? wasm_deploy_profile_unit_allowing_over_cap
+        : wasm_deploy_profile_unit;
+      const displayName = deploy(
         WASM_MATCH_ID,
         deploymentSlot.id,
         selectedProfile.modId,
@@ -737,6 +814,8 @@ export function useGameRuntime() {
       );
       const state = parseState(wasm_get_current_state(WASM_MATCH_ID));
       setGameState(state);
+      refreshCombatState();
+      setPendingDeploy(null);
       setInspectedEntity(
         entitiesFromState(state).find((entity) => entity.id === deploymentSlot.id) ?? null,
       );
@@ -749,6 +828,7 @@ export function useGameRuntime() {
         `Deployed ${displayName} in ${deploymentSlot.id} for ${deploymentSeat} at ${life}/${selectedProfile.maxHealth} HP${saveLocalSandbox()}`,
       );
     } catch (error) {
+      setPendingDeploy(null);
       setProfileDeployFeedback({
         kind: "error",
         text: error instanceof Error ? error.message : String(error),
@@ -824,6 +904,9 @@ export function useGameRuntime() {
         await init();
         wasm_reset_match(WASM_MATCH_ID, MOCK_MAP_JSON);
         setGameState(parseState(wasm_get_current_state(WASM_MATCH_ID)));
+        refreshCombatState();
+        setPendingDeploy(null);
+        setPendingSetup(null);
         const saveNotice = saveLocalSandbox();
         if (mode === "network") {
           setMode("wasm");
@@ -891,8 +974,8 @@ export function useGameRuntime() {
       ? "Move one friendly unit one adjacent hex, or skip movement"
       : gameState?.context?.turn_phase === "attack"
         ? selectedUnit
-          ? "Attack one adjacent enemy for 1 damage, or skip attack"
-          : "Select a friendly unit to attack for 1 damage, or skip attack"
+          ? combatState && mode === "wasm" ? "Attack one adjacent enemy (dice roll), or skip attack" : "Attack one adjacent enemy for 1 damage, or skip attack"
+          : combatState && mode === "wasm" ? "Select a friendly unit to attack (dice roll), or skip attack" : "Select a friendly unit to attack for 1 damage, or skip attack"
         : gameState?.context?.turn_phase === "end"
           ? "End the turn to activate the other seat"
           : "Referee state unavailable";
@@ -916,13 +999,14 @@ export function useGameRuntime() {
       entities, terrain, units, deploymentSlots, deploymentSlot, selectedProfile, activeSeat,
       turnPhase, winner, playerSeat, isYourTurn, canAct, selectedUnit, attackTargetIds,
       playerOneCount, playerTwoCount, ruleHint, showRecoveryBanner, healthLabelElements,
+      combatState: mode === "wasm" ? combatState : null,
     },
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
       profileLoadFeedback, profileDeployFeedback,
-      setupFeedback, setupBusy, handleExportSetup, handleLoadSetup,
+      setupFeedback, setupBusy, handleExportSetup, handleLoadSetup, pendingSetup, handleAllowSetup,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
-      setStartingHealth, loadModProfiles, handleDeployProfile, handleStartFreshSandbox,
+      setStartingHealth, loadModProfiles, handleDeployProfile, pendingDeploy, handleStartFreshSandbox,
     },
     actions: {
       chooseMode, clearSelection, submitAction, handleEndTurn, selectUnit, handleHexClick,

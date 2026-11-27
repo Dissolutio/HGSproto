@@ -47,4 +47,10 @@ test("attack report displays the core's rolls and results", () => {
   ]);
   assert.deepEqual(formatAttackReport({ combat: null }), []);
   assert.deepEqual(formatAttackReport({ ...state, last_attack: null }), ["No attacks yet"]);
+  const grass = {
+    ...state,
+    terrain_types: [{ id: "grass", name: "Grass" }],
+    last_attack: { ...state.last_attack, defense: { ...state.last_attack.defense, terrain: "grass", terrain_bonus: 0 } },
+  };
+  assert.match(formatAttackReport(grass)[4], /terrain: Grass =/);
 });
