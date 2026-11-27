@@ -60,8 +60,6 @@ pub fn get_combat_record(match_id: &str) -> Result<Option<CombatRecord>, String>
     if !matches.contains_key(match_id) {
         return Err(format!("Unknown match: {match_id}"));
     }
-    let _flows = MATCH_FLOWS.lock()
-        .map_err(|_| "Match flow registry is unavailable".to_string())?;
     Ok(MATCH_COMBAT_RECORDS.lock()
         .map_err(|_| "Match combat registry is unavailable".to_string())?
         .get(match_id).cloned())
