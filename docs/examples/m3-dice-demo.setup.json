@@ -1,0 +1,53 @@
+{
+  "setup_version": 2,
+  "name": "M3 dice demo",
+  "terrain_types": [
+    { "id": "grass", "name": "Grass" },
+    { "id": "shadow", "name": "Shadow", "tags": ["concealment"] }
+  ],
+  "die": { "faces": ["strike", "strike", "strike", "block", "block", "blank"] },
+  "map": {
+    "hexMap": { "name": "Five-hex demo lane" },
+    "boardPieces": [
+      { "uid": "home", "inventoryID": "g1", "terrain": "grass", "altitude": 0, "rotation": 0,
+        "pieceCoords": { "q": 0, "r": 0, "s": 0 } },
+      { "uid": "approach", "inventoryID": "g1", "terrain": "grass", "altitude": 0, "rotation": 0,
+        "pieceCoords": { "q": 1, "r": 0, "s": -1 } },
+      { "uid": "middle", "inventoryID": "g1", "terrain": "grass", "altitude": 0, "rotation": 0,
+        "pieceCoords": { "q": 2, "r": 0, "s": -2 } },
+      { "uid": "shade", "inventoryID": "g1", "terrain": "shadow", "altitude": 0, "rotation": 0,
+        "pieceCoords": { "q": 3, "r": 0, "s": -3 } },
+      { "uid": "far", "inventoryID": "g1", "terrain": "grass", "altitude": 0, "rotation": 0,
+        "pieceCoords": { "q": 4, "r": 0, "s": -4 } }
+    ],
+    "starterUnits": [
+      { "id": "UNIT_P1_1", "seat": "P1", "components": {
+        "tags": ["Unit", "P1"],
+        "destructible": { "current_life": 4, "max_life": 4 },
+        "combat": { "attack": 3, "defense": 3, "damage_per_strike": 1 }
+      } },
+      { "id": "UNIT_P1_2", "seat": "P1", "components": {
+        "tags": ["Unit", "P1"],
+        "destructible": { "current_life": 4, "max_life": 4 },
+        "combat": { "attack": 3, "defense": 3, "damage_per_strike": 1 }
+      } },
+      { "id": "UNIT_P2_1", "seat": "P2", "components": {
+        "tags": ["Unit", "P2"],
+        "destructible": { "current_life": 4, "max_life": 4 },
+        "combat": { "attack": 3, "defense": 3, "damage_per_strike": 1 }
+      } },
+      { "id": "UNIT_P2_2", "seat": "P2", "components": {
+        "tags": ["Unit", "P2"],
+        "destructible": { "current_life": 4, "max_life": 4 },
+        "combat": { "attack": 3, "defense": 3, "damage_per_strike": 1 }
+      } }
+    ]
+  },
+  "profiles": [],
+  "roster": [],
+  "rules": {
+    "terrain_defense_bonus": [{ "tag": "concealment", "dice": 1 }],
+    "health_cap": { "max_health": 10 }
+  },
+  "house_rules": []
+}
