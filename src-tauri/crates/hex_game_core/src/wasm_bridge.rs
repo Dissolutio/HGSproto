@@ -81,6 +81,46 @@ pub fn wasm_apply_setup(match_id: String, setup_json: String) -> Result<(), JsVa
 }
 
 #[wasm_bindgen]
+pub fn wasm_check_setup(setup_json: String) -> String {
+    crate::setup::check_setup(&setup_json)
+}
+
+fn apply_setup_v2(match_id: String, setup_json: &str, seed_hex: &str, allow_over_cap: bool) -> Result<(), String> {
+    if seed_hex.len() != 16 || !seed_hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("seed_hex must be exactly 16 lowercase hexadecimal characters".into());
+    }
+    let seed = u64::from_str_radix(seed_hex, 16).expect("hex checked");
+    let approval = crate::setup::Approval::LocalSandbox;
+    if allow_over_cap {
+        crate::setup::apply_setup_with_seed_allowing_over_cap(match_id, setup_json, &MOD_REGISTRY, seed, approval)
+    } else {
+        crate::setup::apply_setup_with_seed(match_id, setup_json, &MOD_REGISTRY, seed, approval)
+    }
+}
+
+#[wasm_bindgen]
+pub fn wasm_apply_setup_v2(match_id: String, setup_json: String, seed_hex: String, allow_over_cap: bool) -> Result<(), JsValue> {
+    apply_setup_v2(match_id, &setup_json, &seed_hex, allow_over_cap)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_query_deploy(match_id: String, slot: String, mod_id: String, seat: String, starting_health: i32) -> String {
+    engine::query_deploy(&match_id, &slot, &mod_id, &seat, starting_health, &MOD_REGISTRY)
+}
+
+#[wasm_bindgen]
+pub fn wasm_deploy_profile_unit_allowing_over_cap(match_id: String, slot: String, mod_id: String, seat: String, starting_health: i32) -> Result<String, JsValue> {
+    engine::deploy_profile_unit_allowing_over_cap(&match_id, &slot, &mod_id, &seat, starting_health, &MOD_REGISTRY, crate::setup::Approval::LocalSandbox)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_get_combat_state(match_id: String) -> Result<String, JsValue> {
+    engine::combat_state(&match_id).map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
 pub fn wasm_export_setup(match_id: String) -> Result<String, JsValue> {
     crate::setup::export_setup(&match_id, &MOD_REGISTRY).map_err(|error| JsValue::from_str(&error))
 }
@@ -133,6 +173,38 @@ mod tests {
 
     // Applying a setup replaces the page-wide registry, so registry users must not run in parallel.
     static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn b7_bridge_seed_consent_and_legacy_combat_state() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let id = "b7_bridge";
+        let legacy = r#"{"hexMap":{},"boardPieces":[{"uid":"g7","inventoryID":"g7","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}}]}"#;
+        super::initialize_match(id.into(), legacy).unwrap();
+        let before = super::wasm_get_current_state(id.into());
+        assert_eq!(super::wasm_get_combat_state(id.into()).unwrap(), "{\"combat\": null}");
+        let source = serde_json::json!({
+            "setup_version":2, "name":"bridge", "terrain_types":[{"id":"grass","name":"Grass"}],
+            "map":{"hexMap":{},"boardPieces":[{"uid":"a","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}},
+                {"uid":"b","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":1,"r":0,"s":-1}}],
+                "starterUnits":[
+                    {"id":"UNIT_P1_1","seat":"P1","components":{"tags":["Unit","P1"],"destructible":{"current_life":4,"max_life":4},"combat":{"attack":1,"defense":1}}},
+                    {"id":"UNIT_P2_1","seat":"P2","components":{"tags":["Unit","P2"],"destructible":{"current_life":4,"max_life":4},"combat":{"attack":1,"defense":1}}}]},
+            "profiles":[], "roster":[], "rules":{"health_cap":{"max_health":3}}
+        }).to_string();
+        for seed in ["", "000000000000000", "000000000000000A", "000000000000000g", "00000000000000000"] {
+            assert!(super::apply_setup_v2(id.into(), &source, seed, true).is_err());
+            assert_eq!(super::wasm_get_current_state(id.into()), before);
+        }
+        assert!(super::apply_setup_v2(id.into(), &source, "0000000000000001", false).is_err());
+        assert_eq!(super::wasm_get_current_state(id.into()), before);
+        let checked: serde_json::Value = serde_json::from_str(&super::wasm_check_setup(source.clone())).unwrap();
+        assert_eq!(checked["over_cap"].as_array().unwrap().len(), 2);
+        super::apply_setup_v2(id.into(), &source, "0000000000000001", true).unwrap();
+        super::wasm_apply_setup_v2(id.into(), source, "0000000000000001".into(), true).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&super::wasm_get_combat_state(id.into()).unwrap()).unwrap();
+        assert_eq!(state["house_rules"].as_array().unwrap().len(), 2);
+        crate::engine::remove_match(id);
+    }
 
     #[test]
     fn wasm_api_initializes_queries_and_processes_moves() {

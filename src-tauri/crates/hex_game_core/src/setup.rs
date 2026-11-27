@@ -15,6 +15,8 @@ use std::fmt;
 #[path = "setup_v2.rs"]
 mod v2;
 pub use v2::{HealthCap, ScenarioRules, TerrainBonus, TerrainDefinition, ValidatedSetupV2, validate_setup_v2};
+pub(crate) use v2::OverCap;
+pub(crate) use v2::check_deployment_dice;
 
 const MAX_SETUP_BYTES: usize = 1_048_576;
 const MAX_DEPTH: usize = 32;
@@ -751,6 +753,46 @@ pub enum Approval {
     LocalSandbox,
 }
 
+/// Inspects a setup without changing a match or registry.
+pub fn check_setup(json: &str) -> String {
+    let result: Result<Value, String> = (|| {
+        let value = v2::parse_setup(json)?;
+        if value.get("setup_version").and_then(Value::as_u64) == Some(2) {
+            let (setup, over) = v2::inspect_value(&value)?;
+            let error = over.first().map(OverCap::error);
+            Ok(serde_json::json!({"ok":over.is_empty(), "error":error, "over_cap":over,
+                "house_rules":setup.source.get("house_rules").cloned().unwrap_or_else(|| serde_json::json!([]))}))
+        } else {
+            validate_setup(json)?;
+            Ok(serde_json::json!({"ok":true, "error":null, "over_cap":[], "house_rules":[]}))
+        }
+    })();
+    match result {
+        Ok(value) => value.to_string(),
+        Err(error) => serde_json::json!({"ok":false, "error":error, "over_cap":[], "house_rules":[]}).to_string(),
+    }
+}
+
+pub fn apply_setup_with_seed_allowing_over_cap(
+    match_id: String, json: &str, registry: &ModRegistry, seed: u64, approval: Approval,
+) -> Result<(), String> {
+    let mut value = v2::parse_setup(json)?;
+    let (_, over) = v2::inspect_value(&value).map_err(|error| {
+        if error == "setup_version 1: use validate_setup" {
+            "setup_version 1: use apply_setup".to_string()
+        } else { error }
+    })?;
+    if over.is_empty() {
+        return apply_setup_with_seed(match_id, json, registry, seed, approval);
+    }
+    let root = value.as_object_mut().expect("validated setup object");
+    let rules = root.entry("house_rules").or_insert_with(|| serde_json::json!([]))
+        .as_array_mut().expect("validated house rules");
+    rules.extend(over.iter().map(|item| item.house_rule(approval)));
+    let json = serialize_v2_json(&value).map_err(|error| error.to_string())?;
+    apply_setup_with_seed(match_id, &json, registry, seed, approval)
+}
+
 /// Starts a validated v2 setup with a caller-provided match seed.
 pub fn apply_setup_with_seed(
     match_id: String,
@@ -1178,16 +1220,214 @@ mod tests {
         let id = "b6_invalid_deployment";
         let registry = ModRegistry::default();
         apply_setup_with_seed(id.into(), &seeded_example().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
-        engine::deploy_profile_unit(id, "UNIT_P2_1", "com.community.goliath", "P2", 11, &registry).unwrap();
         let before = match_value(id);
         let combat = engine::get_combat_record(id).unwrap();
         let setup_before = engine::setup_records().lock().unwrap()[id].map.clone();
-        assert!(export_setup(id, &registry).unwrap_err().contains("health"));
-        assert!(export_local_sandbox(id, &registry).unwrap_err().contains("health"));
+        assert!(engine::deploy_profile_unit(id, "UNIT_P2_1", "com.community.goliath", "P2", 11, &registry).unwrap_err().contains("health"));
         assert_eq!(match_value(id), before);
         assert_eq!(engine::get_combat_record(id).unwrap(), combat);
         assert_eq!(engine::setup_records().lock().unwrap()[id].map, setup_before);
+        engine::deploy_profile_unit_allowing_over_cap(id, "UNIT_P2_1", "com.community.goliath", "P2", 11, &registry, Approval::LocalSandbox).unwrap();
+        let exported: Value = serde_json::from_str(&export_setup(id, &registry).unwrap()).unwrap();
+        assert_eq!(exported["house_rules"].as_array().unwrap().len(), 2);
+        let saved: Value = serde_json::from_str(&export_local_sandbox(id, &registry).unwrap()).unwrap();
+        assert_eq!(saved["setup"]["house_rules"], exported["house_rules"]);
         engine::remove_match(id);
+    }
+
+    #[test]
+    fn b7_check_and_allow_multiple_placements() {
+        let id = "b7_multiple";
+        let registry = ModRegistry::default();
+        let mut source = seeded_example();
+        source["house_rules"] = json!([]);
+        source["map"]["starterUnits"][1]["components"]["destructible"] = json!({"current_life":11,"max_life":11});
+        let raw = source.to_string();
+        let result: Value = serde_json::from_str(&check_setup(&raw)).unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["over_cap"].as_array().unwrap().len(), 2);
+        assert_eq!(result["over_cap"][0], json!({"slot":"UNIT_P1_1","profile":"com.community.goliath","starting_health":11,"max_health":12,"cap":{"starting_health":null,"max_health":10}}));
+        assert_eq!(result["over_cap"][1]["profile"], Value::Null);
+        assert!(engine::get_combat_record(id).is_err());
+        assert!(apply_setup_with_seed(id.into(), &raw, &registry, 1, Approval::LocalSandbox).is_err());
+        apply_setup_with_seed_allowing_over_cap(id.into(), &raw, &registry, 1, Approval::LocalSandbox).unwrap();
+        let exported = export_setup(id, &registry).unwrap();
+        let value: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(value["house_rules"].as_array().unwrap().len(), 2);
+        assert_eq!(value["house_rules"][0], json!({"kind":"allow_over_health_cap","slot":"UNIT_P1_1","name":"Goliath in UNIT_P1_1 allowed above the health cap","starting_health":11,"max_health":12,"approval":{"mode":"local_sandbox"}}));
+        assert_eq!(value["house_rules"][1], json!({"kind":"allow_over_health_cap","slot":"UNIT_P2_1","name":"UNIT_P2_1 in UNIT_P2_1 allowed above the health cap","starting_health":11,"max_health":11,"approval":{"mode":"local_sandbox"}}));
+        apply_setup_with_seed("b7_roundtrip".into(), &exported, &ModRegistry::default(), 2, Approval::LocalSandbox).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&check_setup(&exported)).unwrap()["ok"], true);
+        source["rules"]["unknown"] = json!(1);
+        let result: Value = serde_json::from_str(&check_setup(&source.to_string())).unwrap();
+        assert_eq!(result["over_cap"], json!([]));
+        assert!(result["error"].as_str().unwrap().contains("unknown"));
+        source["rules"].as_object_mut().unwrap().remove("unknown");
+        source["house_rules"] = value["house_rules"].clone();
+        source["roster"][0]["starting_health"] = json!(10);
+        let result: Value = serde_json::from_str(&check_setup(&source.to_string())).unwrap();
+        assert!(result["error"].as_str().unwrap().contains("stale house rule"));
+        assert_eq!(result["over_cap"], json!([]));
+        assert_eq!(serde_json::from_str::<Value>(&check_setup(VALID)).unwrap(), json!({"ok":true,"error":null,"over_cap":[],"house_rules":[]}));
+        let dup = r#"{"setup_version":2,"setup_version":2}"#;
+        assert!(serde_json::from_str::<Value>(&check_setup(dup)).unwrap()["error"].as_str().unwrap().contains("duplicate"));
+        assert!(apply_setup_with_seed_allowing_over_cap("unused".into(), dup, &registry, 1, Approval::LocalSandbox).unwrap_err().contains("duplicate"));
+        let oversized = format!("{}{}", raw, " ".repeat(MAX_SETUP_BYTES));
+        assert!(serde_json::from_str::<Value>(&check_setup(&oversized)).unwrap()["error"].as_str().unwrap().contains("1 MiB"));
+        assert!(apply_setup_with_seed_allowing_over_cap("unused".into(), &oversized, &registry, 1, Approval::LocalSandbox).unwrap_err().contains("1 MiB"));
+        engine::remove_match(id);
+        engine::remove_match("b7_roundtrip");
+    }
+
+    #[test]
+    fn b7_long_utf8_name_is_truncated_at_character_boundary() {
+        let id = "b7_utf8";
+        let registry = ModRegistry::default();
+        let mut source = seeded_example();
+        source["house_rules"] = json!([]);
+        source["profiles"][0]["display_name"] = json!("é".repeat(100));
+        apply_setup_with_seed_allowing_over_cap(id.into(), &source.to_string(), &registry, 1, Approval::LocalSandbox).unwrap();
+        let exported: Value = serde_json::from_str(&export_setup(id, &registry).unwrap()).unwrap();
+        let name = exported["house_rules"][0]["name"].as_str().unwrap();
+        assert!(name.len() <= 128);
+        assert!(name.ends_with(" in UNIT_P1_1 allowed above the health cap"));
+        engine::remove_match(id);
+    }
+
+    #[test]
+    fn b7_existing_rules_are_preserved_and_stale_rules_are_rejected() {
+        let id = "b7_preserve";
+        let registry = ModRegistry::default();
+        let mut source = seeded_example();
+        source["map"]["starterUnits"][1]["components"]["destructible"] = json!({"current_life":11,"max_life":11});
+        let report: Value = serde_json::from_str(&check_setup(&source.to_string())).unwrap();
+        assert_eq!(report["house_rules"], source["house_rules"]);
+        assert_eq!(report["over_cap"].as_array().unwrap().len(), 1);
+        assert_eq!(report["over_cap"][0]["slot"], "UNIT_P2_1");
+        apply_setup_with_seed_allowing_over_cap(id.into(), &source.to_string(), &registry, 1, Approval::LocalSandbox).unwrap();
+        let value: Value = serde_json::from_str(&export_setup(id, &registry).unwrap()).unwrap();
+        assert_eq!(value["house_rules"][0], source["house_rules"][0]);
+        assert_eq!(value["house_rules"].as_array().unwrap().len(), 2);
+        let mut stale = source;
+        stale["rules"] = json!({});
+        let report: Value = serde_json::from_str(&check_setup(&stale.to_string())).unwrap();
+        assert!(report["error"].as_str().unwrap().contains("stale house rule"));
+        assert_eq!(report["over_cap"], json!([]));
+        engine::remove_match(id);
+    }
+
+    #[test]
+    fn b7_deploy_query_allow_redeploy_and_restore() {
+        let id = "b7_deploy";
+        let restored = "b7_deploy_restored";
+        let registry = ModRegistry::default();
+        let mut source = seeded_example();
+        source["profiles"][0]["components"]["destructible"] = json!({"current_life":8,"max_life":8});
+        source["roster"][0]["starting_health"] = json!(8);
+        source["house_rules"] = json!([]);
+        apply_setup_with_seed(id.into(), &source.to_string(), &registry, 9, Approval::LocalSandbox).unwrap();
+        let mut large = seeded_example()["profiles"][0].clone();
+        large["mod_id"] = json!("com.example.large");
+        registry.load_batch(&json!([large]).to_string()).unwrap();
+        let args = (id, "UNIT_P2_1", "com.example.large", "P2", 11);
+        let before = match_value(id);
+        let before_export = export_setup(id, &registry).unwrap();
+        let q: Value = serde_json::from_str(&engine::query_deploy(args.0,args.1,args.2,args.3,args.4,&registry)).unwrap();
+        assert_eq!(q["legal"], false);
+        assert_eq!(q["over_cap"]["max_health"], 12);
+        let invalid: Value = serde_json::from_str(&engine::query_deploy(id,"UNIT_P2_1","com.example.large","P1",11,&registry)).unwrap();
+        assert_eq!(invalid["over_cap"], Value::Null);
+        assert!(invalid["error"].as_str().unwrap().contains("does not belong"));
+        assert!(engine::deploy_profile_unit(args.0,args.1,args.2,args.3,args.4,&registry).is_err());
+        assert!(engine::deploy_profile_unit_recorded(args.0,args.1,args.2,args.3,args.4,&registry).is_err());
+        assert_eq!(match_value(id), before);
+        assert_eq!(export_setup(id, &registry).unwrap(), before_export);
+        engine::deploy_profile_unit_allowing_over_cap(args.0,args.1,args.2,args.3,args.4,&registry,Approval::LocalSandbox).unwrap();
+        let exported: Value = serde_json::from_str(&export_setup(id, &registry).unwrap()).unwrap();
+        assert_eq!(exported["house_rules"][0]["slot"], "UNIT_P2_1");
+        let saved = export_local_sandbox(id, &registry).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&saved).unwrap()["record_version"], 3);
+        let restored_registry = ModRegistry::default();
+        restore_local_sandbox(restored, &saved, &restored_registry).unwrap();
+        let restored_setup: Value = serde_json::from_str(&export_setup(restored, &restored_registry).unwrap()).unwrap();
+        assert_eq!(restored_setup["house_rules"], exported["house_rules"]);
+        engine::deploy_profile_unit(id,"UNIT_P2_1","com.community.goliath","P2",7,&registry).unwrap();
+        let exported: Value = serde_json::from_str(&export_setup(id, &registry).unwrap()).unwrap();
+        assert_eq!(exported["house_rules"], json!([]));
+        engine::remove_match(id);
+        engine::remove_match(restored);
+    }
+
+    #[test]
+    fn b7_starting_health_cap_uses_placed_value() {
+        let mut source = seeded_example();
+        source["rules"]["health_cap"] = json!({"starting_health": 10});
+        source["house_rules"] = json!([]);
+        source["roster"][0]["starting_health"] = json!(10);
+        assert_eq!(serde_json::from_str::<Value>(&check_setup(&source.to_string())).unwrap()["ok"], true);
+        source["roster"][0]["starting_health"] = json!(11);
+        let result: Value = serde_json::from_str(&check_setup(&source.to_string())).unwrap();
+        assert_eq!(result["over_cap"][0]["starting_health"], 11);
+        assert!(result["error"].as_str().unwrap().contains("starting_health 11"));
+        let id = "b7_start_cap";
+        source["roster"][0]["starting_health"] = json!(10);
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &source.to_string(), &registry, 1, Approval::LocalSandbox).unwrap();
+        let q: Value = serde_json::from_str(&engine::query_deploy(id,"UNIT_P2_1","com.community.goliath","P2",11,&registry)).unwrap();
+        assert_eq!(q["over_cap"]["starting_health"], 11);
+        let q: Value = serde_json::from_str(&engine::query_deploy(id,"UNIT_P2_1","com.community.goliath","P2",10,&registry)).unwrap();
+        assert_eq!(q["legal"], true);
+        engine::remove_match(id);
+    }
+
+    #[test]
+    fn b7_v1_and_legacy_query_and_deploy() {
+        let registry = ModRegistry::default();
+        let v1 = "b7_v1";
+        let legacy = "b7_legacy";
+        apply_setup(v1.into(), VALID, &registry).unwrap();
+        let map = r#"{"hexMap":{},"boardPieces":[{"uid":"g7","inventoryID":"g7","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}}]}"#;
+        engine::try_initialize_from_hexoscape_with_registry(legacy.into(), map, &registry).unwrap();
+        for id in [v1, legacy] {
+            let before = match_value(id);
+            let q: Value = serde_json::from_str(&engine::query_deploy(id,"UNIT_P1_1","com.community.goliath","P1",12,&registry)).unwrap();
+            assert_eq!(q, json!({"legal":true,"error":null,"over_cap":null}));
+            assert_eq!(match_value(id), before);
+            let q: Value = serde_json::from_str(&engine::query_deploy(id,"UNIT_P1_1","com.community.goliath","P2",12,&registry)).unwrap();
+            assert_eq!(q["legal"], false);
+            assert_eq!(q["over_cap"], Value::Null);
+            assert_eq!(engine::deploy_profile_unit(id,"UNIT_P1_1","com.community.goliath","P1",12,&registry).unwrap(), "Goliath");
+            engine::remove_match(id);
+        }
+        assert_eq!(apply_setup_with_seed_allowing_over_cap("unused".into(), VALID, &registry, 1, Approval::LocalSandbox).unwrap_err(),
+            apply_setup_with_seed("unused".into(), VALID, &registry, 1, Approval::LocalSandbox).unwrap_err());
+    }
+
+    #[test]
+    fn b7_deployment_rejects_dice_limits_before_cap_and_preserves_legacy() {
+        let id = "b7_dice_limit";
+        let legacy = "b7_dice_legacy";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &seeded_example().to_string(), &registry, 1, Approval::LocalSandbox).unwrap();
+        let mut profile = seeded_example()["profiles"][0].clone();
+        profile["mod_id"] = json!("com.example.dice_limit");
+        profile["components"]["combat"]["defense"] = json!(999);
+        registry.load_batch(&json!([profile]).to_string()).unwrap();
+        let before = match_value(id);
+        let exported = export_setup(id, &registry).unwrap();
+        let query: Value = serde_json::from_str(&engine::query_deploy(id,"UNIT_P2_1","com.example.dice_limit","P2",11,&registry)).unwrap();
+        assert_eq!(query["over_cap"], Value::Null);
+        assert!(query["error"].as_str().unwrap().contains("exceeds 1000 dice"));
+        assert!(engine::deploy_profile_unit_allowing_over_cap(id,"UNIT_P2_1","com.example.dice_limit","P2",11,&registry,Approval::LocalSandbox).unwrap_err().contains("exceeds 1000 dice"));
+        assert_eq!(match_value(id), before);
+        assert_eq!(export_setup(id, &registry).unwrap(), exported);
+        let map = r#"{"hexMap":{},"boardPieces":[{"uid":"g7","inventoryID":"g7","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}}]}"#;
+        engine::try_initialize_from_hexoscape_with_registry(legacy.into(), map, &registry).unwrap();
+        let query: Value = serde_json::from_str(&engine::query_deploy(legacy,"UNIT_P1_1","com.example.dice_limit","P1",11,&registry)).unwrap();
+        assert_eq!(query["legal"], true);
+        engine::deploy_profile_unit(legacy,"UNIT_P1_1","com.example.dice_limit","P1",11,&registry).unwrap();
+        engine::remove_match(id);
+        engine::remove_match(legacy);
     }
 
     #[test]
