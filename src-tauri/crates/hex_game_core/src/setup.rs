@@ -457,6 +457,14 @@ pub fn validate_setup(json: &str) -> Result<ValidatedSetup, String> {
     let raw_profiles = array(&root["profiles"], "profiles")?;
     let registry = ModRegistry::default();
     if !raw_profiles.is_empty() {
+        for profile in raw_profiles {
+            if let Some(version) = profile.get("schema_version").and_then(Value::as_u64)
+                && version <= u32::MAX as u64 && version != 1
+            {
+                let id = profile.get("mod_id").and_then(Value::as_str).unwrap_or("");
+                return Err(format!("profiles: profile {id}: unsupported schema_version {version}; expected 1"));
+            }
+        }
         load_profiles(&registry, raw_profiles).map_err(|error| format!("profiles: {error}"))?;
     }
     let profiles = raw_profiles
@@ -1488,6 +1496,27 @@ mod tests {
         check(&value).unwrap();
         value["map"]["boardPieces"].as_array_mut().unwrap().pop();
         rejected(&value, "6 starter units exceed 5 unique spawn hexes");
+    }
+
+    #[test]
+    fn version_one_setup_rejects_valid_schema_two_profile_without_mutation() {
+        let match_id = format!("setup_schema_two_refused_{}", std::process::id());
+        let registry = ModRegistry::default();
+        apply_setup(match_id.clone(), VALID, &registry).unwrap();
+        let before = apply_preservation(&match_id, &registry);
+        let exported = export_setup(&match_id, &registry).unwrap();
+        let mut candidate = example();
+        candidate["profiles"][0]["schema_version"] = 2.into();
+        candidate["profiles"][0]["components"]["combat"] = json!({"attack": 4, "defense": 3});
+        let scratch = ModRegistry::default();
+        scratch.load_batch(&candidate["profiles"].to_string()).unwrap();
+        assert_eq!(
+            apply_setup(match_id.clone(), &candidate.to_string(), &registry).unwrap_err(),
+            "profiles: profile com.community.goliath: unsupported schema_version 2; expected 1"
+        );
+        assert_eq!(apply_preservation(&match_id, &registry), before);
+        assert_eq!(export_setup(&match_id, &registry).unwrap(), exported);
+        engine::remove_match(&match_id);
     }
 
     #[test]
