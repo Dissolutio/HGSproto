@@ -452,6 +452,14 @@ export function useGameRuntime() {
   const deploymentSlot =
     deploymentSlots.find((unit) => unit.id === deploymentSlotId) ?? deploymentSlots[0] ?? null;
   const selectedProfile = loadedModProfiles.find((profile) => profile.modId === selectedModId);
+  useEffect(() => {
+    if (pendingDeploy && (pendingDeploy.slot !== deploymentSlot?.id ||
+      pendingDeploy.modId !== selectedProfile?.modId || pendingDeploy.seat !== deploymentSeat ||
+      pendingDeploy.life !== Number(startingHealth) || pendingDeploy.maxHealth !== selectedProfile?.maxHealth)) {
+      setPendingDeploy(null);
+      setProfileDeployFeedback(null);
+    }
+  }, [pendingDeploy, deploymentSlot?.id, selectedProfile?.modId, selectedProfile?.maxHealth, deploymentSeat, startingHealth]);
   const activeSeat = gameState?.context?.active_player;
   const turnPhase = gameState?.context?.turn_phase;
   const winner = gameState?.context?.winner;
@@ -512,6 +520,7 @@ export function useGameRuntime() {
 
   const handleExportSetup = () => {
     if (!setupActionsEnabled.current || setupLoadPending.current) return;
+    setPendingSetup(null);
     try {
       const text = wasm_export_setup(WASM_MATCH_ID);
       const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
@@ -740,6 +749,8 @@ export function useGameRuntime() {
       const parsed: unknown = JSON.parse(modProfileText);
       const summaries = summarizeProfiles(Array.isArray(parsed) ? parsed : [parsed]);
       const loadedCount = wasm_load_mod_profiles(modProfileText);
+      setPendingDeploy(null);
+      setProfileDeployFeedback(null);
       showLoadedProfiles(summaries, true);
       setProfileLoadFeedback({
         kind: "success",
