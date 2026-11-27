@@ -6,15 +6,48 @@ use std::sync::{Arc, RwLock};
 
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UnitTemplate {
     pub schema_version: u32,
     pub mod_id: String,
     pub display_name: String,
     pub visual_primitive: String,
-    #[serde(deserialize_with = "deserialize_profile_components")]
     pub components: HashMap<String, Component>,
+}
+
+impl<'de> Deserialize<'de> for UnitTemplate {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawTemplate {
+            schema_version: u32,
+            mod_id: String,
+            display_name: String,
+            visual_primitive: String,
+            components: HashMap<String, Value>,
+        }
+
+        let raw = RawTemplate::deserialize(deserializer)?;
+        let components = raw
+            .components
+            .into_iter()
+            .map(|(name, value)| {
+                if raw.schema_version == 1 && name == "combat" {
+                    return Err(serde::de::Error::custom("unsupported unit component 'combat'"));
+                }
+                parse_profile_component(&name, value)
+                    .map(|component| (name, component))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect::<Result<_, D::Error>>()?;
+        Ok(Self {
+            schema_version: raw.schema_version,
+            mod_id: raw.mod_id,
+            display_name: raw.display_name,
+            visual_primitive: raw.visual_primitive,
+            components,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,9 +123,9 @@ impl ModRegistry {
 }
 
 fn validate_template(template: &UnitTemplate) -> Result<(), String> {
-    if template.schema_version != 1 {
+    if !matches!(template.schema_version, 1 | 2) {
         return Err(format!(
-            "unsupported schema_version {}; expected 1",
+            "unsupported schema_version {}; expected 1 or 2",
             template.schema_version
         ));
     }
@@ -112,7 +145,7 @@ fn validate_template(template: &UnitTemplate) -> Result<(), String> {
     if template
         .components
         .keys()
-        .any(|key| !matches!(key.as_str(), "destructible" | "tags"))
+        .any(|key| !matches!(key.as_str(), "destructible" | "tags" | "combat"))
     {
         return Err("unit profiles support only destructible and tags components".to_string());
     }
@@ -141,6 +174,20 @@ fn validate_template(template: &UnitTemplate) -> Result<(), String> {
     if labels.iter().collect::<HashSet<_>>().len() != labels.len() {
         return Err("tag labels must not contain duplicates".to_string());
     }
+    if template.schema_version == 2 {
+        let Some(Component::Combat { attack, defense, damage_per_strike }) = template.components.get("combat") else {
+            return Err("unit profiles require a combat component".to_string());
+        };
+        for (name, value, max) in [
+            ("attack", attack, 999),
+            ("defense", defense, 999),
+            ("damage_per_strike", damage_per_strike, 100),
+        ] {
+            if !(0..=max).contains(value) {
+                return Err(format!("combat.{name} must be within 0..={max}"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -167,25 +214,21 @@ fn is_valid_mod_id(mod_id: &str) -> bool {
         })
 }
 
-fn deserialize_profile_components<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<String, Component>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw_components = HashMap::<String, Value>::deserialize(deserializer)?;
-    raw_components
-        .into_iter()
-        .map(|(name, value)| {
-            parse_profile_component(&name, value)
-                .map(|component| (name.clone(), component))
-                .map_err(serde::de::Error::custom)
-        })
-        .collect()
-}
-
 fn parse_profile_component(name: &str, value: Value) -> Result<Component, String> {
     match name {
+        "combat" => {
+            let data = tagged_component_data(&value, "Combat", "combat")?;
+            reject_unknown_fields(data, &["attack", "defense", "damage_per_strike"], "combat")?;
+            Ok(Component::Combat {
+                attack: profile_integer(data, "attack", "combat")?,
+                defense: profile_integer(data, "defense", "combat")?,
+                damage_per_strike: if data.contains_key("damage_per_strike") {
+                    profile_integer(data, "damage_per_strike", "combat")?
+                } else {
+                    1
+                },
+            })
+        }
         "destructible" => {
             let data = tagged_component_data(&value, "Destructible", "destructible")?;
             reject_unknown_fields(data, &["current_life", "max_life"], "destructible")?;
@@ -295,6 +338,107 @@ mod tests {
             "tags": ["Unit", "Heavy", "Armored"]
         }
     }"#;
+
+    fn combat_profile() -> Value {
+        let mut profile: Value = serde_json::from_str(VALID_PROFILE).unwrap();
+        profile["schema_version"] = 2.into();
+        profile["components"]["combat"] = serde_json::json!({
+            "attack": 4, "defense": 3, "damage_per_strike": 1
+        });
+        profile
+    }
+
+    #[test]
+    fn combat_values_validate_boundaries_and_default() {
+        for (field, max) in [("attack", 999), ("defense", 999), ("damage_per_strike", 100)] {
+            for value in [serde_json::json!(0), serde_json::json!(max)] {
+                let mut profile = combat_profile();
+                profile["components"]["combat"][field] = value.clone();
+                let registry = ModRegistry::default();
+                registry.load_batch(&serde_json::json!([profile]).to_string()).unwrap();
+                let template = registry.get_template("com.community.heavy_mech").unwrap();
+                assert_eq!(serde_json::to_value(&template.components["combat"]).unwrap()["data"][field], value);
+            }
+            for value in [serde_json::json!(-1), serde_json::json!(max + 1), serde_json::json!(1.5), Value::Null] {
+                let mut profile = combat_profile();
+                profile["components"]["combat"][field] = value.clone();
+                let error = ModRegistry::default().load_batch(&serde_json::json!([profile]).to_string()).unwrap_err();
+                assert!(error.contains(&format!("combat.{field}")), "{field}={value}: {error}");
+            }
+        }
+        let mut profile = combat_profile();
+        profile["components"]["combat"].as_object_mut().unwrap().remove("damage_per_strike");
+        let registry = ModRegistry::default();
+        registry.load_batch(&serde_json::json!([profile]).to_string()).unwrap();
+        assert!(matches!(registry.get_template("com.community.heavy_mech").unwrap().components["combat"],
+            Component::Combat { damage_per_strike: 1, .. }));
+    }
+
+    #[test]
+    fn combat_schema_and_strict_fields_are_enforced() {
+        let mut v1 = combat_profile();
+        v1["schema_version"] = 1.into();
+        v1["components"]["combat"] = Value::Null;
+        let error = ModRegistry::default().load_batch(&serde_json::json!([v1]).to_string()).unwrap_err();
+        assert_eq!(error, "profile 0: invalid profile: unsupported unit component 'combat'");
+
+        let mut missing = combat_profile();
+        missing["components"].as_object_mut().unwrap().remove("combat");
+        let error = ModRegistry::default().load_batch(&serde_json::json!([missing]).to_string()).unwrap_err();
+        assert_eq!(error, "profile com.community.heavy_mech: unit profiles require a combat component");
+
+        let mut unknown = combat_profile();
+        unknown["components"]["combat"]["extra"] = 1.into();
+        let error = ModRegistry::default().load_batch(&serde_json::json!([unknown]).to_string()).unwrap_err();
+        assert!(error.contains("unsupported combat field 'extra'"), "{error}");
+
+        let mut future = combat_profile();
+        future["schema_version"] = 3.into();
+        let error = ModRegistry::default().load_batch(&serde_json::json!([future]).to_string()).unwrap_err();
+        assert!(error.contains("unsupported schema_version 3"), "{error}");
+
+        for field in ["attack", "defense"] {
+            let mut profile = combat_profile();
+            profile["components"]["combat"].as_object_mut().unwrap().remove(field);
+            let error = ModRegistry::default().load_batch(&serde_json::json!([profile]).to_string()).unwrap_err();
+            assert!(error.contains(&format!("combat.{field}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn mixed_schema_batches_are_atomic() {
+        let registry = ModRegistry::default();
+        let mut v1: Value = serde_json::from_str(VALID_PROFILE).unwrap();
+        v1["mod_id"] = "com.example.v1".into();
+        let mut v2 = combat_profile();
+        v2["mod_id"] = "com.example.v2".into();
+        assert_eq!(registry.load_batch(&serde_json::json!([v1, v2]).to_string()).unwrap(), 2);
+        let before = serde_json::to_value(&*registry.templates.read().unwrap()).unwrap();
+        let mut valid = combat_profile();
+        valid["mod_id"] = "com.example.new".into();
+        let mut invalid = combat_profile();
+        invalid["mod_id"] = "com.example.bad".into();
+        invalid["components"]["combat"]["attack"] = 1000.into();
+        assert!(registry.load_batch(&serde_json::json!([valid, invalid]).to_string()).is_err());
+        assert_eq!(serde_json::to_value(&*registry.templates.read().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn tagged_combat_profile_round_trips() {
+        let mut profile = combat_profile();
+        profile["components"]["combat"] = serde_json::json!({
+            "type": "Combat", "data": {"attack": 4, "defense": 3, "damage_per_strike": 1}
+        });
+        let registry = ModRegistry::default();
+        registry.load_batch(&serde_json::json!([profile]).to_string()).unwrap();
+        let template = registry.get_template("com.community.heavy_mech").unwrap();
+        let encoded = serde_json::to_value(&template).unwrap();
+        assert_eq!(encoded["components"]["combat"], serde_json::json!({
+            "type": "Combat", "data": {"attack": 4, "defense": 3, "damage_per_strike": 1}
+        }));
+        let restored: UnitTemplate = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
+    }
 
     #[test]
     fn test_mod_registry_atomic_batch_ingestion_and_validation() {

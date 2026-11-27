@@ -498,7 +498,7 @@ fn starter_unit_components(
     })?;
     let seat = starter_unit_seat(unit)?;
     let mut components = HashMap::new();
-    for key in ["destructible", "tags"] {
+    for key in ["destructible", "tags", "combat"] {
         if let Some(component) = template.components.get(key) {
             components.insert(key.to_string(), component.clone());
         }
@@ -638,7 +638,7 @@ fn prepare_profile_deployment_from_template(
     template: &crate::mod_registry::UnitTemplate,
 ) -> Result<PreparedDeployment, String> {
     let mut components = HashMap::new();
-    for key in ["destructible", "tags"] {
+    for key in ["destructible", "tags", "combat"] {
         if let Some(component) = template.components.get(key) {
             components.insert(key.to_string(), component.clone());
         }
@@ -1887,6 +1887,35 @@ mod tests {
                     && labels.iter().any(|label| label == "P2")
                     && !labels.iter().any(|label| label == "P1")
         ));
+    }
+
+    #[test]
+    fn schema_two_deployment_copies_combat_independently() {
+        let match_id = format!("schema_two_deployment_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry.load_batch(r#"[{
+            "schema_version": 2, "mod_id": "com.example.combat",
+            "display_name": "Combat Unit", "visual_primitive": "CUBE",
+            "components": {
+                "destructible": {"current_life": 5, "max_life": 5},
+                "tags": ["Unit"], "combat": {"attack": 9, "defense": 8, "damage_per_strike": 7}
+            }
+        }]"#).unwrap();
+        store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
+        deploy_profile_unit(&match_id, "UNIT_P1_1", "com.example.combat", "P1", 5, &registry).unwrap();
+        let combat = serde_json::json!({"type": "Combat", "data": {
+            "attack": 9, "defense": 8, "damage_per_strike": 7
+        }});
+        {
+            let mut templates = registry.templates.write().unwrap();
+            templates.get_mut("com.example.combat").unwrap().components.insert(
+                "combat".into(), Component::Combat { attack: 1, defense: 2, damage_per_strike: 3 }
+            );
+        }
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        assert_eq!(serde_json::to_value(&matches[&match_id].entities["UNIT_P1_1"].components["combat"]).unwrap(), combat);
+        drop(matches);
+        remove_match(&match_id);
     }
 
     #[test]
