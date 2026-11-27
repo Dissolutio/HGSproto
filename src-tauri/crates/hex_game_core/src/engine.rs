@@ -7,6 +7,7 @@ use crate::models::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
+use serde::Serialize;
 
 const REFEREE_ATTACK_DAMAGE: i32 = 1;
 
@@ -41,7 +42,58 @@ pub struct DiceRecord {
     pub seed: u64,
     pub draws_used: u64,
     pub attacks_resolved: u64,
-    pub last_attack: Option<crate::dice::AttackOutcome>,
+    pub last_attack: Option<AttackReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FaceCounts {
+    pub strike: u16,
+    pub block: u16,
+    pub blank: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttackDiceReport {
+    pub base: i32,
+    pub height_bonus: i32,
+    pub total: i32,
+    pub faces: Vec<u8>,
+    pub counts: FaceCounts,
+    pub strikes: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DefenseDiceReport {
+    pub base: i32,
+    pub height_bonus: i32,
+    pub terrain_bonus: i32,
+    pub terrain: Option<String>,
+    pub total: i32,
+    pub faces: Vec<u8>,
+    pub counts: FaceCounts,
+    pub blocks: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DrawRange {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttackReport {
+    pub sequence: u64,
+    pub attacker: String,
+    pub defender: String,
+    pub attack: AttackDiceReport,
+    pub defense: DefenseDiceReport,
+    pub unblocked_strikes: u16,
+    pub damage_per_strike: i32,
+    pub damage: u32,
+    pub defender_health_before: i32,
+    pub defender_health_after: i32,
+    pub defender_removed: bool,
+    pub draws: DrawRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +115,36 @@ pub fn get_combat_record(match_id: &str) -> Result<Option<CombatRecord>, String>
     Ok(MATCH_COMBAT_RECORDS.lock()
         .map_err(|_| "Match combat registry is unavailable".to_string())?
         .get(match_id).cloned())
+}
+
+pub fn combat_state(match_id: &str) -> Result<String, String> {
+    let matches = ACTIVE_MATCHES.lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    if !matches.contains_key(match_id) {
+        return Err(format!("Unknown match: {match_id}"));
+    }
+    let records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    let Some(record) = records.get(match_id) else {
+        return Ok("{\"combat\": null}".into());
+    };
+    let setups = MATCH_SETUP_RECORDS.lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    let source = &setups.get(match_id)
+        .ok_or_else(|| format!("Missing match setup: {match_id}"))?.map;
+    let faces: Vec<_> = record.ruleset.die.faces().iter().map(|face| match face {
+        crate::dice::FaceKind::Strike => "strike",
+        crate::dice::FaceKind::Block => "block",
+        crate::dice::FaceKind::Blank => "blank",
+    }).collect();
+    serde_json::to_string(&serde_json::json!({
+        "combat_version": 1,
+        "die": { "faces": faces },
+        "terrain_types": source["terrain_types"],
+        "house_rules": source.get("house_rules").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "attacks_resolved": record.dice.attacks_resolved,
+        "last_attack": record.dice.last_attack,
+    })).map_err(|error| format!("Could not serialize combat state: {error}"))
 }
 
 pub(crate) fn setup_records() -> &'static Mutex<HashMap<String, crate::setup::SetupRecord>> {
@@ -979,7 +1061,10 @@ pub fn process_action(match_id: &str, acting_seat: &str, action: &str) -> Result
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     let flow = flows.get_mut(match_id)
         .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
-    apply_referee_action(state, flow, acting_seat, action).map_err(|error| error.message)
+    let mut records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    apply_referee_action_with_combat(state, flow, acting_seat, action, records.get_mut(match_id))
+        .map_err(|error| error.message)
 }
 
 /// Reports step permissions and validates a supplied candidate without committing effects.
@@ -1100,6 +1185,84 @@ fn apply_referee_action(
     acting_seat: &str,
     action: &str,
 ) -> Result<(), Rejection> {
+    apply_referee_action_with_combat(state, flow, acting_seat, action, None)
+}
+
+fn face_counts(die: &crate::dice::Die, faces: &[u8]) -> FaceCounts {
+    let mut counts = FaceCounts { strike: 0, block: 0, blank: 0 };
+    for face in faces {
+        match die.faces()[usize::from(*face)] {
+            crate::dice::FaceKind::Strike => counts.strike += 1,
+            crate::dice::FaceKind::Block => counts.block += 1,
+            crate::dice::FaceKind::Blank => counts.blank += 1,
+        }
+    }
+    counts
+}
+
+fn resolve_combat_attack(
+    attacker: &Entity,
+    defender: &Entity,
+    terrain: Option<&str>,
+    record: &CombatRecord,
+) -> Result<AttackReport, Rejection> {
+    let invalid = || Rejection::new(ReasonCode::InvalidState, "Invalid combat data");
+    let combat = |entity: &Entity| entity.components.values().find_map(|component| match component {
+        Component::Combat { attack, defense, damage_per_strike } => Some((*attack, *defense, *damage_per_strike)),
+        _ => None,
+    });
+    let (attack_base, _, damage_per_strike) = combat(attacker).ok_or_else(invalid)?;
+    let (_, defense_base, _) = combat(defender).ok_or_else(invalid)?;
+    let health = defender.components.values().find_map(|component| match component {
+        Component::Destructible { current_life, .. } => Some(*current_life),
+        _ => None,
+    }).ok_or_else(invalid)?;
+    let attack_height = i32::from(attacker.spatial.z > defender.spatial.z);
+    let defense_height = i32::from(defender.spatial.z > attacker.spatial.z);
+    let terrain_type = terrain.and_then(|id| record.ruleset.terrain_types.iter().find(|t| t.id == id));
+    let terrain_bonus = record.ruleset.rules.terrain_defense_bonus.iter().find(|bonus| {
+        terrain_type.is_some_and(|t| bonus.terrain.as_deref() == Some(t.id.as_str())
+            || bonus.tag.as_ref().is_some_and(|tag| t.tags.contains(tag)))
+    }).map_or(0, |bonus| bonus.dice);
+    let attack_total = attack_base.checked_add(attack_height).ok_or_else(invalid)?;
+    let defense_total = defense_base.checked_add(defense_height)
+        .and_then(|n| n.checked_add(terrain_bonus)).ok_or_else(invalid)?;
+    let attack_dice = u16::try_from(attack_total).ok().and_then(crate::dice::DiceCount::new).ok_or_else(invalid)?;
+    let defense_dice = u16::try_from(defense_total).ok().and_then(crate::dice::DiceCount::new).ok_or_else(invalid)?;
+    let damage_value = u8::try_from(damage_per_strike).ok().and_then(crate::dice::DamagePerStrike::new).ok_or_else(invalid)?;
+    let sequence = record.dice.attacks_resolved.checked_add(1).ok_or_else(invalid)?;
+    let from = record.dice.draws_used;
+    let (outcome, to) = crate::dice::resolve_attack(attack_dice, defense_dice, damage_value, &record.ruleset.die, record.dice.seed, from);
+    let health_after = health.saturating_sub(outcome.damage as i32);
+    Ok(AttackReport {
+        sequence,
+        attacker: attacker.id.clone(),
+        defender: defender.id.clone(),
+        attack: AttackDiceReport {
+            base: attack_base, height_bonus: attack_height, total: attack_total,
+            counts: face_counts(&record.ruleset.die, &outcome.attack_faces),
+            faces: outcome.attack_faces, strikes: outcome.strikes,
+        },
+        defense: DefenseDiceReport {
+            base: defense_base, height_bonus: defense_height, terrain_bonus,
+            terrain: terrain.map(str::to_owned), total: defense_total,
+            counts: face_counts(&record.ruleset.die, &outcome.defense_faces),
+            faces: outcome.defense_faces, blocks: outcome.blocks,
+        },
+        unblocked_strikes: outcome.unblocked_strikes, damage_per_strike,
+        damage: outcome.damage, defender_health_before: health,
+        defender_health_after: health_after, defender_removed: health_after <= 0,
+        draws: DrawRange { from, to },
+    })
+}
+
+fn apply_referee_action_with_combat(
+    state: &mut GameState,
+    flow: &mut MatchFlow,
+    acting_seat: &str,
+    action: &str,
+    combat: Option<&mut CombatRecord>,
+) -> Result<(), Rejection> {
     validate_action_context(state, flow, acting_seat, ActionKind::from_token(action))?;
     let next = flow.advance().map_err(|message| Rejection::new(ReasonCode::InvalidState, message))?;
     let step = &flow.definition.phases[0].steps[flow.cursor.step_index];
@@ -1201,6 +1364,20 @@ fn apply_referee_action(
                 {
                     return Err(Rejection::new(ReasonCode::InvalidTarget, format!("Target is not destructible: {target_id}")));
                 }
+                let report = if let Some(record) = combat.as_ref() {
+                    let terrain = state.entities.values().find_map(|entity| {
+                        (entity.spatial.q == target.spatial.q && entity.spatial.r == target.spatial.r
+                            && entity.spatial.z == target.spatial.z).then(|| {
+                            entity.components.values().find_map(|component| match component {
+                                Component::TerrainKind { id } => Some(id.as_str()),
+                                _ => None,
+                            })
+                        }).flatten()
+                    });
+                    Some(resolve_combat_attack(attacker, target, terrain, record)?)
+                } else {
+                    None
+                };
                 let target = state
                     .entities
                     .get_mut(target_id)
@@ -1213,9 +1390,17 @@ fn apply_referee_action(
                         _ => None,
                     })
                     .unwrap();
-                *destructible = destructible.saturating_sub(REFEREE_ATTACK_DAMAGE);
+                *destructible = report.as_ref().map_or_else(
+                    || destructible.saturating_sub(REFEREE_ATTACK_DAMAGE),
+                    |report| report.defender_health_after,
+                );
                 if *destructible <= 0 {
                     state.entities.remove(target_id);
+                }
+                if let (Some(record), Some(report)) = (combat, report) {
+                    record.dice.draws_used = report.draws.to;
+                    record.dice.attacks_resolved = report.sequence;
+                    record.dice.last_attack = Some(report);
                 }
             }
         }
@@ -1302,6 +1487,161 @@ fn parse_spatial_position(value: &str) -> Result<SpatialPosition, String> {
         r: r.parse().map_err(|_| "Invalid R coordinate".to_string())?,
         z: z.parse().map_err(|_| "Invalid Z coordinate".to_string())?,
     })
+}
+
+#[cfg(test)]
+mod dice_combat_tests {
+    use super::*;
+    use crate::setup::{apply_setup_with_seed, Approval};
+    use serde_json::{json, Value};
+
+    fn setup(damage: i32, die: Value, extra_unit: bool) -> Value {
+        let mut units = vec![
+            json!({"id":"UNIT_P1_1","seat":"P1","components":{"tags":["Unit","P1"],
+                "destructible":{"current_life":10,"max_life":10},
+                "combat":{"attack":3,"defense":2,"damage_per_strike":damage}}}),
+            json!({"id":"UNIT_P2_1","seat":"P2","components":{"tags":["Unit","P2"],
+                "destructible":{"current_life":10,"max_life":10},
+                "combat":{"attack":3,"defense":2,"damage_per_strike":damage}}}),
+        ];
+        if extra_unit {
+            units.push(json!({"id":"UNIT_P2_2","seat":"P2","components":{"tags":["Unit","P2"],
+                "destructible":{"current_life":10,"max_life":10},
+                "combat":{"attack":3,"defense":2,"damage_per_strike":damage}}}));
+        }
+        json!({
+            "setup_version":2, "name":"Dice test", "die":{"faces":die},
+            "terrain_types":[{"id":"grass","name":"Grass"},{"id":"shadow","name":"Shadow","tags":["concealment"]}],
+            "map":{"hexMap":{},"boardPieces":[
+                {"uid":"a","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}},
+                {"uid":"b","inventoryID":"g1","terrain":"shadow","altitude":0,"rotation":0,"pieceCoords":{"q":1,"r":0,"s":-1}},
+                {"uid":"c","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":5,"r":0,"s":-5}}
+            ],"starterUnits":units},
+            "profiles":[], "roster":[],
+            "rules":{"terrain_defense_bonus":[{"tag":"concealment","dice":1}]}
+        })
+    }
+
+    fn start(id: &str, source: &Value) {
+        apply_setup_with_seed(id.into(), &source.to_string(), &ModRegistry::default(),
+            0x0123456789abcdef, Approval::LocalSandbox).unwrap();
+    }
+
+    fn snapshot(id: &str) -> Value {
+        serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[id]).unwrap()
+    }
+
+    fn preserved(id: &str) -> (Value, MatchFlow, CombatRecord) {
+        (snapshot(id), get_match_flow(id).unwrap(), get_combat_record(id).unwrap().unwrap())
+    }
+
+    #[test]
+    fn dice_attacks_record_replay_queries_and_rejections() {
+        let ids = ["b5_dice_replay_a", "b5_dice_replay_b"];
+        let source = setup(1, json!(["strike","strike","strike","block","block","blank"]), true);
+        for id in ids {
+            start(id, &source);
+            let before = preserved(id);
+            assert!(process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").is_err());
+            assert_eq!(preserved(id), before);
+            process_action(id, "P1", "S").unwrap();
+            for (seat, token) in [
+                ("P2", "A:UNIT_P1_1:UNIT_P2_1"),
+                ("P1", "A:UNIT_P1_1:UNIT_P2_2"),
+            ] {
+                let before = preserved(id);
+                assert!(!query_actions(id, seat, Some(token)).unwrap().candidate.unwrap().legal);
+                assert!(process_action(id, seat, token).is_err());
+                assert_eq!(preserved(id), before);
+            }
+            let before = preserved(id);
+            let query = query_actions(id, "P1", Some("A:UNIT_P1_1:UNIT_P2_1")).unwrap();
+            assert!(query.candidate.as_ref().unwrap().legal);
+            assert!(!serde_json::to_string(&query).unwrap().contains("dice"));
+            assert_eq!(preserved(id), before);
+            process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+            let record = get_combat_record(id).unwrap().unwrap();
+            let report = record.dice.last_attack.unwrap();
+            assert_eq!(report.attack.faces, [3, 5, 2]);
+            assert_eq!(report.defense.faces, [2, 2, 2]);
+            assert_eq!((report.attack.strikes, report.defense.blocks, report.damage), (1, 0, 1));
+            assert_eq!((report.defense.terrain.as_deref(), report.defense.terrain_bonus), (Some("shadow"), 1));
+            assert_eq!((record.dice.draws_used, record.dice.attacks_resolved, report.sequence, report.draws.from, report.draws.to), (6, 1, 1, 0, 6));
+            let public: Value = serde_json::from_str(&combat_state(id).unwrap()).unwrap();
+            assert_eq!(public["last_attack"], serde_json::to_value(&report).unwrap());
+            assert_eq!(public["terrain_types"], source["terrain_types"]);
+            assert_eq!(public["house_rules"], json!([]));
+            assert!(public.get("seed").is_none());
+            for (seat, token) in [("P1","E"), ("P2","S"), ("P2","A:UNIT_P2_1:UNIT_P1_1")] {
+                process_action(id, seat, token).unwrap();
+            }
+            let record = get_combat_record(id).unwrap().unwrap();
+            let report = record.dice.last_attack.unwrap();
+            assert_eq!((report.defense.terrain.as_deref(), report.defense.terrain_bonus), (Some("grass"), 0));
+            assert_eq!((record.dice.draws_used, record.dice.attacks_resolved, report.sequence, report.draws.from, report.draws.to), (11, 2, 2, 6, 11));
+        }
+        let mut a = snapshot(ids[0]);
+        let b = snapshot(ids[1]);
+        a["context"]["match_id"] = ids[1].into();
+        assert_eq!(a, b);
+        assert_eq!(get_combat_record(ids[0]).unwrap(), get_combat_record(ids[1]).unwrap());
+        for id in ids { remove_match(id); }
+    }
+
+    #[test]
+    fn height_bonus_is_pure_and_zero_damage_is_preserved() {
+        let id = "b5_height";
+        start(id, &setup(0, json!(["strike"]), false));
+        let state = ACTIVE_MATCHES.lock().unwrap()[id].clone();
+        let record = get_combat_record(id).unwrap().unwrap();
+        let mut attacker = state.entities["UNIT_P1_1"].clone();
+        let mut defender = state.entities["UNIT_P2_1"].clone();
+        for (az, dz, ah, dh) in [(0, 0, 0, 0), (1, 0, 1, 0), (0, 1, 0, 1)] {
+            attacker.spatial.z = az;
+            defender.spatial.z = dz;
+            let report = resolve_combat_attack(&attacker, &defender, Some("shadow"), &record).unwrap();
+            assert_eq!((report.attack.height_bonus, report.defense.height_bonus), (ah, dh));
+            assert_eq!((report.attack.total, report.defense.total), (3 + ah, 3 + dh));
+            assert_eq!((report.damage, report.defender_health_after), (0, 10));
+        }
+        process_action(id, "P1", "S").unwrap();
+        process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        let report = get_combat_record(id).unwrap().unwrap().dice.last_attack.unwrap();
+        assert_eq!((report.damage, report.defender_health_after, report.defender_removed), (0, 10, false));
+        remove_match(id);
+    }
+
+    #[test]
+    fn lethal_roll_removes_target_and_finishes_match() {
+        let id = "b5_lethal";
+        let mut source = setup(10, json!(["strike"]), false);
+        source["map"]["boardPieces"].as_array_mut().unwrap().pop();
+        start(id, &source);
+        process_action(id, "P1", "S").unwrap();
+        process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        let state = snapshot(id);
+        assert!(state["entities"].get("UNIT_P2_1").is_none());
+        assert_eq!(state["context"]["winner"], "P1");
+        assert_eq!(state["context"]["turn_phase"], "finished");
+        let report = get_combat_record(id).unwrap().unwrap().dice.last_attack.unwrap();
+        assert_eq!((report.damage, report.defender_removed), (30, true));
+        remove_match(id);
+    }
+
+    #[test]
+    fn legacy_snapshot_remains_identical_to_fixed_damage_referee() {
+        let id = "b5_legacy";
+        store_match(id.into(), generate_test_sandbox(id.into()));
+        process_action(id, "P1", "M:UNIT_P1_1:Q0R0Z0").unwrap();
+        let mut expected = ACTIVE_MATCHES.lock().unwrap()[id].clone();
+        let mut flow = get_match_flow(id).unwrap();
+        apply_referee_action(&mut expected, &mut flow, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        assert_eq!(serde_json::to_vec(&ACTIVE_MATCHES.lock().unwrap()[id]).unwrap(), serde_json::to_vec(&expected).unwrap());
+        assert_eq!(combat_state(id).unwrap(), "{\"combat\": null}");
+        remove_match(id);
+        assert!(combat_state(id).is_err());
+    }
 }
 
 #[cfg(test)]
