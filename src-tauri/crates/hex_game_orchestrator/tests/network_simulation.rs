@@ -82,12 +82,16 @@ async fn network_simulation_recovery_direct_only() {
 }
 
 #[tokio::test]
-#[ignore = "requires Iroh compiled with DEV_RELAY_ONLY=1"]
+#[ignore = "requires network access to Iroh relay servers"]
 async fn network_simulation_recovery_relay_only() {
-    assert!(
-        option_env!("DEV_RELAY_ONLY").is_some(),
-        "rerun Cargo with DEV_RELAY_ONLY=1 to activate Iroh relay-only mode"
-    );
+    let relay_probe = timeout(
+        Duration::from_secs(10),
+        MatchSession::host_match_for_recovery_test(RecoveryTestRoute::RelayOnly),
+    )
+    .await
+    .expect("Iroh relay servers were unreachable: relay-only endpoint did not come online within 10 seconds")
+    .expect("relay-only endpoint startup failed");
+    relay_probe.close().await.expect("relay probe close failed");
     run_recovery_scenario(RecoveryTestRoute::RelayOnly).await;
 }
 

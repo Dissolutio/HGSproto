@@ -238,7 +238,7 @@ line printed by the test. It does not change behavior.
 | 5 | `cargo test -p hex_game_orchestrator --test network_simulation network_simulation_recovery_direct_only --locked -- --exact --ignored --test-threads=1`, 30 separate runs per batch | 1.4.1 | Batch A: **30/30 passed** (each 0.51–0.56 s). Batch B: **30/30 passed**. 0 failures in 60 runs |
 | 6 | `cargo test -p hex_game_orchestrator --test network_simulation network_simulation_auth_sync_disconnect_and_recovery --locked -- --exact --test-threads=1`, 30 separate runs per batch | 1.4.1 | Batch A: **30/30 passed** (each 0.55–0.61 s). Batch B: **30/30 passed**. 0 failures in 60 runs |
 | 7 | Control: same command as #6, 30 separate runs, on the unmodified `dev` commit | 0.29 | **30/30 passed**, 0 failed |
-| 8 | `DEV_RELAY_ONLY=1 cargo test -p hex_game_orchestrator --test network_simulation network_simulation_recovery_relay_only --locked -- --exact --ignored --test-threads=1`, 1 run per batch | 1.4.1 | Batch A: **0/1**. Batch B: **0/1**. Both panicked at line 107 (`host endpoint startup timed out`) after 25 s. See below |
+| 8 | `cargo test -p hex_game_orchestrator --test network_simulation network_simulation_recovery_relay_only --locked -- --exact --ignored --test-threads=1`, 1 run per batch | 1.4.1 | Batch A: **0/1**. Batch B: **0/1**. Both panicked at line 107 (`host endpoint startup timed out`) after 25 s. The historical runs also set the now-ineffective `DEV_RELAY_ONLY` variable. See below |
 | 9 | Web build: `cargo install wasm-pack --version 0.15.0 --locked`, `npm --prefix client ci`, `npm --prefix client run build` | 1.4.1 lockfile | wasm-pack compiled `hex_game_core` for wasm. The step then **failed in the sandbox** downloading `binaryen` (`wasm-opt`) from github.com. Running the remaining steps by hand (`npx tsc`, `npx vite build` in `client/`) both succeeded |
 | 10 | `npm --prefix client run test` (not in CI) | n/a | 8/8 passed |
 | 11 | Cross-version check: 1.4.1 endpoint dials a 0.29 endpoint on loopback, direct-only, 12 s cap, 1 run | both | Failed: timed out. The 0.29 side logged `no node state found, skipping` for every packet |
@@ -254,9 +254,9 @@ test-only path:
 
 - On 1.4.1 the relay-only endpoint is built with `clear_ip_transports()`, and
   the host waits for `online()` so its address includes a relay URL.
-- The test still asserts that `DEV_RELAY_ONLY` is set and its ignore message
-  still mentions it. The test was not edited. On 1.x that variable no longer
-  affects Iroh.
+- The test previously asserted that `DEV_RELAY_ONLY` was set, although it
+  no longer affects Iroh 1.x. The guard has since been replaced by a short
+  relay readiness preflight; the test remains ignored by default.
 
 ### Web build (#9)
 
@@ -315,8 +315,8 @@ compatible builds.
 4. **Discovery defaults changed.** Dialing by Node ID now relies on the
    relay-URL-only pkarr record (#4012) plus relay and hole-punching.
    **NOT EXERCISED** across networks.
-5. **The relay-only test guard is stale** (see #8). It still requires an
-   environment variable that no longer does anything.
+5. **Relay-only verification remains open** (see #8). The stale test guard
+   has been replaced, but the recovery scenario still needs reachable relays.
 6. **Test diagnostics changed.** The `[WE-2 route]` log fields differ from
    0.29 because the old per-path fields no longer exist in Iroh. This affects
    only `recovery-diagnostics` builds used by tests.
@@ -329,8 +329,8 @@ compatible builds.
 
 1. Accept the port onto `dev` now, or keep it parked on this branch until the
    human cross-network test passes on 1.4.1.
-2. Whether the relay-only test's guard and ignore message should be updated
-   for 1.x. That is a test edit, so it was not done here.
+2. The relay-only test's guard and ignore message have since been updated for
+   1.x; no decision remains on that guard.
 3. Whether the roughly 35 s detection time for abrupt guest loss is
    acceptable, or whether a specific transport timeout should be set.
 4. How to handle version compatibility once something ships (for example, a
