@@ -183,6 +183,31 @@ mod tests {
     static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn wasm_restore_report_returns_profiles_and_dropped_setup_reason() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let match_id = "wasm_restore_report";
+        let registry = crate::mod_registry::ModRegistry::default();
+        let map = r#"{"hexMap":{},"boardPieces":[{"uid":"g7","inventoryID":"g7","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}}]}"#;
+        crate::engine::try_initialize_from_hexoscape_with_registry(match_id.into(), map, &registry).unwrap();
+        let saved = crate::local_sandbox::export_local_sandbox(match_id, &registry).unwrap();
+        let original_templates = std::mem::take(&mut *MOD_REGISTRY.templates.write().unwrap());
+        let valid: serde_json::Value = serde_json::from_str(
+            &super::wasm_restore_local_sandbox_report(match_id.into(), saved.clone()).unwrap()
+        ).unwrap();
+        assert_eq!(valid, serde_json::json!({"profiles": 0, "setup_dropped": null}));
+
+        let mut invalid: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        invalid["setup"]["name"] = true.into();
+        let report: serde_json::Value = serde_json::from_str(
+            &super::wasm_restore_local_sandbox_report(match_id.into(), invalid.to_string()).unwrap()
+        ).unwrap();
+        assert_eq!(report["profiles"], 0);
+        assert!(report["setup_dropped"].as_str().unwrap().contains("Invalid saved setup"));
+        *MOD_REGISTRY.templates.write().unwrap() = original_templates;
+        crate::engine::remove_match(match_id);
+    }
+
+    #[test]
     fn b7_bridge_seed_consent_and_legacy_combat_state() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let id = "b7_bridge";

@@ -1328,6 +1328,27 @@ mod tests {
     }
 
     #[test]
+    fn v3_restore_report_keeps_valid_setup_and_refuses_invalid_setup() {
+        let id = "v3_restore_report";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &b6_combat_setup().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        let mut saved: Value = serde_json::from_str(&export_local_sandbox(id, &registry).unwrap()).unwrap();
+        let before = match_value(id);
+        engine::remove_match(id);
+        let restored = ModRegistry::default();
+        assert_eq!(
+            crate::local_sandbox::restore_local_sandbox_with_report(id, &saved.to_string(), &restored).unwrap(),
+            (0, None)
+        );
+        assert_eq!(match_value(id), before);
+        saved["setup"]["setup_version"] = 1.into();
+        let target = ModRegistry::default();
+        assert!(crate::local_sandbox::restore_local_sandbox_with_report(id, &saved.to_string(), &target).is_err());
+        assert_eq!(match_value(id), before);
+        engine::remove_match(id);
+    }
+
+    #[test]
     fn b6_v3_invalid_records_leave_fresh_sandbox_unchanged() {
         let id = "b6_invalid_records";
         let registry = ModRegistry::default();
