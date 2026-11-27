@@ -978,6 +978,179 @@ mod tests {
         })
     }
 
+    fn b6_combat_setup() -> Value {
+        json!({
+            "setup_version": 2, "name": "Continuation",
+            "die": {"faces": ["strike"]},
+            "terrain_types": [{"id":"grass","name":"Grass"}],
+            "map": {"hexMap": {}, "boardPieces": [
+                {"uid":"a","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}},
+                {"uid":"b","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":1,"r":0,"s":-1}}
+            ], "starterUnits": [
+                {"id":"UNIT_P1_1","seat":"P1","components":{"tags":["Unit","P1"],"destructible":{"current_life":10,"max_life":10},"combat":{"attack":1,"defense":1}}},
+                {"id":"UNIT_P2_1","seat":"P2","components":{"tags":["Unit","P2"],"destructible":{"current_life":10,"max_life":10},"combat":{"attack":1,"defense":1}}}
+            ]},
+            "profiles": [], "roster": [], "rules": {}
+        })
+    }
+
+    #[test]
+    fn b6_saved_combat_continues_without_reroll_or_healing() {
+        let uninterrupted = "b6_continuous";
+        let restored = "b6_restored";
+        let source = b6_combat_setup().to_string();
+        let registry = ModRegistry::default();
+        for id in [uninterrupted, restored] {
+            apply_setup_with_seed(id.into(), &source, &registry, 42, Approval::LocalSandbox).unwrap();
+            engine::process_action(id, "P1", "S").unwrap();
+            engine::process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        }
+        let before = match_value(restored);
+        assert_eq!(component(&before, "UNIT_P2_1", "destructible")["current_life"], 9);
+        let dice_before = engine::get_combat_record(restored).unwrap().unwrap();
+        let public_before = engine::combat_state(restored).unwrap();
+        let saved = export_local_sandbox(restored, &registry).unwrap();
+        let value: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(value["record_version"], 3);
+        assert_eq!(value["dice"]["seed"], "000000000000002a");
+        assert!(value["setup"].get("profiles").is_none());
+        engine::remove_match(restored);
+        let restored_registry = ModRegistry::default();
+        restore_local_sandbox(restored, &saved, &restored_registry).unwrap();
+        assert_eq!(match_value(restored), before);
+        assert_eq!(engine::get_combat_record(restored).unwrap().unwrap(), dice_before);
+        assert_eq!(engine::combat_state(restored).unwrap(), public_before);
+        for id in [uninterrupted, restored] {
+            for (seat, token) in [("P1","E"), ("P2","S"), ("P2","A:UNIT_P2_1:UNIT_P1_1")] {
+                engine::process_action(id, seat, token).unwrap();
+            }
+        }
+        let mut a = match_value(uninterrupted);
+        a["context"]["match_id"] = restored.into();
+        assert_eq!(a, match_value(restored));
+        let a = engine::get_combat_record(uninterrupted).unwrap().unwrap();
+        let b = engine::get_combat_record(restored).unwrap().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b.dice.attacks_resolved, 2);
+        assert!(b.dice.last_attack.is_some());
+        for id in [uninterrupted, restored] { engine::remove_match(id); }
+    }
+
+    #[test]
+    fn b6_v3_invalid_records_leave_fresh_sandbox_unchanged() {
+        let id = "b6_invalid_records";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &b6_combat_setup().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        let saved: Value = serde_json::from_str(&export_local_sandbox(id, &registry).unwrap()).unwrap();
+        engine::remove_match(id);
+        let mut cases = Vec::new();
+        for field in ["dice", "seed", "draws_used", "attacks_resolved", "last_attack"] {
+            let mut value = saved.clone();
+            if field == "dice" { value.as_object_mut().unwrap().remove(field); }
+            else { value["dice"].as_object_mut().unwrap().remove(field); }
+            cases.push(value);
+        }
+        for seed in ["123456789012345", "12345678901234567", "123456789012345g", "0123456789ABCDEF"] {
+            let mut value = saved.clone(); value["dice"]["seed"] = seed.into(); cases.push(value);
+        }
+        for field in ["draws_used", "attacks_resolved"] {
+            let mut value = saved.clone(); value["dice"][field] = json!(9007199254740992_u64); cases.push(value);
+        }
+        let mut value = saved.clone(); value["setup"] = Value::Null; cases.push(value);
+        let mut value = saved.clone(); value["setup"]["setup_version"] = 1.into(); cases.push(value);
+        let mut value = saved.clone(); value["setup"]["rules"]["health_cap"] = json!({"max_health": 1}); cases.push(value);
+        let mut value = saved.clone(); value["snapshot"]["entities"]["UNIT_P1_1"]["components"].as_object_mut().unwrap().remove("combat"); cases.push(value);
+        let mut value = saved.clone(); value["snapshot"]["entities"]["TILE_a_0"]["components"].as_object_mut().unwrap().remove("terrain_kind"); cases.push(value);
+        let mut value = saved.clone(); value["snapshot"]["entities"]["TILE_a_0"]["components"]["terrain_kind"]["data"]["id"] = "missing".into(); cases.push(value);
+        for value in cases {
+            let target = ModRegistry::default();
+            apply_setup(id.into(), VALID, &ModRegistry::default()).unwrap();
+            let before = match_value(id);
+            let flow = engine::get_match_flow(id).unwrap();
+            let setup_before = engine::setup_records().lock().unwrap()[id].map.clone();
+            let error = restore_local_sandbox(id, &value.to_string(), &target);
+            assert!(error.is_err(), "unexpectedly accepted {value}");
+            assert_eq!(match_value(id), before);
+            assert_eq!(engine::get_match_flow(id).unwrap(), flow);
+            assert_eq!(engine::setup_records().lock().unwrap()[id].map, setup_before);
+            assert!(engine::get_combat_record(id).unwrap().is_none());
+            assert!(target.templates.read().unwrap().is_empty());
+            engine::remove_match(id);
+        }
+    }
+
+    #[test]
+    fn b6_legacy_snapshot_paths_refuse_combat_components_atomically() {
+        let source = "b6_legacy_source";
+        let target = "b6_legacy_target";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(source.into(), &b6_combat_setup().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        apply_setup(target.into(), VALID, &ModRegistry::default()).unwrap();
+        let original = match_value(source);
+        for kind in ["Combat", "TerrainKind"] {
+            let mut snapshot = original.clone();
+            for entity in snapshot["entities"].as_object_mut().unwrap().values_mut() {
+                entity["components"].as_object_mut().unwrap().retain(|_, value|
+                    value["type"] != if kind == "Combat" { "TerrainKind" } else { "Combat" });
+            }
+            let before = match_value(target);
+            let flow = engine::get_match_flow(target).unwrap();
+            let record = engine::setup_records().lock().unwrap()[target].map.clone();
+            assert!(engine::restore_match_snapshot_as(target, source, &snapshot.to_string()).unwrap_err().contains("combat or terrain"));
+            snapshot["context"]["match_id"] = target.into();
+            assert!(engine::restore_match_snapshot(target, &snapshot.to_string()).unwrap_err().contains("combat or terrain"));
+            assert_eq!(match_value(target), before);
+            assert_eq!(engine::get_match_flow(target).unwrap(), flow);
+            assert_eq!(engine::setup_records().lock().unwrap()[target].map, record);
+            assert!(engine::get_combat_record(target).unwrap().is_none());
+        }
+        engine::remove_match(source); engine::remove_match(target);
+    }
+
+    #[test]
+    fn b6_v2_export_is_canonical_and_house_rules_survive_save() {
+        let first = "b6_export_first";
+        let second = "b6_export_second";
+        let mut source = seeded_example();
+        source["roster"].as_array_mut().unwrap().push(json!({"slot":"UNIT_P2_1","seat":"P2","profile":"com.community.goliath","starting_health":11}));
+        let mut rule = source["house_rules"][0].clone();
+        rule["slot"] = "UNIT_P2_1".into();
+        source["house_rules"].as_array_mut().unwrap().insert(0, rule);
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(first.into(), &source.to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        let public = engine::combat_state(first).unwrap();
+        let exported = export_setup(first, &registry).unwrap();
+        let value: Value = serde_json::from_str(&exported).unwrap();
+        assert!(value.get("seed").is_none() && value.get("dice").is_none());
+        assert_eq!(value["house_rules"][0]["slot"], "UNIT_P1_1");
+        assert_eq!(value["house_rules"][1]["slot"], "UNIT_P2_1");
+        assert_eq!(value["die"]["faces"].as_array().unwrap().len(), 6);
+        apply_setup_with_seed(second.into(), &exported, &ModRegistry::default(), 99, Approval::LocalSandbox).unwrap();
+        assert_eq!(export_setup(second, &registry).unwrap(), exported);
+        let saved = export_local_sandbox(first, &registry).unwrap();
+        engine::remove_match(first);
+        restore_local_sandbox(first, &saved, &ModRegistry::default()).unwrap();
+        assert_eq!(engine::combat_state(first).unwrap(), public);
+        engine::remove_match(first); engine::remove_match(second);
+    }
+
+    #[test]
+    fn b6_deployment_invalidating_v2_setup_refuses_export_and_save() {
+        let id = "b6_invalid_deployment";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &seeded_example().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        engine::deploy_profile_unit(id, "UNIT_P2_1", "com.community.goliath", "P2", 11, &registry).unwrap();
+        let before = match_value(id);
+        let combat = engine::get_combat_record(id).unwrap();
+        let setup_before = engine::setup_records().lock().unwrap()[id].map.clone();
+        assert!(export_setup(id, &registry).unwrap_err().contains("health"));
+        assert!(export_local_sandbox(id, &registry).unwrap_err().contains("health"));
+        assert_eq!(match_value(id), before);
+        assert_eq!(engine::get_combat_record(id).unwrap(), combat);
+        assert_eq!(engine::setup_records().lock().unwrap()[id].map, setup_before);
+        engine::remove_match(id);
+    }
+
     #[test]
     fn seeded_v2_applies_components_rules_and_reproducible_records() {
         let a = format!("seeded_example_a_{}", std::process::id());

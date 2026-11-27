@@ -100,6 +100,9 @@ pub fn export_local_sandbox(match_id: &str, registry: &ModRegistry) -> Result<St
         let record = setup_records.get(match_id)
             .ok_or_else(|| "setup: this match has no setup record".to_string())?;
         let mut setup = setup::export_v2_setup(record, &templates, &combat.ruleset)?;
+        if let Some(house_rules) = record.map.get("house_rules") {
+            setup["house_rules"] = house_rules.clone();
+        }
         setup.as_object_mut().unwrap().remove("profiles");
         if combat.dice.draws_used > MAX_SAFE_COUNTER || combat.dice.attacks_resolved > MAX_SAFE_COUNTER {
             return Err("Saved dice counters exceed the safe integer limit".into());
@@ -225,9 +228,14 @@ pub fn restore_local_sandbox(
             if unit && !entity.components.values().any(|component| matches!(component, Component::Combat { .. })) {
                 return Err(format!("Saved unit '{}' lacks Combat", entity.id));
             }
-            if tile && !entity.components.values().any(|component| matches!(component,
-                Component::TerrainKind { id } if ruleset.terrain_types.iter().any(|terrain| terrain.id == *id))) {
-                return Err(format!("Saved tile '{}' lacks a declared TerrainKind", entity.id));
+            if tile {
+                let kinds: Vec<_> = entity.components.values().filter_map(|component| match component {
+                    Component::TerrainKind { id } => Some(id),
+                    _ => None,
+                }).collect();
+                if kinds.is_empty() || kinds.iter().any(|id| !ruleset.terrain_types.iter().any(|terrain| terrain.id == **id)) {
+                    return Err(format!("Saved tile '{}' lacks a declared TerrainKind", entity.id));
+                }
             }
         }
         combat_record = Some(engine::CombatRecord {
@@ -449,6 +457,49 @@ mod tests {
         let mut value: Value = serde_json::from_str(record).unwrap();
         edit(&mut value);
         value.to_string()
+    }
+
+    #[test]
+    fn b6_v1_save_and_setup_export_match_legacy_bytes() {
+        #[derive(serde::Serialize)]
+        struct LegacySetup<'a> {
+            setup_version: u32,
+            name: &'a str,
+            map: &'a Value,
+            roster: &'a [crate::setup::RosterEntry],
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyRecord<'a> {
+            record_version: u32,
+            profiles: Vec<crate::mod_registry::UnitTemplate>,
+            snapshot: &'a crate::models::GameState,
+            setup: Option<LegacySetup<'a>>,
+        }
+        let id = "b6_legacy_bytes";
+        let registry = ModRegistry::default();
+        registry.load_batch(&goliath_profile()).unwrap();
+        engine::try_initialize_from_hexoscape_with_registry(id.into(), MAP_JSON, &registry).unwrap();
+        engine::deploy_profile_unit(id, "UNIT_P1_1", GOLIATH, "P1", 12, &registry).unwrap();
+        let expected = {
+            let templates = registry.templates.read().unwrap();
+            let matches = engine::ACTIVE_MATCHES.lock().unwrap();
+            let records = engine::setup_records().lock().unwrap();
+            let record = &records[id];
+            let mut profiles: Vec<_> = templates.values().cloned().collect();
+            profiles.sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
+            let saved = serde_json::to_string(&LegacyRecord {
+                record_version: 2, profiles: profiles.clone(), snapshot: &matches[id],
+                setup: Some(LegacySetup { setup_version: 1, name: &record.name, map: &record.map, roster: &record.roster }),
+            }).unwrap();
+            let exported = serde_json::json!({
+                "setup_version": 1, "name": record.name, "map": record.map,
+                "profiles": profiles, "roster": record.roster,
+            }).to_string();
+            (saved, exported)
+        };
+        assert_eq!(export_local_sandbox(id, &registry).unwrap(), expected.0);
+        assert_eq!(export_setup(id, &registry).unwrap(), expected.1);
+        engine::remove_match(id);
     }
 
     #[test]
