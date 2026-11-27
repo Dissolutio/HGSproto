@@ -14,7 +14,7 @@ use std::fmt;
 
 #[path = "setup_v2.rs"]
 mod v2;
-pub use v2::{ValidatedSetupV2, validate_setup_v2};
+pub use v2::{HealthCap, ScenarioRules, TerrainBonus, TerrainDefinition, ValidatedSetupV2, validate_setup_v2};
 
 const MAX_SETUP_BYTES: usize = 1_048_576;
 const MAX_DEPTH: usize = 32;
@@ -83,6 +83,7 @@ pub(crate) const DEFAULT_SETUP_NAME: &str = "Default sandbox";
 #[derive(Debug, Clone)]
 pub(crate) struct SetupRecord {
     pub(crate) name: String,
+    // For v2 matches this holds the complete original setup until v2 export exists.
     pub(crate) map: Value,
     pub(crate) roster: Vec<RosterEntry>,
 }
@@ -745,6 +746,82 @@ pub fn apply_setup(match_id: String, json: &str, registry: &ModRegistry) -> Resu
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    LocalSandbox,
+}
+
+/// Starts a validated v2 setup with a caller-provided match seed.
+pub fn apply_setup_with_seed(
+    match_id: String,
+    json: &str,
+    registry: &ModRegistry,
+    seed: u64,
+    approval: Approval,
+) -> Result<(), String> {
+    let setup = validate_setup_v2(json).map_err(|error| {
+        if error == "setup_version 1: use validate_setup" {
+            "setup_version 1: use apply_setup".to_string()
+        } else {
+            error
+        }
+    })?;
+    match approval {
+        Approval::LocalSandbox => {}
+    }
+    let scratch = ModRegistry::default();
+    scratch.templates.write()
+        .map_err(|_| "mod registry write lock is poisoned".to_string())?
+        .extend(setup.profiles.iter().map(|profile| (profile.mod_id.clone(), profile.clone())));
+
+    let map_file = legacy_map_file(&setup.common.map)?;
+    let mut state = crate::engine::build_map_state(match_id.clone(), map_file, Some(&scratch))?;
+    for (piece, terrain) in setup.common.map.board_pieces.iter().zip(&setup.piece_terrain) {
+        for index in 0..get_hex_footprint_offsets(&piece.inventory_id, piece.rotation).len() {
+            let id = format!("TILE_{}_{}", piece.uid, index);
+            let tile = state.entities.get_mut(&id)
+                .ok_or_else(|| format!("setup: missing staged tile '{id}'"))?;
+            tile.components.insert("terrain_kind".into(), Component::TerrainKind { id: terrain.clone() });
+        }
+    }
+    for (unit, template) in setup.common.map.starter_units.iter().zip(&setup.inline) {
+        let entity = state.entities.get_mut(&unit.id)
+            .ok_or_else(|| format!("setup: missing staged unit '{}'", unit.id))?;
+        entity.components = template.components.clone();
+    }
+    for (index, entry) in setup.common.roster.iter().enumerate() {
+        crate::engine::stage_profile_deployment(
+            &mut state, &entry.slot, &entry.profile, &entry.seat, entry.starting_health, &scratch,
+        ).map_err(|error| format!("roster[{index}]: {error}"))?;
+    }
+    let snapshot = serde_json::to_vec(&state)
+        .map_err(|error| format!("setup: could not measure initial match state: {error}"))?;
+    check_staged_snapshot_size(snapshot.len())?;
+    let flow = MatchFlow::reference(&state.context)?;
+    let staged_templates = std::mem::take(&mut *scratch.templates.write()
+        .map_err(|_| "mod registry write lock is poisoned".to_string())?);
+    let record = SetupRecord {
+        name: setup.common.name,
+        map: setup.source,
+        roster: setup.common.roster,
+    };
+    let combat = crate::engine::CombatRecord {
+        ruleset: crate::engine::CombatRuleset {
+            die: setup.die,
+            terrain_types: setup.terrain_types,
+            rules: setup.rules,
+        },
+        dice: crate::engine::DiceRecord {
+            seed, draws_used: 0, attacks_resolved: 0, last_attack: None,
+        },
+    };
+    let mut templates = registry.templates.write()
+        .map_err(|_| "mod registry write lock is poisoned".to_string())?;
+    crate::engine::replace_with_staged_combat_match(match_id, state, flow, combat, record, || {
+        *templates = staged_templates;
+    })
+}
+
 /// Exports the immutable setup that produced the match, not its live state.
 pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, String> {
     let templates = registry
@@ -762,6 +839,12 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     if !flows.contains_key(match_id) {
         return Err(format!("Missing match flow: {match_id}"));
+    }
+    let combat = crate::engine::combat_records()
+        .lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    if combat.contains_key(match_id) {
+        return Err("export of setup_version 2 is not supported yet".into());
     }
     let records = crate::engine::setup_records()
         .lock()
@@ -809,6 +892,111 @@ mod tests {
     use crate::{engine, wasm_bridge};
     use crate::local_sandbox::{export_local_sandbox, restore_local_sandbox};
     use serde_json::json;
+
+    fn seeded_example() -> Value {
+        json!({
+            "setup_version": 2, "name": "Shadow skirmish",
+            "terrain_types": [
+                {"id": "grass", "name": "Grass"},
+                {"id": "shadow", "name": "Shadow", "tags": ["concealment"]}
+            ],
+            "map": {
+                "hexMap": {},
+                "boardPieces": [
+                    {"uid":"field","inventoryID":"g7","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}},
+                    {"uid":"shade","inventoryID":"g7","terrain":"shadow","altitude":0,"rotation":0,"pieceCoords":{"q":3,"r":-1,"s":-2}}
+                ],
+                "starterUnits": [
+                    {"id":"UNIT_P1_1","seat":"P1","components":{"tags":["Unit","P1"],"destructible":{"current_life":4,"max_life":4},"combat":{"attack":2,"defense":2}}},
+                    {"id":"UNIT_P2_1","seat":"P2","components":{"tags":["Unit","P2"],"destructible":{"current_life":3,"max_life":4},"combat":{"attack":1,"defense":2,"damage_per_strike":0}}}
+                ]
+            },
+            "profiles":[{"schema_version":2,"mod_id":"com.community.goliath","display_name":"Goliath","visual_primitive":"CUBE","components":{"destructible":{"current_life":12,"max_life":12},"combat":{"attack":4,"defense":3},"tags":["Unit","Heavy"]}}],
+            "roster":[{"slot":"UNIT_P1_1","seat":"P1","profile":"com.community.goliath","starting_health":11}],
+            "rules":{"terrain_defense_bonus":[{"tag":"concealment","dice":1}],"health_cap":{"max_health":10}},
+            "house_rules":[{"kind":"allow_over_health_cap","slot":"UNIT_P1_1","name":"Allow Goliath","starting_health":11,"max_health":12,"approval":{"mode":"local_sandbox"}}]
+        })
+    }
+
+    #[test]
+    fn seeded_v2_applies_components_rules_and_reproducible_records() {
+        let a = format!("seeded_example_a_{}", std::process::id());
+        let b = format!("seeded_example_b_{}", std::process::id());
+        let source = seeded_example();
+        let registry = ModRegistry::default();
+        for id in [&a, &b] {
+            apply_setup_with_seed(id.clone(), &source.to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        }
+        let first = match_value(&a);
+        let mut second = match_value(&b);
+        second["context"]["match_id"] = a.as_str().into();
+        assert_eq!(first, second);
+        for (piece, kind) in [("field", "grass"), ("shade", "shadow")] {
+            for index in 0..7 {
+                assert_eq!(component(&first, &format!("TILE_{piece}_{index}"), "terrain_kind")["id"], kind);
+            }
+        }
+        assert_eq!(component(&first, "UNIT_P1_1", "combat"), &json!({"attack":4,"defense":3,"damage_per_strike":1}));
+        assert_eq!(component(&first, "UNIT_P1_1", "destructible"), &json!({"current_life":11,"max_life":12}));
+        assert_eq!(component(&first, "UNIT_P2_1", "combat"), &json!({"attack":1,"defense":2,"damage_per_strike":0}));
+        assert_eq!(component(&first, "UNIT_P2_1", "destructible"), &json!({"current_life":3,"max_life":4}));
+        let combat = engine::get_combat_record(&a).unwrap().unwrap();
+        assert_eq!(combat, engine::get_combat_record(&b).unwrap().unwrap());
+        assert_eq!(combat.dice, engine::DiceRecord { seed: 42, draws_used: 0, attacks_resolved: 0, last_attack: None });
+        assert_eq!(combat.ruleset.die, crate::dice::Die::default());
+        assert_eq!(combat.ruleset.terrain_types[1].tags, vec!["concealment"]);
+        assert_eq!(combat.ruleset.rules.terrain_defense_bonus[0].dice, 1);
+        assert_eq!(combat.ruleset.rules.health_cap.unwrap().max_health, Some(10));
+        assert_eq!(engine::setup_records().lock().unwrap()[&a].map, source);
+        engine::remove_match(&a);
+        engine::remove_match(&b);
+        assert!(!engine::combat_records().lock().unwrap().contains_key(&a));
+    }
+
+    #[test]
+    fn seeded_v2_failures_and_exports_preserve_all_records() {
+        let id = format!("seeded_preservation_{}", std::process::id());
+        let registry = ModRegistry::default();
+        let source = seeded_example();
+        apply_setup_with_seed(id.clone(), &source.to_string(), &registry, 123, Approval::LocalSandbox).unwrap();
+        engine::process_action(&id, "P1", "S").unwrap();
+        engine::rebind_player_session(&id, "Player_1").unwrap();
+        let before = apply_preservation(&id, &registry);
+        let combat = engine::get_combat_record(&id).unwrap();
+        let recorded_source = engine::setup_records().lock().unwrap()[&id].map.clone();
+        let mut invalid = source.clone();
+        invalid["map"]["boardPieces"][0]["terrain"] = "unknown".into();
+        for input in [invalid.to_string(), VALID.to_string()] {
+            let error = apply_setup_with_seed(id.clone(), &input, &registry, 456, Approval::LocalSandbox).unwrap_err();
+            if input == VALID {
+                assert_eq!(error, "setup_version 1: use apply_setup");
+            }
+            assert_eq!(apply_preservation(&id, &registry), before);
+            assert_eq!(engine::get_combat_record(&id).unwrap(), combat);
+            assert_eq!(engine::setup_records().lock().unwrap()[&id].map, recorded_source);
+        }
+        assert_eq!(export_setup(&id, &registry).unwrap_err(), "export of setup_version 2 is not supported yet");
+        assert_eq!(export_local_sandbox(&id, &registry).unwrap_err(), "saving setup_version 2 matches is not supported yet");
+        assert_eq!(apply_preservation(&id, &registry), before);
+        assert_eq!(engine::get_combat_record(&id).unwrap(), combat);
+        assert_eq!(engine::setup_records().lock().unwrap()[&id].map, recorded_source);
+        assert_eq!(engine::rebind_player_session(&id, "Player_1").unwrap_err(), "Player seat is already active: Player_1");
+        engine::remove_match(&id);
+    }
+
+    #[test]
+    fn seeded_v2_replaced_by_v1_clears_combat_and_preserves_v1_snapshot() {
+        let id = format!("seeded_to_v1_{}", std::process::id());
+        let registry = ModRegistry::default();
+        apply_setup(id.clone(), VALID, &registry).unwrap();
+        let before = serde_json::to_vec(&match_value(&id)).unwrap();
+        assert_eq!(engine::get_combat_record(&id).unwrap(), None);
+        apply_setup_with_seed(id.clone(), &seeded_example().to_string(), &registry, 9, Approval::LocalSandbox).unwrap();
+        apply_setup(id.clone(), VALID, &registry).unwrap();
+        assert_eq!(engine::get_combat_record(&id).unwrap(), None);
+        assert_eq!(serde_json::to_vec(&match_value(&id)).unwrap(), before);
+        engine::remove_match(&id);
+    }
 
     // Verbatim JSON from design section 2.6.
     const VALID: &str = r#"{

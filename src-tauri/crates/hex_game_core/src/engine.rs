@@ -16,8 +16,10 @@ pub static ACTIVE_MATCHES: LazyLock<Mutex<HashMap<String, GameState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_PLAYER_SESSIONS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-// Lock order: mod registry when needed, ACTIVE_MATCHES, MATCH_FLOWS, setup records.
+// Lock order: mod registry, ACTIVE_MATCHES, MATCH_FLOWS, combat records, setup records.
 static MATCH_FLOWS: LazyLock<Mutex<HashMap<String, MatchFlow>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static MATCH_COMBAT_RECORDS: LazyLock<Mutex<HashMap<String, CombatRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 // Setup records are always acquired after ACTIVE_MATCHES and MATCH_FLOWS.
 static MATCH_SETUP_RECORDS: LazyLock<Mutex<HashMap<String, crate::setup::SetupRecord>>> =
@@ -25,6 +27,44 @@ static MATCH_SETUP_RECORDS: LazyLock<Mutex<HashMap<String, crate::setup::SetupRe
 
 pub(crate) fn match_flows() -> &'static Mutex<HashMap<String, MatchFlow>> {
     &MATCH_FLOWS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombatRuleset {
+    pub die: crate::dice::Die,
+    pub terrain_types: Vec<crate::setup::TerrainDefinition>,
+    pub rules: crate::setup::ScenarioRules,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiceRecord {
+    pub seed: u64,
+    pub draws_used: u64,
+    pub attacks_resolved: u64,
+    pub last_attack: Option<crate::dice::AttackOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombatRecord {
+    pub ruleset: CombatRuleset,
+    pub dice: DiceRecord,
+}
+
+pub(crate) fn combat_records() -> &'static Mutex<HashMap<String, CombatRecord>> {
+    &MATCH_COMBAT_RECORDS
+}
+
+pub fn get_combat_record(match_id: &str) -> Result<Option<CombatRecord>, String> {
+    let matches = ACTIVE_MATCHES.lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    if !matches.contains_key(match_id) {
+        return Err(format!("Unknown match: {match_id}"));
+    }
+    let _flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    Ok(MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?
+        .get(match_id).cloned())
 }
 
 pub(crate) fn setup_records() -> &'static Mutex<HashMap<String, crate::setup::SetupRecord>> {
@@ -132,10 +172,13 @@ fn try_store_match(match_id: String, state: GameState) -> Result<(), String> {
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let mut combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
     let mut setup_records = MATCH_SETUP_RECORDS
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
     setup_records.remove(&match_id);
+    combat_records.remove(&match_id);
     flows.insert(match_id.clone(), flow);
     matches.insert(match_id, state);
     Ok(())
@@ -156,13 +199,17 @@ pub fn get_match_flow(match_id: &str) -> Result<MatchFlow, String> {
 pub fn remove_match(match_id: &str) {
     if let Ok(mut matches) = ACTIVE_MATCHES.lock() {
         match MATCH_FLOWS.lock() {
-            Ok(mut flows) => match MATCH_SETUP_RECORDS.lock() {
-                Ok(mut setup_records) => {
-                    matches.remove(match_id);
-                    flows.remove(match_id);
-                    setup_records.remove(match_id);
-                }
-                Err(_) => eprintln!("Could not remove match: setup registry is unavailable"),
+            Ok(mut flows) => match MATCH_COMBAT_RECORDS.lock() {
+                Ok(mut combat_records) => match MATCH_SETUP_RECORDS.lock() {
+                    Ok(mut setup_records) => {
+                        matches.remove(match_id);
+                        flows.remove(match_id);
+                        combat_records.remove(match_id);
+                        setup_records.remove(match_id);
+                    }
+                    Err(_) => eprintln!("Could not remove match: setup registry is unavailable"),
+                },
+                Err(_) => eprintln!("Could not remove match: combat registry is unavailable"),
             },
             Err(_) => eprintln!("Could not remove match: flow registry is unavailable"),
         }
@@ -415,13 +462,25 @@ pub(crate) fn replace_with_staged_match(
     setup_record: Option<crate::setup::SetupRecord>,
     commit_with_locks: impl FnOnce(),
 ) -> Result<(), String> {
-    commit_staged_match(match_id, state, flow, setup_record, true, commit_with_locks)
+    commit_staged_match(match_id, state, flow, None, setup_record, true, commit_with_locks)
+}
+
+pub(crate) fn replace_with_staged_combat_match(
+    match_id: String,
+    state: GameState,
+    flow: MatchFlow,
+    combat_record: CombatRecord,
+    setup_record: crate::setup::SetupRecord,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    commit_staged_match(match_id, state, flow, Some(combat_record), Some(setup_record), true, commit_with_locks)
 }
 
 fn commit_staged_match(
     match_id: String,
     state: GameState,
     flow: MatchFlow,
+    combat_record: Option<CombatRecord>,
     setup_record: Option<crate::setup::SetupRecord>,
     release_sessions: bool,
     commit_with_locks: impl FnOnce(),
@@ -431,6 +490,8 @@ fn commit_staged_match(
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let mut combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
     let mut setup_records = MATCH_SETUP_RECORDS
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
@@ -440,6 +501,11 @@ fn commit_staged_match(
         release_player_session(&match_id, "Player_2");
     }
     flows.insert(match_id.clone(), flow);
+    if let Some(record) = combat_record {
+        combat_records.insert(match_id.clone(), record);
+    } else {
+        combat_records.remove(&match_id);
+    }
     if let Some(setup_record) = setup_record {
         setup_records.insert(match_id.clone(), setup_record);
     } else {
@@ -461,6 +527,7 @@ pub(crate) fn restore_staged_match_snapshot(
         match_id,
         state,
         flow,
+        None,
         setup_record,
         false,
         commit_with_locks,

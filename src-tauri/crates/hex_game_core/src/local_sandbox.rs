@@ -69,6 +69,12 @@ pub fn export_local_sandbox(match_id: &str, registry: &ModRegistry) -> Result<St
     let _flows = engine::match_flows()
         .lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let combat = engine::combat_records()
+        .lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    if combat.contains_key(match_id) {
+        return Err("saving setup_version 2 matches is not supported yet".into());
+    }
     let setup_records = engine::setup_records()
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
