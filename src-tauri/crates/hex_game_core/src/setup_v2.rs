@@ -29,7 +29,7 @@ pub struct TerrainBonus {
     pub dice: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthCap {
     pub starting_health: Option<i32>,
     pub max_health: Option<i32>,
@@ -43,6 +43,11 @@ pub struct ScenarioRules {
 }
 
 pub fn validate_setup_v2(json: &str) -> Result<ValidatedSetupV2, String> {
+    let value = parse_setup(json)?;
+    validate_value(&value)
+}
+
+pub(super) fn parse_setup(json: &str) -> Result<Value, String> {
     if json.len() > MAX_SETUP_BYTES {
         return Err("invalid setup: file exceeds the 1 MiB setup limit (1048576 bytes)".into());
     }
@@ -56,7 +61,42 @@ pub fn validate_setup_v2(json: &str) -> Result<ValidatedSetupV2, String> {
     deserializer
         .end()
         .map_err(|error| format!("invalid setup JSON: {error}"))?;
-    validate_value(&value)
+    Ok(value)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OverCap {
+    pub slot: String,
+    pub profile: Option<String>,
+    pub starting_health: i32,
+    pub max_health: i32,
+    pub cap: HealthCap,
+    #[serde(skip)]
+    pub location: String,
+    #[serde(skip)]
+    pub display_name: String,
+}
+
+impl OverCap {
+    pub(crate) fn error(&self) -> String {
+        let (key, actual, limit) = if self.cap.starting_health.is_some_and(|n| self.starting_health > n) {
+            ("starting_health", self.starting_health, self.cap.starting_health.unwrap())
+        } else {
+            ("max_health", self.max_health, self.cap.max_health.unwrap())
+        };
+        format!("{}: slot '{}' {key} {actual} is over the scenario cap {key} {limit}; allow it as a house rule to continue", self.location, self.slot)
+    }
+
+    pub(crate) fn house_rule(&self, approval: Approval) -> Value {
+        let suffix = format!(" in {} allowed above the health cap", self.slot);
+        let mut end = self.display_name.len().min(128 - suffix.len());
+        while !self.display_name.is_char_boundary(end) { end -= 1; }
+        let mode = match approval { Approval::LocalSandbox => "local_sandbox" };
+        serde_json::json!({"kind":"allow_over_health_cap", "slot":self.slot,
+            "name":format!("{}{}", &self.display_name[..end], suffix),
+            "starting_health":self.starting_health, "max_health":self.max_health,
+            "approval":{"mode":mode}})
+    }
 }
 
 fn text<'a>(value: &'a Value, location: &str) -> Result<&'a str, String> {
@@ -105,7 +145,18 @@ fn check_dice(template: &UnitTemplate, bonus: i64, location: &str) -> Result<(),
     Ok(())
 }
 
+pub(crate) fn check_deployment_dice(template: &UnitTemplate, rules: &ScenarioRules) -> Result<(), String> {
+    let bonus = rules.terrain_defense_bonus.iter().map(|item| i64::from(item.dice)).max().unwrap_or(0);
+    check_dice(template, bonus, &format!("profile {}", template.mod_id))
+}
+
 pub(super) fn validate_value(value: &Value) -> Result<ValidatedSetupV2, String> {
+    let (setup, over) = inspect_value(value)?;
+    if let Some(first) = over.first() { return Err(first.error()); }
+    Ok(setup)
+}
+
+pub(super) fn inspect_value(value: &Value) -> Result<(ValidatedSetupV2, Vec<OverCap>), String> {
     let root = value
         .as_object()
         .ok_or_else(|| "invalid setup: expected an object".to_string())?;
@@ -481,23 +532,24 @@ pub(super) fn validate_value(value: &Value) -> Result<ValidatedSetupV2, String> 
         }
     }
     // Iterate in file order, rather than hash-map order, for stable errors.
+    let mut over_cap = Vec::new();
     for unit in &common.map.starter_units {
         let (start, max, loc) = &placements[unit.id.as_str()];
-        if !covered.contains(unit.id.as_str()) {
-            for (key, actual, limit) in [
-                ("starting_health", *start, cap[0]),
-                ("max_health", *max, cap[1]),
-            ] {
-                if let Some(limit) = limit.filter(|limit| actual > *limit) {
-                    return Err(format!(
-                        "{loc}: slot '{}' {key} {actual} is over the scenario cap {key} {limit}; allow it as a house rule to continue",
-                        unit.id
-                    ));
-                }
-            }
+        if !covered.contains(unit.id.as_str()) && over(*start, *max) {
+            let entry = common.roster.iter().find(|entry| entry.slot == unit.id);
+            let display_name = match entry {
+                Some(entry) => registry.get_template(&entry.profile)?.display_name,
+                None => unit.id.clone(),
+            };
+            over_cap.push(OverCap {
+                slot: unit.id.clone(), profile: entry.map(|entry| entry.profile.clone()),
+                starting_health: *start as i32, max_health: *max as i32,
+                cap: HealthCap { starting_health: cap[0].map(|n| n as i32), max_health: cap[1].map(|n| n as i32) },
+                location: loc.clone(), display_name,
+            });
         }
     }
-    Ok(ValidatedSetupV2 {
+    Ok((ValidatedSetupV2 {
         source: value.clone(),
         die,
         terrain_types: decode(&root["terrain_types"], "terrain_types")?,
@@ -510,7 +562,7 @@ pub(super) fn validate_value(value: &Value) -> Result<ValidatedSetupV2, String> 
         piece_terrain: pieces.iter()
             .map(|piece| piece["terrain"].as_str().expect("terrain checked").to_owned())
             .collect(),
-    })
+    }, over_cap))
 }
 
 #[cfg(test)]

@@ -689,6 +689,33 @@ pub fn deploy_profile_unit(
     starting_life: i32,
     registry: &ModRegistry,
 ) -> Result<String, String> {
+    deploy_profile_unit_inner(match_id, slot_unit_id, mod_id, seat, starting_life, registry, None, false)
+        .map(|(name, _)| name)
+}
+
+pub fn deploy_profile_unit_allowing_over_cap(
+    match_id: &str, slot_unit_id: &str, mod_id: &str, seat: &str, starting_life: i32,
+    registry: &ModRegistry, approval: crate::setup::Approval,
+) -> Result<String, String> {
+    deploy_profile_unit_inner(match_id, slot_unit_id, mod_id, seat, starting_life, registry, Some(approval), false)
+        .map(|(name, _)| name)
+}
+
+pub fn query_deploy(
+    match_id: &str, slot_unit_id: &str, mod_id: &str, seat: &str, starting_life: i32,
+    registry: &ModRegistry,
+) -> String {
+    match deploy_profile_unit_inner(match_id, slot_unit_id, mod_id, seat, starting_life, registry, None, true) {
+        Ok((_, Some(over))) => serde_json::json!({"legal":false, "error":over.error(), "over_cap":over}).to_string(),
+        Ok((_, None)) => serde_json::json!({"legal":true, "error":null, "over_cap":null}).to_string(),
+        Err(error) => serde_json::json!({"legal":false, "error":error, "over_cap":null}).to_string(),
+    }
+}
+
+fn deploy_profile_unit_inner(
+    match_id: &str, slot_unit_id: &str, mod_id: &str, seat: &str, starting_life: i32,
+    registry: &ModRegistry, approval: Option<crate::setup::Approval>, query: bool,
+) -> Result<(String, Option<crate::setup::OverCap>), String> {
     if !matches!(seat, "P1" | "P2") {
         return Err("seat must be 'P1' or 'P2'".to_string());
     }
@@ -720,9 +747,42 @@ pub fn deploy_profile_unit(
     {
         return Err(format!("profile {mod_id} has no combat values; version 2 matches need schema 2 profiles"));
     }
+    if let Some(combat) = combat_records.get(match_id) {
+        crate::setup::check_deployment_dice(template, &combat.ruleset.rules)?;
+    }
     let mut setup_records = MATCH_SETUP_RECORDS
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    let over = if let Some(combat) = combat_records.get(match_id) {
+        if !setup_records.contains_key(match_id) {
+            return Err(format!("Missing match setup: {match_id}"));
+        }
+        let Component::Destructible { max_life, .. } = deployed.components["destructible"] else { unreachable!() };
+        combat.ruleset.rules.health_cap.as_ref().and_then(|cap| {
+            if cap.starting_health.is_some_and(|n| starting_life > n) || cap.max_health.is_some_and(|n| max_life > n) {
+                Some(crate::setup::OverCap {
+                    slot: slot_unit_id.to_string(), profile: Some(mod_id.to_string()),
+                    starting_health: starting_life, max_health: max_life, cap: cap.clone(),
+                    location: "roster".into(), display_name: template.display_name.clone(),
+                })
+            } else { None }
+        })
+    } else { None };
+    let name = display_name.unwrap_or_else(|| mod_id.to_string());
+    if query { return Ok((name, over)); }
+    if approval.is_none() {
+        if let Some(over) = &over { return Err(over.error()); }
+    }
+    if combat_records.contains_key(match_id) {
+        let record = setup_records.get_mut(match_id).expect("setup record checked");
+        let root = record.map.as_object_mut().ok_or_else(|| "setup: invalid recorded setup".to_string())?;
+        let rules = root.entry("house_rules").or_insert_with(|| serde_json::json!([]))
+            .as_array_mut().ok_or_else(|| "setup: invalid recorded house rules".to_string())?;
+        rules.retain(|rule| rule.get("slot").and_then(serde_json::Value::as_str) != Some(slot_unit_id));
+        if let (Some(over), Some(approval)) = (&over, approval) {
+            rules.push(over.house_rule(approval));
+        }
+    }
     commit_profile_deployment(state, deployed);
     if let Some(record) = setup_records.get_mut(match_id) {
         let entry = crate::setup::RosterEntry {
@@ -741,7 +801,7 @@ pub fn deploy_profile_unit(
     if state.context.turn_phase == TurnPhase::Finished {
         flow.finish();
     }
-    Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
+    Ok((name, over))
 }
 
 /// Deploys a profile and keeps the match's setup record in step when one exists.
