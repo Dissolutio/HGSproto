@@ -222,6 +222,30 @@ mod tests {
     }
 
     #[test]
+    fn blocks_reduce_positive_damage() {
+        let (outcome, draws_used) = resolve_attack(
+            count(3),
+            count(1),
+            damage(2),
+            &Die::default(),
+            0x0123456789abcdef,
+            2,
+        );
+        assert_eq!(outcome.attack_faces, [2, 2, 2]);
+        assert_eq!(outcome.defense_faces, [4]);
+        assert_eq!(
+            (
+                outcome.strikes,
+                outcome.blocks,
+                outcome.unblocked_strikes,
+                outcome.damage
+            ),
+            (3, 1, 2, 4)
+        );
+        assert_eq!(draws_used, 6);
+    }
+
+    #[test]
     fn damage_bounds_and_thousand_dice() {
         let die = Die::new(vec![FaceKind::Strike]).unwrap();
         for (per_strike, expected) in [(0, 0), (100, 100_000)] {
