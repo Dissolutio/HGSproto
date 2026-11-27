@@ -296,12 +296,15 @@ fn try_initialize_map_file(
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let mut combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
     let mut setup_records = MATCH_SETUP_RECORDS
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
     let should_insert = replace_existing || !matches.contains_key(&match_id);
     if should_insert {
         flows.insert(match_id.clone(), flow);
+        combat_records.remove(&match_id);
         setup_records.insert(match_id.clone(), setup_record);
     }
     if replace_existing {
@@ -667,6 +670,30 @@ pub(crate) fn stage_profile_deployment(
     let display_name = deployed.display_name.clone();
     commit_profile_deployment(state, deployed);
     Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
+}
+
+pub(crate) fn stage_v2_roster(
+    state: &mut GameState,
+    roster: &[crate::setup::RosterEntry],
+    registry: &ModRegistry,
+) -> Result<(), String> {
+    for (index, entry) in roster.iter().enumerate() {
+        let result = (|| {
+            let prepared = prepare_profile_deployment(
+                &entry.slot, &entry.profile, &entry.seat, entry.starting_health, registry,
+            )?;
+            let deployed = check_profile_deployment(
+                state, &entry.slot, &entry.profile, &entry.seat, prepared,
+            )?;
+            state.entities.insert(deployed.id.clone(), deployed);
+            Ok::<(), String>(())
+        })();
+        result.map_err(|error| format!("roster[{index}]: {error}"))?;
+    }
+    if !roster.is_empty() {
+        evaluate_victory(state);
+    }
+    Ok(())
 }
 
 struct PreparedDeployment {

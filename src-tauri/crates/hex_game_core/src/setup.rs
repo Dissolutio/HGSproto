@@ -789,11 +789,7 @@ pub fn apply_setup_with_seed(
             .ok_or_else(|| format!("setup: missing staged unit '{}'", unit.id))?;
         entity.components = template.components.clone();
     }
-    for (index, entry) in setup.common.roster.iter().enumerate() {
-        crate::engine::stage_profile_deployment(
-            &mut state, &entry.slot, &entry.profile, &entry.seat, entry.starting_health, &scratch,
-        ).map_err(|error| format!("roster[{index}]: {error}"))?;
-    }
+    crate::engine::stage_v2_roster(&mut state, &setup.common.roster, &scratch)?;
     let snapshot = serde_json::to_vec(&state)
         .map_err(|error| format!("setup: could not measure initial match state: {error}"))?;
     check_staged_snapshot_size(snapshot.len())?;
@@ -995,6 +991,42 @@ mod tests {
         apply_setup(id.clone(), VALID, &registry).unwrap();
         assert_eq!(engine::get_combat_record(&id).unwrap(), None);
         assert_eq!(serde_json::to_vec(&match_value(&id)).unwrap(), before);
+        engine::remove_match(&id);
+    }
+
+    #[test]
+    fn seeded_v2_reset_clears_combat_but_non_replacing_initialization_does_not() {
+        let id = format!("seeded_reset_{}", std::process::id());
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.clone(), &seeded_example().to_string(), &registry, 9, Approval::LocalSandbox).unwrap();
+        let map = example()["map"].to_string();
+        engine::try_initialize_from_hexoscape_with_registry(id.clone(), &map, &registry).unwrap();
+        assert!(engine::get_combat_record(&id).unwrap().is_some());
+        engine::try_reset_from_hexoscape_with_registry(id.clone(), &map, &registry).unwrap();
+        assert_eq!(engine::get_combat_record(&id).unwrap(), None);
+        assert!(export_setup(&id, &registry).is_ok());
+        assert!(export_local_sandbox(&id, &registry).is_ok());
+        engine::remove_match(&id);
+    }
+
+    #[test]
+    fn seeded_v2_single_seat_roster_is_staged_before_victory() {
+        let id = format!("seeded_single_seat_{}", std::process::id());
+        let registry = ModRegistry::default();
+        let mut source = seeded_example();
+        source["map"]["starterUnits"][1]["seat"] = "P1".into();
+        source["map"]["starterUnits"][1]["components"]["tags"] = json!(["Unit", "P1"]);
+        source["roster"].as_array_mut().unwrap().push(json!({
+            "slot":"UNIT_P2_1", "seat":"P1", "profile":"com.community.goliath", "starting_health":12
+        }));
+        source["house_rules"].as_array_mut().unwrap().push(json!({
+            "kind":"allow_over_health_cap", "slot":"UNIT_P2_1", "name":"Allow Goliath",
+            "starting_health":12, "max_health":12, "approval":{"mode":"local_sandbox"}
+        }));
+        apply_setup_with_seed(id.clone(), &source.to_string(), &registry, 9, Approval::LocalSandbox).unwrap();
+        let snapshot = match_value(&id);
+        assert_eq!(component(&snapshot, "UNIT_P2_1", "destructible")["current_life"], 12);
+        assert_eq!(snapshot["context"]["winner"], "P1");
         engine::remove_match(&id);
     }
 
