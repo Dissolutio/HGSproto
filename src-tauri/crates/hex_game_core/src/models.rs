@@ -13,6 +13,9 @@ pub enum Component {
     TerrainType {
         terrain: String,
     },
+    TerrainKind {
+        id: String,
+    },
     LifePoints {
         current: i32,
         max: i32,
@@ -20,6 +23,11 @@ pub enum Component {
     Destructible {
         current_life: i32,
         max_life: i32,
+    },
+    Combat {
+        attack: i32,
+        defense: i32,
+        damage_per_strike: i32,
     },
     Tags {
         labels: Vec<String>,
@@ -124,6 +132,21 @@ pub struct PieceCoords {
 #[cfg(test)]
 mod tests {
     use super::{Component, HexoscapeMapFile};
+
+    #[test]
+    fn new_components_round_trip_with_tagged_shapes() {
+        for (component, expected) in [
+            (Component::Combat { attack: 4, defense: 3, damage_per_strike: 1 },
+             serde_json::json!({"type": "Combat", "data": {"attack": 4, "defense": 3, "damage_per_strike": 1}})),
+            (Component::TerrainKind { id: "shadow".into() },
+             serde_json::json!({"type": "TerrainKind", "data": {"id": "shadow"}})),
+        ] {
+            let value = serde_json::to_value(component).unwrap();
+            assert_eq!(value, expected);
+            let decoded: Component = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        }
+    }
 
     #[test]
     fn hexoscape_map_file_round_trips_serialized_layout_keys() {

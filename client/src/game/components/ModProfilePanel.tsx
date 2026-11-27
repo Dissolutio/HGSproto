@@ -1,10 +1,12 @@
-import type { ModProfileSummary, PlayerSeat, RenderEntity } from "../types";
+import { useRef } from "react";
+import type { ModProfileSummary, PlayerSeat, ProfileFeedback, RenderEntity } from "../types";
 
 type ModProfilePanelProps = {
   profileText: string;
   onProfileTextChange: (value: string) => void;
   enabled: boolean;
   onLoadProfiles: () => void;
+  loadFeedback?: ProfileFeedback | null;
   loadedProfiles: ModProfileSummary[];
   selectedProfile: ModProfileSummary | null;
   onSelectProfile: (modId: string) => void;
@@ -16,8 +18,16 @@ type ModProfilePanelProps = {
   startingHealth: string;
   onStartingHealthChange: (value: string) => void;
   onDeployProfile: () => void;
+  deployFeedback?: ProfileFeedback | null;
   setupLocked: boolean;
   matchFinished: boolean;
+  onStartFresh: () => void;
+  onExportSetup: () => void;
+  onLoadSetup: (file: File) => Promise<void>;
+  setupFeedback?: ProfileFeedback | null;
+  setupBusy?: boolean;
+  onAllowSetup?: () => void;
+  onAllowDeploy?: () => void;
 };
 
 export function ModProfilePanel({
@@ -25,6 +35,7 @@ export function ModProfilePanel({
   onProfileTextChange,
   enabled,
   onLoadProfiles,
+  loadFeedback,
   loadedProfiles,
   selectedProfile,
   onSelectProfile,
@@ -36,18 +47,74 @@ export function ModProfilePanel({
   startingHealth,
   onStartingHealthChange,
   onDeployProfile,
+  deployFeedback,
   setupLocked,
   matchFinished,
+  onStartFresh,
+  onExportSetup,
+  onLoadSetup,
+  setupFeedback,
+  setupBusy,
+  onAllowSetup,
+  onAllowDeploy,
 }: ModProfilePanelProps) {
+  const setupFileInput = useRef<HTMLInputElement>(null);
   return (
     <details style={styles.section}>
       <summary style={styles.summary}>🔌 Community Mod Profile Loader</summary>
+      <button
+        type="button"
+        onClick={onExportSetup}
+        disabled={!enabled || setupBusy}
+        aria-describedby="setup-feedback setup-note"
+        style={styles.button}
+      >
+        Export setup
+      </button>{" "}
+      <button
+        type="button"
+        onClick={() => setupFileInput.current?.click()}
+        disabled={!enabled || setupBusy}
+        aria-describedby="setup-feedback setup-note"
+        style={styles.button}
+      >
+        Load setup
+      </button>
+      <input
+        ref={setupFileInput}
+        type="file"
+        accept=".json"
+        aria-label="Setup JSON file"
+        hidden
+        disabled={!enabled || setupBusy}
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = "";
+          if (file) void onLoadSetup(file);
+        }}
+      />
+      <p
+        id="setup-feedback"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        style={{ ...styles.feedback, color: setupFeedback?.kind === "error" ? "#ff9999" : "#70d6a4" }}
+      >
+        {setupFeedback?.text}
+      </p>
+      {onAllowSetup && <button type="button" onClick={onAllowSetup} disabled={!enabled || setupBusy} style={styles.button}>Allow as house rule</button>}
+      <p id="setup-note" role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
+        {enabled
+          ? "Loading a setup replaces the local sandbox and all loaded profiles after confirmation."
+          : "Setup files are available only in the ready local WASM sandbox, not in network mode."}
+      </p>
       <label style={styles.label} htmlFor="mod-profile-json">
         Paste a mod profile or profile batch as JSON
       </label>
       <textarea
         id="mod-profile-json"
         aria-label="Community mod profile JSON"
+        aria-describedby="mod-profile-load-feedback"
         value={profileText}
         onChange={(event) => onProfileTextChange(event.target.value)}
         placeholder={'{\n  "schema_version": 1,\n  "mod_id": "com.community.scout",\n  "display_name": "Community Scout",\n  "visual_primitive": "CUBE",\n  "components": {\n    "destructible": { "current_life": 5, "max_life": 5 },\n    "tags": ["Unit"]\n  }\n}'}
@@ -61,6 +128,15 @@ export function ModProfilePanel({
       >
         Load Mod Profile
       </button>
+      <p
+        id="mod-profile-load-feedback"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        style={{ ...styles.feedback, color: loadFeedback?.kind === "error" ? "#ff9999" : "#70d6a4" }}
+      >
+        {loadFeedback && `${loadFeedback.kind === "error" ? "Error: " : ""}${loadFeedback.text}`}
+      </p>
       {loadedProfiles.length > 0 && (
         <div style={{ marginTop: 12 }}>
           <label style={styles.label} htmlFor="profile-to-deploy">
@@ -129,6 +205,7 @@ export function ModProfilePanel({
           <button
             type="button"
             onClick={onDeployProfile}
+            aria-describedby="mod-profile-deploy-feedback"
             disabled={
               !enabled ||
               !selectedProfile ||
@@ -140,6 +217,16 @@ export function ModProfilePanel({
           >
             Deploy Profile into Roster Slot
           </button>
+          <p
+            id="mod-profile-deploy-feedback"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            style={{ ...styles.feedback, color: deployFeedback?.kind === "error" ? "#ff9999" : "#70d6a4" }}
+          >
+            {deployFeedback && `${deployFeedback.kind === "error" ? "Error: " : ""}${deployFeedback.text}`}
+          </p>
+          {onAllowDeploy && <button type="button" onClick={onAllowDeploy} disabled={!enabled || setupLocked || matchFinished} style={styles.button}>Allow as house rule</button>}
           <p role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
             The Rust core replaces the selected unit in place and owns its health, tags, and visual. Deployment locks after the first referee action.
           </p>
@@ -154,6 +241,17 @@ export function ModProfilePanel({
           ))}
         </ul>
       )}
+      <button
+        type="button"
+        onClick={onStartFresh}
+        disabled={!enabled}
+        style={styles.button}
+      >
+        Start Fresh Sandbox
+      </button>
+      <p role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
+        This tab keeps the local sandbox and its profiles across a refresh. Start fresh discards them.
+      </p>
     </details>
   );
 }
@@ -200,5 +298,11 @@ const styles = {
     color: "#b4c5ba",
     fontSize: 10,
     overflowWrap: "anywhere" as const,
+  },
+  feedback: {
+    margin: "6px 0 0",
+    fontSize: 12,
+    overflowWrap: "anywhere" as const,
+    whiteSpace: "pre-wrap" as const,
   },
 };

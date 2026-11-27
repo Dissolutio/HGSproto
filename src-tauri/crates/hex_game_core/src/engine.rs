@@ -7,6 +7,7 @@ use crate::models::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
+use serde::{Deserialize, Serialize};
 
 const REFEREE_ATTACK_DAMAGE: i32 = 1;
 
@@ -16,9 +17,139 @@ pub static ACTIVE_MATCHES: LazyLock<Mutex<HashMap<String, GameState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_PLAYER_SESSIONS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-// Always acquire ACTIVE_MATCHES before MATCH_FLOWS so both records commit together.
+// Lock order: mod registry, ACTIVE_MATCHES, MATCH_FLOWS, combat records, setup records.
 static MATCH_FLOWS: LazyLock<Mutex<HashMap<String, MatchFlow>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static MATCH_COMBAT_RECORDS: LazyLock<Mutex<HashMap<String, CombatRecord>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// Setup records are always acquired after ACTIVE_MATCHES and MATCH_FLOWS.
+static MATCH_SETUP_RECORDS: LazyLock<Mutex<HashMap<String, crate::setup::SetupRecord>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn match_flows() -> &'static Mutex<HashMap<String, MatchFlow>> {
+    &MATCH_FLOWS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombatRuleset {
+    pub die: crate::dice::Die,
+    pub terrain_types: Vec<crate::setup::TerrainDefinition>,
+    pub rules: crate::setup::ScenarioRules,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiceRecord {
+    pub seed: u64,
+    pub draws_used: u64,
+    pub attacks_resolved: u64,
+    pub last_attack: Option<AttackReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaceCounts {
+    pub strike: u16,
+    pub block: u16,
+    pub blank: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttackDiceReport {
+    pub base: i32,
+    pub height_bonus: i32,
+    pub total: i32,
+    pub faces: Vec<u8>,
+    pub counts: FaceCounts,
+    pub strikes: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenseDiceReport {
+    pub base: i32,
+    pub height_bonus: i32,
+    pub terrain_bonus: i32,
+    pub terrain: Option<String>,
+    pub total: i32,
+    pub faces: Vec<u8>,
+    pub counts: FaceCounts,
+    pub blocks: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawRange {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttackReport {
+    pub sequence: u64,
+    pub attacker: String,
+    pub defender: String,
+    pub attack: AttackDiceReport,
+    pub defense: DefenseDiceReport,
+    pub unblocked_strikes: u16,
+    pub damage_per_strike: i32,
+    pub damage: u32,
+    pub defender_health_before: i32,
+    pub defender_health_after: i32,
+    pub defender_removed: bool,
+    pub draws: DrawRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombatRecord {
+    pub ruleset: CombatRuleset,
+    pub dice: DiceRecord,
+}
+
+pub(crate) fn combat_records() -> &'static Mutex<HashMap<String, CombatRecord>> {
+    &MATCH_COMBAT_RECORDS
+}
+
+pub fn get_combat_record(match_id: &str) -> Result<Option<CombatRecord>, String> {
+    let matches = ACTIVE_MATCHES.lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    if !matches.contains_key(match_id) {
+        return Err(format!("Unknown match: {match_id}"));
+    }
+    Ok(MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?
+        .get(match_id).cloned())
+}
+
+pub fn combat_state(match_id: &str) -> Result<String, String> {
+    let matches = ACTIVE_MATCHES.lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    if !matches.contains_key(match_id) {
+        return Err(format!("Unknown match: {match_id}"));
+    }
+    let records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    let Some(record) = records.get(match_id) else {
+        return Ok("{\"combat\": null}".into());
+    };
+    let setups = MATCH_SETUP_RECORDS.lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    let source = &setups.get(match_id)
+        .ok_or_else(|| format!("Missing match setup: {match_id}"))?.map;
+    let faces: Vec<_> = record.ruleset.die.faces().iter().map(|face| match face {
+        crate::dice::FaceKind::Strike => "strike",
+        crate::dice::FaceKind::Block => "block",
+        crate::dice::FaceKind::Blank => "blank",
+    }).collect();
+    serde_json::to_string(&serde_json::json!({
+        "combat_version": 1,
+        "die": { "faces": faces },
+        "terrain_types": source["terrain_types"],
+        "house_rules": source.get("house_rules").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "attacks_resolved": record.dice.attacks_resolved,
+        "last_attack": record.dice.last_attack,
+    })).map_err(|error| format!("Could not serialize combat state: {error}"))
+}
+
+pub(crate) fn setup_records() -> &'static Mutex<HashMap<String, crate::setup::SetupRecord>> {
+    &MATCH_SETUP_RECORDS
+}
 
 /// Generates a hardcoded test sandbox with a small board and 2 units per player.
 pub fn generate_test_sandbox(match_id: String) -> GameState {
@@ -121,6 +252,13 @@ fn try_store_match(match_id: String, state: GameState) -> Result<(), String> {
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let mut combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    setup_records.remove(&match_id);
+    combat_records.remove(&match_id);
     flows.insert(match_id.clone(), flow);
     matches.insert(match_id, state);
     Ok(())
@@ -141,10 +279,18 @@ pub fn get_match_flow(match_id: &str) -> Result<MatchFlow, String> {
 pub fn remove_match(match_id: &str) {
     if let Ok(mut matches) = ACTIVE_MATCHES.lock() {
         match MATCH_FLOWS.lock() {
-            Ok(mut flows) => {
-                matches.remove(match_id);
-                flows.remove(match_id);
-            }
+            Ok(mut flows) => match MATCH_COMBAT_RECORDS.lock() {
+                Ok(mut combat_records) => match MATCH_SETUP_RECORDS.lock() {
+                    Ok(mut setup_records) => {
+                        matches.remove(match_id);
+                        flows.remove(match_id);
+                        combat_records.remove(match_id);
+                        setup_records.remove(match_id);
+                    }
+                    Err(_) => eprintln!("Could not remove match: setup registry is unavailable"),
+                },
+                Err(_) => eprintln!("Could not remove match: combat registry is unavailable"),
+            },
             Err(_) => eprintln!("Could not remove match: flow registry is unavailable"),
         }
     }
@@ -154,24 +300,30 @@ pub fn remove_match(match_id: &str) {
 }
 
 pub fn get_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Vec<(i32, i32)> {
+    // Built-in templates contain only small offsets, independent of map coordinates.
+    checked_hex_footprint_offsets(inventory_id, rotation)
+        .expect("Built-in footprint offsets must fit in i32 coordinates")
+}
+
+fn checked_hex_footprint_offsets(inventory_id: &str, rotation: i32) -> Option<Vec<(i32, i32)>> {
     let templates_list = crate::templates::get_template_offsets(inventory_id);
     templates_list
         .iter()
         .map(|offset| {
             let mut current_q = offset.q;
             let mut current_r = offset.r;
-            let mut current_s = -offset.q - offset.r;
+            let mut current_s = offset.q.checked_neg()?.checked_sub(offset.r)?;
             let normalized_steps = rotation.rem_euclid(6);
 
             for _ in 0..normalized_steps {
-                let next_q = -current_r;
-                let next_r = -current_s;
-                let next_s = -next_q - next_r;
+                let next_q = current_r.checked_neg()?;
+                let next_r = current_s.checked_neg()?;
+                let next_s = next_q.checked_neg()?.checked_sub(next_r)?;
                 current_q = next_q;
                 current_r = next_r;
                 current_s = next_s;
             }
-            (current_q, current_r)
+            Some((current_q, current_r))
         })
         .collect()
 }
@@ -210,6 +362,50 @@ fn try_initialize_map_file(
     registry: Option<&ModRegistry>,
     replace_existing: bool,
 ) -> Result<(), String> {
+    let mut setup_map = crate::setup::legacy_setup_map(&map_file)?;
+    let legacy_starters = map_file.starter_units.clone();
+    let game_state = build_map_state(match_id.clone(), map_file, registry)?;
+    crate::setup::inline_legacy_profile_starters(&mut setup_map, &legacy_starters, &game_state)?;
+    let setup_record = crate::setup::SetupRecord {
+        name: crate::setup::DEFAULT_SETUP_NAME.to_string(),
+        map: setup_map,
+        roster: Vec::new(),
+    };
+    let flow = MatchFlow::reference(&game_state.context)?;
+
+    let mut matches = ACTIVE_MATCHES
+        .lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let mut combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    let should_insert = replace_existing || !matches.contains_key(&match_id);
+    if should_insert {
+        flows.insert(match_id.clone(), flow);
+        combat_records.remove(&match_id);
+        setup_records.insert(match_id.clone(), setup_record);
+    }
+    if replace_existing {
+        release_player_session(&match_id, "Player_1");
+        release_player_session(&match_id, "Player_2");
+        matches.insert(match_id, game_state);
+    } else {
+        matches.entry(match_id).or_insert(game_state);
+    }
+    Ok(())
+}
+
+/// Builds the starting `GameState` for a parsed map without storing it anywhere.
+/// The legacy initializers and the setup apply both use this builder.
+pub(crate) fn build_map_state(
+    match_id: String,
+    map_file: HexoscapeMapFile,
+    registry: Option<&ModRegistry>,
+) -> Result<GameState, String> {
     let properties = map_file.hex_map.properties.iter()
         .map(|(key, value)| (key.clone(), value.clone())).collect();
     crate::flow::reject_metadata_flow(&properties)?;
@@ -229,11 +425,15 @@ fn try_initialize_map_file(
         let base_r = piece.piece_coords.r;
         let base_z = piece.altitude;
         let (face_texture, side_texture) = terrain_textures(&piece.inventory_id);
-        let offsets = get_hex_footprint_offsets(&piece.inventory_id, piece.rotation);
+        let coordinate_error = || {
+            format!("Hexoscape map coordinate out of range: piece '{}'", piece.uid)
+        };
+        let offsets = checked_hex_footprint_offsets(&piece.inventory_id, piece.rotation)
+            .ok_or_else(coordinate_error)?;
 
         for (index, (rotated_q, rotated_r)) in offsets.into_iter().enumerate() {
-            let final_q = base_q + rotated_q;
-            let final_r = base_r + rotated_r;
+            let final_q = base_q.checked_add(rotated_q).ok_or_else(coordinate_error)?;
+            let final_r = base_r.checked_add(rotated_r).ok_or_else(coordinate_error)?;
             let entity_id = format!("TILE_{}_{}", piece.uid, index);
             let entity = Entity {
                 id: entity_id.clone(),
@@ -331,23 +531,103 @@ fn try_initialize_map_file(
         game_state.entities.insert(entity.id.clone(), entity);
     }
 
+    Ok(game_state)
+}
+
+/// Commits a fully staged match in one step, replacing any match with the same id.
+/// `commit_with_locks` runs only after ACTIVE_MATCHES, MATCH_FLOWS, and the setup
+/// records are held, so a caller holding the earlier mod registry lock can commit
+/// its own state in the same step. Nothing is mutated before every lock is acquired.
+pub(crate) fn replace_with_staged_match(
+    match_id: String,
+    state: GameState,
+    flow: MatchFlow,
+    setup_record: Option<crate::setup::SetupRecord>,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    commit_staged_match(match_id, state, flow, None, setup_record, true, commit_with_locks)
+}
+
+pub(crate) fn replace_with_staged_combat_match(
+    match_id: String,
+    state: GameState,
+    flow: MatchFlow,
+    combat_record: CombatRecord,
+    setup_record: crate::setup::SetupRecord,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    commit_staged_match(match_id, state, flow, Some(combat_record), Some(setup_record), true, commit_with_locks)
+}
+
+fn commit_staged_match(
+    match_id: String,
+    state: GameState,
+    flow: MatchFlow,
+    combat_record: Option<CombatRecord>,
+    setup_record: Option<crate::setup::SetupRecord>,
+    release_sessions: bool,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
     let mut matches = ACTIVE_MATCHES
         .lock()
         .map_err(|_| "Match registry is unavailable".to_string())?;
     let mut flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
-    if replace_existing || !matches.contains_key(&match_id) {
-        let flow = MatchFlow::reference(&game_state.context)?;
-        flows.insert(match_id.clone(), flow);
-    }
-    if replace_existing {
+    let mut combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    commit_with_locks();
+    if release_sessions {
         release_player_session(&match_id, "Player_1");
         release_player_session(&match_id, "Player_2");
-        matches.insert(match_id, game_state);
-    } else {
-        matches.entry(match_id).or_insert(game_state);
     }
+    flows.insert(match_id.clone(), flow);
+    if let Some(record) = combat_record {
+        combat_records.insert(match_id.clone(), record);
+    } else {
+        combat_records.remove(&match_id);
+    }
+    if let Some(setup_record) = setup_record {
+        setup_records.insert(match_id.clone(), setup_record);
+    } else {
+        setup_records.remove(&match_id);
+    }
+    matches.insert(match_id, state);
     Ok(())
+}
+
+pub(crate) fn restore_staged_match_snapshot(
+    match_id: String,
+    mut state: GameState,
+    setup_record: Option<crate::setup::SetupRecord>,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    evaluate_victory(&mut state);
+    let flow = MatchFlow::reference(&state.context)?;
+    commit_staged_match(
+        match_id,
+        state,
+        flow,
+        None,
+        setup_record,
+        false,
+        commit_with_locks,
+    )
+}
+
+pub(crate) fn restore_staged_combat_match_snapshot(
+    match_id: String,
+    state: GameState,
+    combat_record: CombatRecord,
+    setup_record: crate::setup::SetupRecord,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    let flow = MatchFlow::reference(&state.context)?;
+    commit_staged_match(
+        match_id, state, flow, Some(combat_record), Some(setup_record), false, commit_with_locks,
+    )
 }
 
 pub(crate) fn reject_explicit_scenario_flow(json: &str) -> Result<(), String> {
@@ -381,7 +661,7 @@ fn starter_unit_components(
     })?;
     let seat = starter_unit_seat(unit)?;
     let mut components = HashMap::new();
-    for key in ["destructible", "tags"] {
+    for key in ["destructible", "tags", "combat"] {
         if let Some(component) = template.components.get(key) {
             components.insert(key.to_string(), component.clone());
         }
@@ -409,18 +689,222 @@ pub fn deploy_profile_unit(
     starting_life: i32,
     registry: &ModRegistry,
 ) -> Result<String, String> {
+    deploy_profile_unit_inner(match_id, slot_unit_id, mod_id, seat, starting_life, registry, None, false)
+        .map(|(name, _)| name)
+}
+
+pub fn deploy_profile_unit_allowing_over_cap(
+    match_id: &str, slot_unit_id: &str, mod_id: &str, seat: &str, starting_life: i32,
+    registry: &ModRegistry, approval: crate::setup::Approval,
+) -> Result<String, String> {
+    deploy_profile_unit_inner(match_id, slot_unit_id, mod_id, seat, starting_life, registry, Some(approval), false)
+        .map(|(name, _)| name)
+}
+
+pub fn query_deploy(
+    match_id: &str, slot_unit_id: &str, mod_id: &str, seat: &str, starting_life: i32,
+    registry: &ModRegistry,
+) -> String {
+    match deploy_profile_unit_inner(match_id, slot_unit_id, mod_id, seat, starting_life, registry, None, true) {
+        Ok((_, Some(over))) => serde_json::json!({"legal":false, "error":over.error(), "over_cap":over}).to_string(),
+        Ok((_, None)) => serde_json::json!({"legal":true, "error":null, "over_cap":null}).to_string(),
+        Err(error) => serde_json::json!({"legal":false, "error":error, "over_cap":null}).to_string(),
+    }
+}
+
+fn deploy_profile_unit_inner(
+    match_id: &str, slot_unit_id: &str, mod_id: &str, seat: &str, starting_life: i32,
+    registry: &ModRegistry, approval: Option<crate::setup::Approval>, query: bool,
+) -> Result<(String, Option<crate::setup::OverCap>), String> {
+    if !matches!(seat, "P1" | "P2") {
+        return Err("seat must be 'P1' or 'P2'".to_string());
+    }
+    let templates = registry
+        .templates
+        .read()
+        .map_err(|_| "mod registry read lock is poisoned".to_string())?;
+    let template = templates.get(mod_id).ok_or_else(|| {
+        format!("Starter unit '{slot_unit_id}' references unknown mod_id '{mod_id}'")
+    })?;
+    let prepared = prepare_profile_deployment_from_template(seat, mod_id, starting_life, template)?;
+
+    let mut matches = ACTIVE_MATCHES
+        .lock()
+        .map_err(|_| "Match registry is unavailable".to_string())?;
+    let state = matches
+        .get_mut(match_id)
+        .ok_or_else(|| format!("Unknown match: {match_id}"))?;
+    let deployed = check_profile_deployment(state, slot_unit_id, mod_id, seat, prepared)?;
+    let display_name = deployed.display_name.clone();
+    let mut flows = MATCH_FLOWS.lock()
+        .map_err(|_| "Match flow registry is unavailable".to_string())?;
+    let flow = flows.get_mut(match_id)
+        .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    let combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    if combat_records.contains_key(match_id)
+        && !template.components.values().any(|component| matches!(component, Component::Combat { .. }))
+    {
+        return Err(format!("profile {mod_id} has no combat values; version 2 matches need schema 2 profiles"));
+    }
+    if let Some(combat) = combat_records.get(match_id) {
+        crate::setup::check_deployment_dice(template, &combat.ruleset.rules)?;
+    }
+    let mut setup_records = MATCH_SETUP_RECORDS
+        .lock()
+        .map_err(|_| "Match setup registry is unavailable".to_string())?;
+    let over = if let Some(combat) = combat_records.get(match_id) {
+        if !setup_records.contains_key(match_id) {
+            return Err(format!("Missing match setup: {match_id}"));
+        }
+        let Component::Destructible { max_life, .. } = deployed.components["destructible"] else { unreachable!() };
+        combat.ruleset.rules.health_cap.as_ref().and_then(|cap| {
+            if cap.starting_health.is_some_and(|n| starting_life > n) || cap.max_health.is_some_and(|n| max_life > n) {
+                Some(crate::setup::OverCap {
+                    slot: slot_unit_id.to_string(), profile: Some(mod_id.to_string()),
+                    starting_health: starting_life, max_health: max_life, cap: cap.clone(),
+                    location: "roster".into(), display_name: template.display_name.clone(),
+                })
+            } else { None }
+        })
+    } else { None };
+    let name = display_name.unwrap_or_else(|| mod_id.to_string());
+    if query { return Ok((name, over)); }
+    if approval.is_none() {
+        if let Some(over) = &over { return Err(over.error()); }
+    }
+    if combat_records.contains_key(match_id) {
+        let record = setup_records.get_mut(match_id).expect("setup record checked");
+        let root = record.map.as_object_mut().ok_or_else(|| "setup: invalid recorded setup".to_string())?;
+        let rules = root.entry("house_rules").or_insert_with(|| serde_json::json!([]))
+            .as_array_mut().ok_or_else(|| "setup: invalid recorded house rules".to_string())?;
+        rules.retain(|rule| rule.get("slot").and_then(serde_json::Value::as_str) != Some(slot_unit_id));
+        if let (Some(over), Some(approval)) = (&over, approval) {
+            rules.push(over.house_rule(approval));
+        }
+    }
+    commit_profile_deployment(state, deployed);
+    if let Some(record) = setup_records.get_mut(match_id) {
+        let entry = crate::setup::RosterEntry {
+            slot: slot_unit_id.to_string(),
+            seat: seat.to_string(),
+            profile: mod_id.to_string(),
+            starting_health: starting_life,
+        };
+        if let Some(existing) = record.roster.iter_mut().find(|item| item.slot == slot_unit_id) {
+            *existing = entry;
+        } else {
+            record.roster.push(entry);
+        }
+        record.roster.sort_by(|left, right| left.slot.cmp(&right.slot));
+    }
+    if state.context.turn_phase == TurnPhase::Finished {
+        flow.finish();
+    }
+    Ok((name, over))
+}
+
+/// Deploys a profile and keeps the match's setup record in step when one exists.
+/// Restored matches without a setup record retain the legacy deployment behavior.
+pub fn deploy_profile_unit_recorded(
+    match_id: &str,
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    starting_life: i32,
+    registry: &ModRegistry,
+) -> Result<String, String> {
+    deploy_profile_unit(match_id, slot_unit_id, mod_id, seat, starting_life, registry)
+}
+
+/// Applies `deploy_profile_unit`'s rules to a staged state that is not stored
+/// anywhere. The caller derives the match flow from the staged context afterwards.
+pub(crate) fn stage_profile_deployment(
+    state: &mut GameState,
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    starting_life: i32,
+    registry: &ModRegistry,
+) -> Result<String, String> {
+    let prepared = prepare_profile_deployment(slot_unit_id, mod_id, seat, starting_life, registry)?;
+    let deployed = check_profile_deployment(state, slot_unit_id, mod_id, seat, prepared)?;
+    let display_name = deployed.display_name.clone();
+    commit_profile_deployment(state, deployed);
+    Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
+}
+
+pub(crate) fn stage_v2_roster(
+    state: &mut GameState,
+    roster: &[crate::setup::RosterEntry],
+    registry: &ModRegistry,
+) -> Result<(), String> {
+    for (index, entry) in roster.iter().enumerate() {
+        let result = (|| {
+            let prepared = prepare_profile_deployment(
+                &entry.slot, &entry.profile, &entry.seat, entry.starting_health, registry,
+            )?;
+            let deployed = check_profile_deployment(
+                state, &entry.slot, &entry.profile, &entry.seat, prepared,
+            )?;
+            state.entities.insert(deployed.id.clone(), deployed);
+            Ok::<(), String>(())
+        })();
+        result.map_err(|error| format!("roster[{index}]: {error}"))?;
+    }
+    if !roster.is_empty() {
+        evaluate_victory(state);
+    }
+    Ok(())
+}
+
+struct PreparedDeployment {
+    components: HashMap<String, Component>,
+    visual_primitive: Option<String>,
+    display_name: Option<String>,
+}
+
+fn prepare_profile_deployment(
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    starting_life: i32,
+    registry: &ModRegistry,
+) -> Result<PreparedDeployment, String> {
     if !matches!(seat, "P1" | "P2") {
         return Err("seat must be 'P1' or 'P2'".to_string());
     }
 
-    let starter = StarterUnitDefinition {
-        id: slot_unit_id.to_string(),
-        mod_id: Some(mod_id.to_string()),
-        seat: Some(seat.to_string()),
-        components: HashMap::new(),
+    let template = registry.get_template(mod_id).map_err(|error| {
+        if error.starts_with("unknown mod_id") {
+            format!("Starter unit '{slot_unit_id}' references {error}")
+        } else {
+            error
+        }
+    })?;
+    prepare_profile_deployment_from_template(seat, mod_id, starting_life, &template)
+}
+
+fn prepare_profile_deployment_from_template(
+    seat: &str,
+    mod_id: &str,
+    starting_life: i32,
+    template: &crate::mod_registry::UnitTemplate,
+) -> Result<PreparedDeployment, String> {
+    let mut components = HashMap::new();
+    for key in ["destructible", "tags", "combat"] {
+        if let Some(component) = template.components.get(key) {
+            components.insert(key.to_string(), component.clone());
+        }
+    }
+    let labels = match components.remove("tags") {
+        Some(Component::Tags { labels }) => labels,
+        _ => Vec::new(),
     };
-    let (mut components, visual_primitive, display_name) =
-        starter_unit_components(&starter, Some(registry))?;
+    let mut labels = labels;
+    labels.retain(|label| label != "P1" && label != "P2");
+    labels.push(seat.to_string());
+    components.insert("tags".to_string(), Component::Tags { labels });
     let Component::Destructible {
         current_life,
         max_life,
@@ -436,13 +920,20 @@ pub fn deploy_profile_unit(
         return Err(format!("starting health must be within 1..={max_life}"));
     }
     *current_life = starting_life;
+    Ok(PreparedDeployment {
+        components,
+        visual_primitive: Some(template.visual_primitive.clone()),
+        display_name: Some(template.display_name.clone()),
+    })
+}
 
-    let mut matches = ACTIVE_MATCHES
-        .lock()
-        .map_err(|_| "Match registry is unavailable".to_string())?;
-    let state = matches
-        .get_mut(match_id)
-        .ok_or_else(|| format!("Unknown match: {match_id}"))?;
+fn check_profile_deployment(
+    state: &GameState,
+    slot_unit_id: &str,
+    mod_id: &str,
+    seat: &str,
+    prepared: PreparedDeployment,
+) -> Result<Entity, String> {
     if state.context.setup_locked
         || state.context.turn_phase == TurnPhase::Finished
         || state.context.winner.is_some()
@@ -465,27 +956,22 @@ pub fn deploy_profile_unit(
         ));
     }
 
-    let deployed = Entity {
+    Ok(Entity {
         id: slot_unit_id.to_string(),
         spatial: existing.spatial.clone(),
-        components,
-        visual_primitive,
-        display_name: display_name.clone(),
+        components: prepared.components,
+        visual_primitive: prepared.visual_primitive,
+        display_name: prepared.display_name,
         mod_id: Some(mod_id.to_string()),
-    };
-    let mut flows = MATCH_FLOWS.lock()
-        .map_err(|_| "Match flow registry is unavailable".to_string())?;
-    let flow = flows.get_mut(match_id)
-        .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
-    state.entities.insert(slot_unit_id.to_string(), deployed);
-    evaluate_victory(state);
-    if state.context.turn_phase == TurnPhase::Finished {
-        flow.finish();
-    }
-    Ok(display_name.unwrap_or_else(|| mod_id.to_string()))
+    })
 }
 
-fn starter_unit_seat(unit: &StarterUnitDefinition) -> Result<&'static str, String> {
+fn commit_profile_deployment(state: &mut GameState, deployed: Entity) {
+    state.entities.insert(deployed.id.clone(), deployed);
+    evaluate_victory(state);
+}
+
+pub(crate) fn starter_unit_seat(unit: &StarterUnitDefinition) -> Result<&'static str, String> {
     let seat_from_value = |value: &str| match value {
         "P1" | "Player_1" => Some("P1"),
         "P2" | "Player_2" => Some("P2"),
@@ -553,6 +1039,7 @@ pub fn restore_match_snapshot(match_id: &str, snapshot: &str) -> Result<(), Stri
     if state.context.match_id != match_id {
         return Err("Snapshot match ID does not match the requested match".into());
     }
+    reject_combat_snapshot(&state)?;
     evaluate_victory(&mut state);
     try_store_match(match_id.to_string(), state)
 }
@@ -567,9 +1054,19 @@ pub fn restore_match_snapshot_as(
     if state.context.match_id != expected_match_id {
         return Err("Snapshot match ID does not match the expected host match".into());
     }
+    reject_combat_snapshot(&state)?;
     state.context.match_id = match_id.to_string();
     evaluate_victory(&mut state);
     try_store_match(match_id.to_string(), state)
+}
+
+fn reject_combat_snapshot(state: &GameState) -> Result<(), String> {
+    if state.entities.values().any(|entity| entity.components.values().any(
+        |component| matches!(component, Component::Combat { .. } | Component::TerrainKind { .. })
+    )) {
+        return Err("Snapshot contains combat or terrain kind components; use a saved sandbox record".into());
+    }
+    Ok(())
 }
 
 /// Helper function to view if a match is actively running
@@ -655,7 +1152,10 @@ pub fn process_action(match_id: &str, acting_seat: &str, action: &str) -> Result
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     let flow = flows.get_mut(match_id)
         .ok_or_else(|| format!("Missing match flow: {match_id}"))?;
-    apply_referee_action(state, flow, acting_seat, action).map_err(|error| error.message)
+    let mut records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    apply_referee_action_with_combat(state, flow, acting_seat, action, records.get_mut(match_id), None)
+        .map_err(|error| error.message)
 }
 
 /// Reports step permissions and validates a supplied candidate without committing effects.
@@ -669,6 +1169,9 @@ pub fn query_actions(match_id: &str, seat: &str, candidate: Option<&str>) -> Res
     let flows = MATCH_FLOWS.lock()
         .map_err(|_| "Match flow registry is unavailable".to_string())?;
     let flow = flows.get(match_id).ok_or_else(|| format!("Missing match flow: {match_id}"))?;
+    let combat_records = MATCH_COMBAT_RECORDS.lock()
+        .map_err(|_| "Match combat registry is unavailable".to_string())?;
+    let rules = combat_records.get(match_id).map(|record| &record.ruleset);
     let actor = normalize_seat(seat)
         .map_err(|message| Rejection::new(ReasonCode::UnknownSeat, message));
     let actions = [ActionKind::Move, ActionKind::Attack, ActionKind::Skip, ActionKind::EndTurn]
@@ -684,7 +1187,7 @@ pub fn query_actions(match_id: &str, seat: &str, candidate: Option<&str>) -> Res
         }).collect();
     let candidate = candidate.map(|token| {
         let result = actor.as_ref().map_err(Clone::clone).and_then(|seat| {
-            apply_referee_action(&mut state.clone(), &mut flow.clone(), seat, token)
+            apply_referee_action_with_combat(&mut state.clone(), &mut flow.clone(), seat, token, None, rules)
         });
         CandidateLegality { token: token.into(), legal: result.is_ok(), rejection: result.err() }
     });
@@ -770,11 +1273,119 @@ fn validate_action_context(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_referee_action(
     state: &mut GameState,
     flow: &mut MatchFlow,
     acting_seat: &str,
     action: &str,
+) -> Result<(), Rejection> {
+    apply_referee_action_with_combat(state, flow, acting_seat, action, None, None)
+}
+
+fn face_counts(die: &crate::dice::Die, faces: &[u8]) -> FaceCounts {
+    let mut counts = FaceCounts { strike: 0, block: 0, blank: 0 };
+    for face in faces {
+        match die.faces()[usize::from(*face)] {
+            crate::dice::FaceKind::Strike => counts.strike += 1,
+            crate::dice::FaceKind::Block => counts.block += 1,
+            crate::dice::FaceKind::Blank => counts.blank += 1,
+        }
+    }
+    counts
+}
+
+struct CombatInputs {
+    attack_base: i32,
+    defense_base: i32,
+    damage_per_strike: i32,
+    attack_height: i32,
+    defense_height: i32,
+    terrain_bonus: i32,
+    attack_total: i32,
+    defense_total: i32,
+    attack_dice: crate::dice::DiceCount,
+    defense_dice: crate::dice::DiceCount,
+    damage_value: crate::dice::DamagePerStrike,
+}
+
+fn combat_inputs(
+    attacker: &Entity,
+    defender: &Entity,
+    terrain: Option<&str>,
+    rules: &CombatRuleset,
+) -> Result<CombatInputs, Rejection> {
+    let invalid = || Rejection::new(ReasonCode::InvalidState, "Invalid combat data");
+    let combat = |entity: &Entity| entity.components.values().find_map(|component| match component {
+        Component::Combat { attack, defense, damage_per_strike } => Some((*attack, *defense, *damage_per_strike)),
+        _ => None,
+    });
+    let (attack_base, _, damage_per_strike) = combat(attacker).ok_or_else(invalid)?;
+    let (_, defense_base, _) = combat(defender).ok_or_else(invalid)?;
+    let attack_height = i32::from(attacker.spatial.z > defender.spatial.z);
+    let defense_height = i32::from(defender.spatial.z > attacker.spatial.z);
+    let terrain_type = terrain.and_then(|id| rules.terrain_types.iter().find(|t| t.id == id));
+    let terrain_bonus = rules.rules.terrain_defense_bonus.iter().find(|bonus| {
+        terrain_type.is_some_and(|t| bonus.terrain.as_deref() == Some(t.id.as_str())
+            || bonus.tag.as_ref().is_some_and(|tag| t.tags.contains(tag)))
+    }).map_or(0, |bonus| bonus.dice);
+    let attack_total = attack_base.checked_add(attack_height).ok_or_else(invalid)?;
+    let defense_total = defense_base.checked_add(defense_height)
+        .and_then(|n| n.checked_add(terrain_bonus)).ok_or_else(invalid)?;
+    let attack_dice = u16::try_from(attack_total).ok().and_then(crate::dice::DiceCount::new).ok_or_else(invalid)?;
+    let defense_dice = u16::try_from(defense_total).ok().and_then(crate::dice::DiceCount::new).ok_or_else(invalid)?;
+    let damage_value = u8::try_from(damage_per_strike).ok().and_then(crate::dice::DamagePerStrike::new).ok_or_else(invalid)?;
+    Ok(CombatInputs { attack_base, defense_base, damage_per_strike, attack_height, defense_height,
+        terrain_bonus, attack_total, defense_total, attack_dice, defense_dice, damage_value })
+}
+
+fn resolve_combat_attack(
+    attacker: &Entity,
+    defender: &Entity,
+    terrain: Option<&str>,
+    record: &CombatRecord,
+) -> Result<AttackReport, Rejection> {
+    let invalid = || Rejection::new(ReasonCode::InvalidState, "Invalid combat data");
+    let CombatInputs { attack_base, defense_base, damage_per_strike, attack_height, defense_height,
+        terrain_bonus, attack_total, defense_total, attack_dice, defense_dice, damage_value } =
+        combat_inputs(attacker, defender, terrain, &record.ruleset)?;
+    let health = defender.components.values().find_map(|component| match component {
+        Component::Destructible { current_life, .. } => Some(*current_life),
+        _ => None,
+    }).ok_or_else(invalid)?;
+    let sequence = record.dice.attacks_resolved.checked_add(1).ok_or_else(invalid)?;
+    let from = record.dice.draws_used;
+    let (outcome, to) = crate::dice::resolve_attack(attack_dice, defense_dice, damage_value, &record.ruleset.die, record.dice.seed, from);
+    let health_after = health.saturating_sub(outcome.damage as i32);
+    Ok(AttackReport {
+        sequence,
+        attacker: attacker.id.clone(),
+        defender: defender.id.clone(),
+        attack: AttackDiceReport {
+            base: attack_base, height_bonus: attack_height, total: attack_total,
+            counts: face_counts(&record.ruleset.die, &outcome.attack_faces),
+            faces: outcome.attack_faces, strikes: outcome.strikes,
+        },
+        defense: DefenseDiceReport {
+            base: defense_base, height_bonus: defense_height, terrain_bonus,
+            terrain: terrain.map(str::to_owned), total: defense_total,
+            counts: face_counts(&record.ruleset.die, &outcome.defense_faces),
+            faces: outcome.defense_faces, blocks: outcome.blocks,
+        },
+        unblocked_strikes: outcome.unblocked_strikes, damage_per_strike,
+        damage: outcome.damage, defender_health_before: health,
+        defender_health_after: health_after, defender_removed: health_after <= 0,
+        draws: DrawRange { from, to },
+    })
+}
+
+fn apply_referee_action_with_combat(
+    state: &mut GameState,
+    flow: &mut MatchFlow,
+    acting_seat: &str,
+    action: &str,
+    combat: Option<&mut CombatRecord>,
+    query_rules: Option<&CombatRuleset>,
 ) -> Result<(), Rejection> {
     validate_action_context(state, flow, acting_seat, ActionKind::from_token(action))?;
     let next = flow.advance().map_err(|message| Rejection::new(ReasonCode::InvalidState, message))?;
@@ -877,6 +1488,23 @@ fn apply_referee_action(
                 {
                     return Err(Rejection::new(ReasonCode::InvalidTarget, format!("Target is not destructible: {target_id}")));
                 }
+                let terrain = state.entities.values().find_map(|entity| {
+                        (entity.spatial.q == target.spatial.q && entity.spatial.r == target.spatial.r
+                            && entity.spatial.z == target.spatial.z).then(|| {
+                            entity.components.values().find_map(|component| match component {
+                                Component::TerrainKind { id } => Some(id.as_str()),
+                                _ => None,
+                            })
+                        }).flatten()
+                    });
+                if let Some(rules) = query_rules {
+                    combat_inputs(attacker, target, terrain, rules)?;
+                }
+                let report = if let Some(record) = combat.as_ref() {
+                    Some(resolve_combat_attack(attacker, target, terrain, record)?)
+                } else {
+                    None
+                };
                 let target = state
                     .entities
                     .get_mut(target_id)
@@ -889,9 +1517,17 @@ fn apply_referee_action(
                         _ => None,
                     })
                     .unwrap();
-                *destructible = destructible.saturating_sub(REFEREE_ATTACK_DAMAGE);
+                *destructible = report.as_ref().map_or_else(
+                    || destructible.saturating_sub(REFEREE_ATTACK_DAMAGE),
+                    |report| report.defender_health_after,
+                );
                 if *destructible <= 0 {
                     state.entities.remove(target_id);
+                }
+                if let (Some(record), Some(report)) = (combat, report) {
+                    record.dice.draws_used = report.draws.to;
+                    record.dice.attacks_resolved = report.sequence;
+                    record.dice.last_attack = Some(report);
                 }
             }
         }
@@ -978,6 +1614,245 @@ fn parse_spatial_position(value: &str) -> Result<SpatialPosition, String> {
         r: r.parse().map_err(|_| "Invalid R coordinate".to_string())?,
         z: z.parse().map_err(|_| "Invalid Z coordinate".to_string())?,
     })
+}
+
+#[cfg(test)]
+mod dice_combat_tests {
+    use super::*;
+    use crate::setup::{apply_setup_with_seed, Approval};
+    use serde_json::{json, Value};
+
+    fn setup(damage: i32, die: Value, extra_unit: bool) -> Value {
+        let mut units = vec![
+            json!({"id":"UNIT_P1_1","seat":"P1","components":{"tags":["Unit","P1"],
+                "destructible":{"current_life":10,"max_life":10},
+                "combat":{"attack":3,"defense":2,"damage_per_strike":damage}}}),
+            json!({"id":"UNIT_P2_1","seat":"P2","components":{"tags":["Unit","P2"],
+                "destructible":{"current_life":10,"max_life":10},
+                "combat":{"attack":3,"defense":2,"damage_per_strike":damage}}}),
+        ];
+        if extra_unit {
+            units.push(json!({"id":"UNIT_P2_2","seat":"P2","components":{"tags":["Unit","P2"],
+                "destructible":{"current_life":10,"max_life":10},
+                "combat":{"attack":3,"defense":2,"damage_per_strike":damage}}}));
+        }
+        json!({
+            "setup_version":2, "name":"Dice test", "die":{"faces":die},
+            "terrain_types":[{"id":"grass","name":"Grass"},{"id":"shadow","name":"Shadow","tags":["concealment"]}],
+            "map":{"hexMap":{},"boardPieces":[
+                {"uid":"a","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}},
+                {"uid":"b","inventoryID":"g1","terrain":"shadow","altitude":0,"rotation":0,"pieceCoords":{"q":1,"r":0,"s":-1}},
+                {"uid":"c","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":5,"r":0,"s":-5}}
+            ],"starterUnits":units},
+            "profiles":[], "roster":[],
+            "rules":{"terrain_defense_bonus":[{"tag":"concealment","dice":1}]}
+        })
+    }
+
+    fn start(id: &str, source: &Value) {
+        apply_setup_with_seed(id.into(), &source.to_string(), &ModRegistry::default(),
+            0x0123456789abcdef, Approval::LocalSandbox).unwrap();
+    }
+
+    fn snapshot(id: &str) -> Value {
+        serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[id]).unwrap()
+    }
+
+    fn preserved(id: &str) -> (Value, MatchFlow, CombatRecord) {
+        (snapshot(id), get_match_flow(id).unwrap(), get_combat_record(id).unwrap().unwrap())
+    }
+
+    fn assert_roll(report: &AttackReport, record: &CombatRecord, from: u64) {
+        let die = &record.ruleset.die;
+        let mut draws = from;
+        let attack: Vec<_> = (0..report.attack.total)
+            .map(|_| crate::dice::roll_die(record.dice.seed, &mut draws, die)).collect();
+        let defense: Vec<_> = (0..report.defense.total)
+            .map(|_| crate::dice::roll_die(record.dice.seed, &mut draws, die)).collect();
+        let strikes = attack.iter().filter(|&&face| die.faces()[face as usize] == crate::dice::FaceKind::Strike).count() as u16;
+        let blocks = defense.iter().filter(|&&face| die.faces()[face as usize] == crate::dice::FaceKind::Block).count() as u16;
+        assert_eq!(report.attack.faces, attack);
+        assert_eq!(report.defense.faces, defense);
+        assert_eq!(report.attack.strikes, strikes);
+        assert_eq!(report.defense.blocks, blocks);
+        assert_eq!(report.unblocked_strikes, strikes.saturating_sub(blocks));
+        assert_eq!(report.damage, u32::from(strikes.saturating_sub(blocks)) * report.damage_per_strike as u32);
+        assert_eq!((report.draws.from, report.draws.to), (from, draws));
+        assert_eq!(record.dice.draws_used, draws);
+    }
+
+    #[test]
+    fn dice_attacks_record_replay_queries_and_rejections() {
+        let ids = ["b5_dice_replay_a", "b5_dice_replay_b"];
+        let source = setup(1, json!(["strike","strike","strike","block","block","blank"]), true);
+        for id in ids {
+            start(id, &source);
+            let before = preserved(id);
+            assert!(process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").is_err());
+            assert_eq!(preserved(id), before);
+            process_action(id, "P1", "S").unwrap();
+            for (seat, token) in [
+                ("P2", "A:UNIT_P1_1:UNIT_P2_1"),
+                ("P1", "A:UNIT_P1_1:UNIT_P2_2"),
+            ] {
+                let before = preserved(id);
+                assert!(!query_actions(id, seat, Some(token)).unwrap().candidate.unwrap().legal);
+                assert!(process_action(id, seat, token).is_err());
+                assert_eq!(preserved(id), before);
+            }
+            let before = preserved(id);
+            let query = query_actions(id, "P1", Some("A:UNIT_P1_1:UNIT_P2_1")).unwrap();
+            assert!(query.candidate.as_ref().unwrap().legal);
+            assert!(!serde_json::to_string(&query).unwrap().contains("dice"));
+            assert_eq!(preserved(id), before);
+            process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+            let record = get_combat_record(id).unwrap().unwrap();
+            let report = record.dice.last_attack.as_ref().unwrap();
+            assert_roll(report, &record, 0);
+            assert_eq!(report.attack.faces, [3, 5, 2]);
+            assert_eq!(report.defense.faces, [2, 2, 4]);
+            assert_eq!((report.attack.strikes, report.defense.blocks, report.damage), (1, 1, 0));
+            assert_eq!((report.defense.terrain.as_deref(), report.defense.terrain_bonus), (Some("shadow"), 1));
+            assert_eq!((record.dice.draws_used, record.dice.attacks_resolved, report.sequence, report.draws.from, report.draws.to), (6, 1, 1, 0, 6));
+            let public: Value = serde_json::from_str(&combat_state(id).unwrap()).unwrap();
+            assert_eq!(public["last_attack"], serde_json::to_value(&report).unwrap());
+            assert_eq!(public["terrain_types"], source["terrain_types"]);
+            assert_eq!(public["house_rules"], json!([]));
+            assert!(public.get("seed").is_none());
+            for (seat, token) in [("P1","E"), ("P2","S"), ("P2","A:UNIT_P2_1:UNIT_P1_1")] {
+                process_action(id, seat, token).unwrap();
+            }
+            let record = get_combat_record(id).unwrap().unwrap();
+            let report = record.dice.last_attack.as_ref().unwrap();
+            assert_roll(report, &record, 6);
+            assert_eq!((report.defense.terrain.as_deref(), report.defense.terrain_bonus), (Some("grass"), 0));
+            assert_eq!((record.dice.draws_used, record.dice.attacks_resolved, report.sequence, report.draws.from, report.draws.to), (11, 2, 2, 6, 11));
+        }
+        let mut a = snapshot(ids[0]);
+        let b = snapshot(ids[1]);
+        a["context"]["match_id"] = ids[1].into();
+        assert_eq!(a, b);
+        assert_eq!(get_combat_record(ids[0]).unwrap(), get_combat_record(ids[1]).unwrap());
+        for id in ids { remove_match(id); }
+    }
+
+    #[test]
+    fn height_bonus_is_pure_and_zero_damage_is_preserved() {
+        let id = "b5_height";
+        start(id, &setup(0, json!(["strike"]), false));
+        let state = ACTIVE_MATCHES.lock().unwrap()[id].clone();
+        let record = get_combat_record(id).unwrap().unwrap();
+        let mut attacker = state.entities["UNIT_P1_1"].clone();
+        let mut defender = state.entities["UNIT_P2_1"].clone();
+        for (az, dz, ah, dh) in [(0, 0, 0, 0), (1, 0, 1, 0), (0, 1, 0, 1)] {
+            attacker.spatial.z = az;
+            defender.spatial.z = dz;
+            let report = resolve_combat_attack(&attacker, &defender, Some("shadow"), &record).unwrap();
+            assert_eq!((report.attack.height_bonus, report.defense.height_bonus), (ah, dh));
+            assert_eq!((report.attack.total, report.defense.total), (3 + ah, 3 + dh));
+            assert_eq!((report.damage, report.defender_health_after), (0, 10));
+        }
+        process_action(id, "P1", "S").unwrap();
+        process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        let report = get_combat_record(id).unwrap().unwrap().dice.last_attack.unwrap();
+        assert_eq!((report.damage, report.defender_health_after, report.defender_removed), (0, 10, false));
+        remove_match(id);
+    }
+
+    #[test]
+    fn v2_deployment_rejects_v1_profiles_without_mutation() {
+        let id = "b5_v2_deploy_guard";
+        start(id, &setup(1, json!(["strike"]), false));
+        let registry = ModRegistry::default();
+        let profile = json!({"schema_version":1,"mod_id":"com.example.legacy",
+            "display_name":"Legacy","visual_primitive":"CUBE",
+            "components":{"tags":["Unit"],"destructible":{"current_life":4,"max_life":4}}});
+        registry.load_batch(&json!([profile]).to_string()).unwrap();
+        let before = preserved(id);
+        let setup_before = {
+            let records = MATCH_SETUP_RECORDS.lock().unwrap();
+            let record = &records[id];
+            json!([record.name, record.map, record.roster])
+        };
+        let registry_before = serde_json::to_value(registry.get_template("com.example.legacy").unwrap()).unwrap();
+        for deploy in [deploy_profile_unit, deploy_profile_unit_recorded] {
+            assert_eq!(deploy(id, "UNIT_P1_1", "com.example.legacy", "P1", 4, &registry).unwrap_err(),
+                "profile com.example.legacy has no combat values; version 2 matches need schema 2 profiles");
+            assert_eq!(preserved(id), before);
+            let records = MATCH_SETUP_RECORDS.lock().unwrap();
+            let record = &records[id];
+            assert_eq!(json!([record.name, record.map, record.roster]), setup_before);
+            assert_eq!(serde_json::to_value(registry.get_template("com.example.legacy").unwrap()).unwrap(), registry_before);
+        }
+        remove_match(id);
+        let legacy = "b5_v1_deploy_guard";
+        store_match(legacy.into(), generate_test_sandbox(legacy.into()));
+        deploy_profile_unit(legacy, "UNIT_P1_1", "com.example.legacy", "P1", 4, &registry).unwrap();
+        remove_match(legacy);
+    }
+
+    #[test]
+    fn v2_query_and_execution_reject_invalid_combat_without_mutation() {
+        for (id, unit, oversized) in [
+            ("b5_missing_attacker", "UNIT_P1_1", false),
+            ("b5_missing_defender", "UNIT_P2_1", false),
+            ("b5_oversized_defender", "UNIT_P2_1", true),
+        ] {
+            start(id, &setup(1, json!(["strike"]), false));
+            {
+                let mut matches = ACTIVE_MATCHES.lock().unwrap();
+                let entity = matches.get_mut(id).unwrap().entities.get_mut(unit).unwrap();
+                if oversized {
+                    if let Component::Combat { defense, .. } = entity.components.get_mut("combat").unwrap() {
+                        *defense = 1000;
+                    }
+                } else {
+                    entity.components.remove("combat");
+                }
+            }
+            process_action(id, "P1", "S").unwrap();
+            let before = preserved(id);
+            let token = "A:UNIT_P1_1:UNIT_P2_1";
+            let query = query_actions(id, "P1", Some(token)).unwrap().candidate.unwrap();
+            assert!(!query.legal);
+            assert_eq!(query.rejection.unwrap().message, "Invalid combat data");
+            assert_eq!(process_action(id, "P1", token).unwrap_err(), "Invalid combat data");
+            assert_eq!(preserved(id), before);
+            remove_match(id);
+        }
+    }
+
+    #[test]
+    fn lethal_roll_removes_target_and_finishes_match() {
+        let id = "b5_lethal";
+        let mut source = setup(10, json!(["strike"]), false);
+        source["map"]["boardPieces"].as_array_mut().unwrap().pop();
+        start(id, &source);
+        process_action(id, "P1", "S").unwrap();
+        process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        let state = snapshot(id);
+        assert!(state["entities"].get("UNIT_P2_1").is_none());
+        assert_eq!(state["context"]["winner"], "P1");
+        assert_eq!(state["context"]["turn_phase"], "finished");
+        let report = get_combat_record(id).unwrap().unwrap().dice.last_attack.unwrap();
+        assert_eq!((report.damage, report.defender_removed), (30, true));
+        remove_match(id);
+    }
+
+    #[test]
+    fn legacy_snapshot_remains_identical_to_fixed_damage_referee() {
+        let id = "b5_legacy";
+        store_match(id.into(), generate_test_sandbox(id.into()));
+        process_action(id, "P1", "M:UNIT_P1_1:Q0R0Z0").unwrap();
+        let mut expected = ACTIVE_MATCHES.lock().unwrap()[id].clone();
+        let mut flow = get_match_flow(id).unwrap();
+        apply_referee_action(&mut expected, &mut flow, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        assert_eq!(serde_json::to_vec(&ACTIVE_MATCHES.lock().unwrap()[id]).unwrap(), serde_json::to_vec(&expected).unwrap());
+        assert_eq!(combat_state(id).unwrap(), "{\"combat\": null}");
+        remove_match(id);
+        assert!(combat_state(id).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1114,6 +1989,137 @@ mod tests {
         assert_eq!(positions.len(), 7);
     }
 
+    fn coordinate_test_map(inventory_id: &str, q: i32, r: i32, altitude: i32, rotation: i32) -> String {
+        serde_json::json!({
+            "hexMap": {},
+            "boardPieces": [
+                {
+                    "uid": "valid-piece",
+                    "inventoryID": "g1",
+                    "altitude": 0,
+                    "rotation": 0,
+                    "pieceCoords": {"q": 0, "r": 0, "s": 0}
+                },
+                {
+                    "uid": "extreme-piece",
+                    "inventoryID": inventory_id,
+                    "altitude": altitude,
+                    "rotation": rotation,
+                    "pieceCoords": {"q": q, "r": r, "s": 0}
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    fn assert_legacy_map_coordinate_overflow(name: &str, q: i32, r: i32, rotation: i32) {
+        let match_id = format!("{name}_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry.load_batch(&format!("[{PRESERVATION_PROFILE}]")).unwrap();
+        let before = serde_json::to_value(&*registry.templates.read().unwrap()).unwrap();
+
+        let error = try_initialize_from_hexoscape_with_registry(
+            match_id.clone(),
+            &coordinate_test_map("g7", q, r, 0, rotation),
+            &registry,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Hexoscape map coordinate out of range: piece 'extreme-piece'");
+        assert!(!match_exists(&match_id));
+        assert!(!MATCH_FLOWS.lock().unwrap().contains_key(&match_id));
+        assert_eq!(serde_json::to_value(&*registry.templates.read().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_map_rejects_i32_max_q_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_max_q", i32::MAX, 0, 0);
+    }
+
+    #[test]
+    fn legacy_map_rejects_i32_min_q_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_min_q", i32::MIN, 0, 0);
+    }
+
+    #[test]
+    fn legacy_map_rejects_i32_max_r_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_max_r", 0, i32::MAX, 0);
+    }
+
+    #[test]
+    fn legacy_map_rejects_rotated_i32_min_r_without_committing() {
+        assert_legacy_map_coordinate_overflow("legacy_map_min_r", 0, i32::MIN, 3);
+    }
+
+    #[test]
+    fn legacy_map_rotation_preserves_offsets_for_all_steps_and_extreme_rotations() {
+        let expected = [
+            vec![(0, 0), (1, 0), (0, 1)],
+            vec![(0, 0), (0, 1), (-1, 1)],
+            vec![(0, 0), (-1, 1), (-1, 0)],
+            vec![(0, 0), (-1, 0), (0, -1)],
+            vec![(0, 0), (0, -1), (1, -1)],
+            vec![(0, 0), (1, -1), (1, 0)],
+        ];
+        for rotation in [-7, -6, -1, 0, 1, 2, 3, 4, 5, 6, 7, i32::MIN, i32::MAX] {
+            assert_eq!(
+                get_hex_footprint_offsets("g3", rotation),
+                expected[rotation.rem_euclid(6) as usize]
+            );
+        }
+        for inventory_id in [
+            "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g24",
+            "straight3", "straight4", "wallWalk7", "wallWalk9",
+        ] {
+            for rotation in 0..6 {
+                assert!(checked_hex_footprint_offsets(inventory_id, rotation).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_map_accepts_large_valid_coordinates_and_extreme_altitudes() {
+        for (index, (inventory_id, q, r, altitude, rotation)) in [
+            ("g7", i32::MAX - 1, i32::MAX - 2, i32::MAX, 0),
+            ("g7", i32::MIN + 1, i32::MIN, i32::MIN, 0),
+            ("g1", i32::MAX, i32::MIN, i32::MAX, i32::MAX),
+            ("g1", i32::MIN, i32::MAX, i32::MIN, i32::MIN),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let match_id = format!("legacy_map_valid_{index}_{}", std::process::id());
+            let registry = ModRegistry::default();
+            try_initialize_from_hexoscape_with_registry(
+                match_id.clone(),
+                &coordinate_test_map(inventory_id, q, r, altitude, rotation),
+                &registry,
+            )
+            .unwrap();
+
+            {
+                let matches = ACTIVE_MATCHES.lock().unwrap();
+                let state = &matches[&match_id];
+                let offsets = get_hex_footprint_offsets(inventory_id, rotation);
+                for (tile_index, (dq, dr)) in offsets.iter().enumerate() {
+                    let spatial = &state.entities[&format!("TILE_extreme-piece_{tile_index}")].spatial;
+                    assert_eq!(i64::from(spatial.q), i64::from(q) + i64::from(*dq));
+                    assert_eq!(i64::from(spatial.r), i64::from(r) + i64::from(*dr));
+                    assert_eq!(spatial.z, altitude);
+                }
+                let units: Vec<_> = state.entities.values().filter(|entity| is_unit(entity)).collect();
+                assert_eq!(units.len(), (offsets.len() + 1).min(6));
+                assert!(units.iter().any(|unit| unit.spatial.z == altitude));
+                assert!(units.iter().all(|unit| state.entities.values().any(|tile| {
+                    matches!(tile.components.get("terrain"), Some(Component::Terrain { .. }))
+                        && (tile.spatial.q, tile.spatial.r, tile.spatial.z)
+                            == (unit.spatial.q, unit.spatial.r, unit.spatial.z)
+                })));
+            }
+            remove_match(&match_id);
+        }
+    }
+
     #[test]
     fn test_mod_aware_setup_fails_on_missing_registry_profile() {
         let match_id = format!("missing_mod_profile_test_{}", std::process::id());
@@ -1140,6 +2146,334 @@ mod tests {
 
         assert!(error.contains("unknown mod_id 'com.fake.unit'"));
         assert!(!match_exists(&match_id));
+    }
+
+    const PRESERVATION_PROFILE: &str = r#"{
+        "schema_version": 1,
+        "mod_id": "com.example.preservation",
+        "display_name": "Preserved Unit",
+        "visual_primitive": "CUBE",
+        "components": {
+            "destructible": {"current_life": 12, "max_life": 12},
+            "tags": ["Unit", "Heavy"]
+        }
+    }"#;
+
+    const UNKNOWN_MOD_MAP: &str = r#"{
+        "hexMap": {},
+        "boardPieces": [{
+            "uid": "replacement",
+            "inventoryID": "g7",
+            "altitude": 0,
+            "rotation": 0,
+            "pieceCoords": {"q": 0, "r": 0, "s": 0}
+        }],
+        "starterUnits": [{
+            "id": "REPLACEMENT_UNIT",
+            "mod_id": "com.unknown.preservation",
+            "seat": "P1"
+        }]
+    }"#;
+
+    #[derive(Debug, PartialEq)]
+    struct PreservationState {
+        snapshot: String,
+        flow: MatchFlow,
+        active_seat: String,
+        turn_phase: TurnPhase,
+        registry: serde_json::Value,
+    }
+
+    fn preservation_state(match_id: &str, registry: &ModRegistry) -> PreservationState {
+        let (snapshot, active_seat, turn_phase) = {
+            let matches = ACTIVE_MATCHES.lock().unwrap();
+            let state = &matches[match_id];
+            (
+                serde_json::to_string(state).unwrap(),
+                state.context.active_player.clone(),
+                state.context.turn_phase,
+            )
+        };
+        PreservationState {
+            snapshot,
+            flow: get_match_flow(match_id).unwrap(),
+            active_seat,
+            turn_phase,
+            registry: serde_json::to_value(&*registry.templates.read().unwrap()).unwrap(),
+        }
+    }
+
+    fn changed_preservation_match(name: &str) -> (String, ModRegistry) {
+        let match_id = format!("{name}_{}", std::process::id());
+        let registry = ModRegistry::default();
+        assert_eq!(
+            registry
+                .load_batch(&format!("[{PRESERVATION_PROFILE}]"))
+                .unwrap(),
+            1
+        );
+        store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
+        let initial = preservation_state(&match_id, &registry);
+        deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            7,
+            &registry,
+        )
+        .unwrap();
+        let changed = preservation_state(&match_id, &registry);
+        assert_ne!(changed.snapshot, initial.snapshot);
+        let state: serde_json::Value = serde_json::from_str(&changed.snapshot).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P1_1"]["components"]["destructible"]["data"]["current_life"],
+            7
+        );
+        assert_eq!(state["context"]["setup_locked"], false);
+        (match_id, registry)
+    }
+
+    fn damage_preservation_match(match_id: &str, registry: &ModRegistry) {
+        process_action(match_id, "P1", "S").unwrap();
+        process_action(match_id, "P1", "A:HERO_P1:UNIT_P2_1").unwrap();
+        let state: serde_json::Value =
+            serde_json::from_str(&preservation_state(match_id, registry).snapshot).unwrap();
+        assert_eq!(
+            state["entities"]["UNIT_P2_1"]["components"]["destructible"]["data"]["current_life"],
+            3
+        );
+        assert_eq!(state["context"]["setup_locked"], true);
+        assert_eq!(state["context"]["turn_phase"], "end");
+    }
+
+    fn assert_legacy_map_overflow_preserves_damaged_match(name: &str, reset: bool) {
+        let (match_id, registry) = changed_preservation_match(name);
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        for (q, r, rotation) in [
+            (i32::MAX, 0, 0),
+            (i32::MIN, 0, 0),
+            (0, i32::MAX, 0),
+            (0, i32::MIN, 3),
+        ] {
+            let map_json = coordinate_test_map("g7", q, r, 0, rotation);
+            let error = if reset {
+                try_reset_from_hexoscape_with_registry(match_id.clone(), &map_json, &registry)
+            } else {
+                try_initialize_from_hexoscape_with_registry(match_id.clone(), &map_json, &registry)
+            }
+            .unwrap_err();
+
+            assert_eq!(error, "Hexoscape map coordinate out of range: piece 'extreme-piece'");
+            assert_eq!(preservation_state(&match_id, &registry), before);
+        }
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn legacy_map_overflow_setup_preserves_damaged_match_flow_and_registry() {
+        assert_legacy_map_overflow_preserves_damaged_match("legacy_map_failed_setup", false);
+    }
+
+    #[test]
+    fn legacy_map_overflow_reset_preserves_damaged_match_flow_and_registry() {
+        assert_legacy_map_overflow_preserves_damaged_match("legacy_map_failed_reset", true);
+    }
+
+    #[test]
+    fn failed_setup_unknown_mod_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_setup_unknown_mod");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            try_initialize_from_hexoscape_with_registry(match_id.clone(), UNKNOWN_MOD_MAP, &registry)
+                .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Starter unit 'REPLACEMENT_UNIT' references unknown mod_id 'com.unknown.preservation'"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_reset_unknown_mod_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_reset_unknown_mod");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            try_reset_from_hexoscape_with_registry(match_id.clone(), UNKNOWN_MOD_MAP, &registry)
+                .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Starter unit 'REPLACEMENT_UNIT' references unknown mod_id 'com.unknown.preservation'"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_reset_malformed_map_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_reset_malformed_map");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            try_reset_from_hexoscape_with_registry(match_id.clone(), "{", &registry).unwrap_err();
+
+        assert!(error.starts_with("Invalid Hexoscape map JSON:"), "{error}");
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    fn assert_failed_deploy_preserves_match(
+        name: &str,
+        slot: &str,
+        mod_id: &str,
+        seat: &str,
+        starting_life: i32,
+        expected_error: &str,
+    ) {
+        // A successful deployment changes the live match without locking setup, so
+        // these cases reach their own validation guards rather than the setup lock.
+        let (match_id, registry) = changed_preservation_match(name);
+        let before = preservation_state(&match_id, &registry);
+
+        let error =
+            deploy_profile_unit(&match_id, slot, mod_id, seat, starting_life, &registry).unwrap_err();
+
+        assert_eq!(error, expected_error);
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_deploy_unknown_slot_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_unknown_slot",
+            "MISSING_UNIT",
+            "com.example.preservation",
+            "P1",
+            7,
+            "Unknown roster unit: MISSING_UNIT",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_invalid_seat_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_invalid_seat",
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P3",
+            7,
+            "seat must be 'P1' or 'P2'",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_zero_life_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_zero_life",
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            0,
+            "starting health must be within 1..=12",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_above_max_life_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_above_max_life",
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            13,
+            "starting health must be within 1..=12",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_unknown_mod_preserves_existing_match_and_registry() {
+        assert_failed_deploy_preserves_match(
+            "failed_deploy_unknown_mod",
+            "UNIT_P1_1",
+            "com.unknown.preservation",
+            "P1",
+            7,
+            "Starter unit 'UNIT_P1_1' references unknown mod_id 'com.unknown.preservation'",
+        );
+    }
+
+    #[test]
+    fn failed_deploy_after_first_action_preserves_existing_match_and_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_deploy_after_first_action");
+        process_action(&match_id, "P1", "S").unwrap();
+        let before = preservation_state(&match_id, &registry);
+        let state: serde_json::Value = serde_json::from_str(&before.snapshot).unwrap();
+        assert_eq!(state["context"]["setup_locked"], true);
+        assert_eq!(before.turn_phase, TurnPhase::Attack);
+
+        let error = deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.preservation",
+            "P1",
+            12,
+            &registry,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Roster deployment is only allowed before the first referee action"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
+    }
+
+    #[test]
+    fn failed_batch_import_preserves_existing_match_and_entire_registry() {
+        let (match_id, registry) = changed_preservation_match("failed_batch_import");
+        damage_preservation_match(&match_id, &registry);
+        let before = preservation_state(&match_id, &registry);
+        let valid = PRESERVATION_PROFILE.replace("com.example.preservation", "com.example.new_unit");
+        let mut invalid: serde_json::Value = serde_json::from_str(PRESERVATION_PROFILE).unwrap();
+        invalid["mod_id"] = serde_json::json!("com.example.invalid_unit");
+        invalid["components"]["destructible"]["current_life"] = serde_json::json!(0);
+
+        let error = registry
+            .load_batch(&format!("[{valid},{invalid}]"))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "profile com.example.invalid_unit: destructible.current_life must be within 1..=max_life"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        let error = deploy_profile_unit(
+            &match_id,
+            "UNIT_P1_1",
+            "com.example.new_unit",
+            "P1",
+            7,
+            &registry,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "Starter unit 'UNIT_P1_1' references unknown mod_id 'com.example.new_unit'"
+        );
+        assert_eq!(preservation_state(&match_id, &registry), before);
+        remove_match(&match_id);
     }
 
     #[test]
@@ -1196,6 +2530,35 @@ mod tests {
                     && labels.iter().any(|label| label == "P2")
                     && !labels.iter().any(|label| label == "P1")
         ));
+    }
+
+    #[test]
+    fn schema_two_deployment_copies_combat_independently() {
+        let match_id = format!("schema_two_deployment_{}", std::process::id());
+        let registry = ModRegistry::default();
+        registry.load_batch(r#"[{
+            "schema_version": 2, "mod_id": "com.example.combat",
+            "display_name": "Combat Unit", "visual_primitive": "CUBE",
+            "components": {
+                "destructible": {"current_life": 5, "max_life": 5},
+                "tags": ["Unit"], "combat": {"attack": 9, "defense": 8, "damage_per_strike": 7}
+            }
+        }]"#).unwrap();
+        store_match(match_id.clone(), generate_test_sandbox(match_id.clone()));
+        deploy_profile_unit(&match_id, "UNIT_P1_1", "com.example.combat", "P1", 5, &registry).unwrap();
+        let combat = serde_json::json!({"type": "Combat", "data": {
+            "attack": 9, "defense": 8, "damage_per_strike": 7
+        }});
+        {
+            let mut templates = registry.templates.write().unwrap();
+            templates.get_mut("com.example.combat").unwrap().components.insert(
+                "combat".into(), Component::Combat { attack: 1, defense: 2, damage_per_strike: 3 }
+            );
+        }
+        let matches = ACTIVE_MATCHES.lock().unwrap();
+        assert_eq!(serde_json::to_value(&matches[&match_id].entities["UNIT_P1_1"].components["combat"]).unwrap(), combat);
+        drop(matches);
+        remove_match(&match_id);
     }
 
     #[test]
@@ -1897,5 +3260,158 @@ mod tests {
         let restored = &matches[&match_id];
         assert_eq!(restored.context.turn_phase, TurnPhase::Finished);
         assert_eq!(restored.context.winner.as_deref(), Some("P1"));
+    }
+
+    // ---- S2: the extracted builders keep the legacy behavior ----
+
+    const EQUALITY_MAPS: [&str; 3] = [
+        r#"{"hexMap": {"name": "default"}, "boardPieces": [
+            {"uid": "g7", "inventoryID": "g7", "altitude": 0, "rotation": 0,
+             "pieceCoords": {"q": 0, "r": 0, "s": 0}}]}"#,
+        r#"{"hexMap": {}, "boardPieces": [
+            {"uid": "a", "inventoryID": "r24", "altitude": 2, "rotation": 3,
+             "pieceCoords": {"q": 4, "r": -2, "s": -2}},
+            {"uid": "b", "inventoryID": "wallWalk9", "altitude": 0, "rotation": -1,
+             "pieceCoords": {"q": -3, "r": 1, "s": 2}},
+            {"uid": "c", "inventoryID": "s3", "altitude": 0, "rotation": 1,
+             "pieceCoords": {"q": 0, "r": 0, "s": 0}}],
+          "starterUnits": [
+            {"id": "MOD_P2", "mod_id": "com.example.preservation", "seat": "P2"},
+            {"id": "INLINE_P1", "player": "P1", "components": {
+                "tags": {"type": "Tags", "data": {"labels": ["Unit", "P1"]}},
+                "destructible": {"type": "Destructible", "data": {"current_life": 3, "max_life": 5}}}},
+            {"id": "MOD_P1", "mod_id": "com.example.preservation", "owner": "Player_1"}]}"#,
+        r#"{"hexMap": {}, "boardPieces": [
+            {"uid": "solo", "inventoryID": "g2", "altitude": 0, "rotation": 0,
+             "pieceCoords": {"q": 0, "r": 0, "s": 0}}],
+          "starterUnits": [{"id": "SOLO_P1", "seat": "P1", "components": {
+            "tags": {"type": "Tags", "data": {"labels": ["Unit", "P1"]}},
+            "destructible": {"type": "Destructible", "data": {"current_life": 2, "max_life": 2}}}}]}"#,
+    ];
+
+    fn equality_registry() -> ModRegistry {
+        let registry = ModRegistry::default();
+        registry.load_batch(&format!("[{PRESERVATION_PROFILE}]")).unwrap();
+        registry
+    }
+
+    fn built(match_id: &str, map_json: &str, registry: Option<&ModRegistry>) -> GameState {
+        build_map_state(match_id.into(), serde_json::from_str(map_json).unwrap(), registry).unwrap()
+    }
+
+    fn stored_value(match_id: &str) -> serde_json::Value {
+        serde_json::to_value(&ACTIVE_MATCHES.lock().unwrap()[match_id]).unwrap()
+    }
+
+    #[test]
+    fn legacy_initializers_match_extracted_map_builder() {
+        let registry = equality_registry();
+        for (index, map_json) in EQUALITY_MAPS.iter().enumerate() {
+            let init_id = format!("builder_equality_init_{index}_{}", std::process::id());
+            let reset_id = format!("builder_equality_reset_{index}_{}", std::process::id());
+            try_initialize_from_hexoscape_with_registry(init_id.clone(), map_json, &registry).unwrap();
+            store_match(reset_id.clone(), generate_test_sandbox(reset_id.clone()));
+            process_action(&reset_id, "P1", "S").unwrap();
+            try_reset_from_hexoscape_with_registry(reset_id.clone(), map_json, &registry).unwrap();
+            for match_id in [&init_id, &reset_id] {
+                let staged = built(match_id, map_json, Some(&registry));
+                assert_eq!(stored_value(match_id), serde_json::to_value(&staged).unwrap());
+                assert_eq!(get_match_flow(match_id).unwrap(), MatchFlow::reference(&staged.context).unwrap());
+                remove_match(match_id);
+            }
+        }
+        // The registry-free legacy entry point.
+        let match_id = format!("builder_equality_plain_{}", std::process::id());
+        initialize_from_hexoscape(match_id.clone(), serde_json::from_str(EQUALITY_MAPS[0]).unwrap());
+        assert_eq!(
+            stored_value(&match_id),
+            serde_json::to_value(built(&match_id, EQUALITY_MAPS[0], None)).unwrap()
+        );
+        remove_match(&match_id);
+        assert_eq!(
+            build_map_state("x".into(), serde_json::from_str(EQUALITY_MAPS[1]).unwrap(), None)
+                .unwrap_err(),
+            "Starter unit 'MOD_P2' references mod 'com.example.preservation', but no mod registry was provided"
+        );
+    }
+
+    #[test]
+    fn staged_deployment_matches_deploy_profile_unit_results_errors_and_flow() {
+        let registry = equality_registry();
+        let mod_id = "com.example.preservation";
+        let match_id = format!("staged_deploy_equality_{}", std::process::id());
+        try_initialize_from_hexoscape_with_registry(match_id.clone(), EQUALITY_MAPS[0], &registry).unwrap();
+        let mut staged = built(&match_id, EQUALITY_MAPS[0], Some(&registry));
+
+        for (slot, seat, life) in [("UNIT_P1_1", "P1", 12), ("HERO_P2", "P2", 5), ("UNIT_P1_1", "P1", 3)] {
+            assert_eq!(
+                deploy_profile_unit(&match_id, slot, mod_id, seat, life, &registry),
+                stage_profile_deployment(&mut staged, slot, mod_id, seat, life, &registry)
+            );
+            assert_eq!(stored_value(&match_id), serde_json::to_value(&staged).unwrap());
+        }
+        let before = stored_value(&match_id);
+        for (slot, profile, seat, life) in [
+            ("MISSING_UNIT", mod_id, "P1", 7),
+            ("TILE_g7_0", mod_id, "P1", 7),
+            ("UNIT_P1_1", mod_id, "P2", 7),
+            ("UNIT_P1_1", mod_id, "P3", 7),
+            ("UNIT_P1_1", mod_id, "P1", 0),
+            ("UNIT_P1_1", mod_id, "P1", 13),
+            ("UNIT_P1_1", "com.unknown.preservation", "P1", 7),
+        ] {
+            let live = deploy_profile_unit(&match_id, slot, profile, seat, life, &registry);
+            assert!(live.is_err());
+            assert_eq!(live, stage_profile_deployment(&mut staged, slot, profile, seat, life, &registry));
+            assert_eq!(stored_value(&match_id), before);
+            assert_eq!(serde_json::to_value(&staged).unwrap(), before);
+        }
+        process_action(&match_id, "P1", "S").unwrap();
+        staged.context.setup_locked = true;
+        assert_eq!(
+            deploy_profile_unit(&match_id, "UNIT_P1_2", mod_id, "P1", 7, &registry),
+            stage_profile_deployment(&mut staged, "UNIT_P1_2", mod_id, "P1", 7, &registry)
+        );
+        remove_match(&match_id);
+
+        // A deployment that leaves one seat with no units finishes the match; the flow
+        // derived from the staged context equals the live flow after `finish()`.
+        let solo_id = format!("staged_deploy_victory_{}", std::process::id());
+        try_initialize_from_hexoscape_with_registry(solo_id.clone(), EQUALITY_MAPS[2], &registry).unwrap();
+        let mut solo = built(&solo_id, EQUALITY_MAPS[2], Some(&registry));
+        assert_eq!(
+            deploy_profile_unit(&solo_id, "SOLO_P1", mod_id, "P1", 4, &registry),
+            stage_profile_deployment(&mut solo, "SOLO_P1", mod_id, "P1", 4, &registry)
+        );
+        assert_eq!(solo.context.turn_phase, TurnPhase::Finished);
+        assert_eq!(stored_value(&solo_id), serde_json::to_value(&solo).unwrap());
+        assert_eq!(get_match_flow(&solo_id).unwrap(), MatchFlow::reference(&solo.context).unwrap());
+        remove_match(&solo_id);
+    }
+
+    /// Source check of the documented lock order: in every non-test function of this
+    /// file that locks MATCH_FLOWS, ACTIVE_MATCHES is named earlier in the same function.
+    /// MATCH_FLOWS is private to this file, so no other module can lock it. This is a
+    /// textual check, not a runtime lock-order detector.
+    #[test]
+    fn match_flows_is_never_locked_before_active_matches() {
+        let source = include_str!("engine.rs");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod ").unwrap()];
+        let mut sites = 0;
+        for (position, _) in production.match_indices("MATCH_FLOWS.lock()") {
+            let function_start = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|marker| production[..position].rfind(marker))
+                .max()
+                .unwrap();
+            let body = &production[function_start..position];
+            assert!(
+                body.contains("ACTIVE_MATCHES"),
+                "MATCH_FLOWS locked before ACTIVE_MATCHES in: {}",
+                body.lines().nth(1).unwrap_or_default()
+            );
+            sites += 1;
+        }
+        assert_eq!(sites, 8, "update this check when lock sites change");
     }
 }

@@ -51,7 +51,7 @@ pub fn wasm_deploy_profile_unit(
     seat: String,
     starting_life: i32,
 ) -> Result<String, JsValue> {
-    engine::deploy_profile_unit(
+    engine::deploy_profile_unit_recorded(
         &match_id,
         &slot_unit_id,
         &mod_id,
@@ -60,6 +60,69 @@ pub fn wasm_deploy_profile_unit(
         &MOD_REGISTRY,
     )
     .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_export_local_sandbox(match_id: String) -> Result<String, JsValue> {
+    crate::local_sandbox::export_local_sandbox(&match_id, &MOD_REGISTRY)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_restore_local_sandbox(match_id: String, record_json: String) -> Result<u32, JsValue> {
+    crate::local_sandbox::restore_local_sandbox(&match_id, &record_json, &MOD_REGISTRY)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_apply_setup(match_id: String, setup_json: String) -> Result<(), JsValue> {
+    crate::setup::apply_setup(match_id, &setup_json, &MOD_REGISTRY)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_check_setup(setup_json: String) -> String {
+    crate::setup::check_setup(&setup_json)
+}
+
+fn apply_setup_v2(match_id: String, setup_json: &str, seed_hex: &str, allow_over_cap: bool) -> Result<(), String> {
+    if seed_hex.len() != 16 || !seed_hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("seed_hex must be exactly 16 lowercase hexadecimal characters".into());
+    }
+    let seed = u64::from_str_radix(seed_hex, 16).expect("hex checked");
+    let approval = crate::setup::Approval::LocalSandbox;
+    if allow_over_cap {
+        crate::setup::apply_setup_with_seed_allowing_over_cap(match_id, setup_json, &MOD_REGISTRY, seed, approval)
+    } else {
+        crate::setup::apply_setup_with_seed(match_id, setup_json, &MOD_REGISTRY, seed, approval)
+    }
+}
+
+#[wasm_bindgen]
+pub fn wasm_apply_setup_v2(match_id: String, setup_json: String, seed_hex: String, allow_over_cap: bool) -> Result<(), JsValue> {
+    apply_setup_v2(match_id, &setup_json, &seed_hex, allow_over_cap)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_query_deploy(match_id: String, slot: String, mod_id: String, seat: String, starting_health: i32) -> String {
+    engine::query_deploy(&match_id, &slot, &mod_id, &seat, starting_health, &MOD_REGISTRY)
+}
+
+#[wasm_bindgen]
+pub fn wasm_deploy_profile_unit_allowing_over_cap(match_id: String, slot: String, mod_id: String, seat: String, starting_health: i32) -> Result<String, JsValue> {
+    engine::deploy_profile_unit_allowing_over_cap(&match_id, &slot, &mod_id, &seat, starting_health, &MOD_REGISTRY, crate::setup::Approval::LocalSandbox)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_get_combat_state(match_id: String) -> Result<String, JsValue> {
+    engine::combat_state(&match_id).map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub fn wasm_export_setup(match_id: String) -> Result<String, JsValue> {
+    crate::setup::export_setup(&match_id, &MOD_REGISTRY).map_err(|error| JsValue::from_str(&error))
 }
 
 #[wasm_bindgen]
@@ -102,12 +165,50 @@ fn error_json(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        initialize_match, wasm_deploy_profile_unit, wasm_get_current_state, wasm_initialize_match,
-        wasm_load_mod_profiles, wasm_process_token_for_match, wasm_reset_match,
+        MOD_REGISTRY, initialize_match, wasm_apply_setup, wasm_deploy_profile_unit,
+        wasm_export_local_sandbox, wasm_export_setup, wasm_get_current_state,
+        wasm_initialize_match, wasm_load_mod_profiles, wasm_process_token_for_match,
+        wasm_reset_match,
     };
+
+    // Applying a setup replaces the page-wide registry, so registry users must not run in parallel.
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn b7_bridge_seed_consent_and_legacy_combat_state() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let id = "b7_bridge";
+        let legacy = r#"{"hexMap":{},"boardPieces":[{"uid":"g7","inventoryID":"g7","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}}]}"#;
+        super::initialize_match(id.into(), legacy).unwrap();
+        let before = super::wasm_get_current_state(id.into());
+        assert_eq!(super::wasm_get_combat_state(id.into()).unwrap(), "{\"combat\": null}");
+        let source = serde_json::json!({
+            "setup_version":2, "name":"bridge", "terrain_types":[{"id":"grass","name":"Grass"}],
+            "map":{"hexMap":{},"boardPieces":[{"uid":"a","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}},
+                {"uid":"b","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":1,"r":0,"s":-1}}],
+                "starterUnits":[
+                    {"id":"UNIT_P1_1","seat":"P1","components":{"tags":["Unit","P1"],"destructible":{"current_life":4,"max_life":4},"combat":{"attack":1,"defense":1}}},
+                    {"id":"UNIT_P2_1","seat":"P2","components":{"tags":["Unit","P2"],"destructible":{"current_life":4,"max_life":4},"combat":{"attack":1,"defense":1}}}]},
+            "profiles":[], "roster":[], "rules":{"health_cap":{"max_health":3}}
+        }).to_string();
+        for seed in ["", "000000000000000", "000000000000000A", "000000000000000g", "00000000000000000"] {
+            assert!(super::apply_setup_v2(id.into(), &source, seed, true).is_err());
+            assert_eq!(super::wasm_get_current_state(id.into()), before);
+        }
+        assert!(super::apply_setup_v2(id.into(), &source, "0000000000000001", false).is_err());
+        assert_eq!(super::wasm_get_current_state(id.into()), before);
+        let checked: serde_json::Value = serde_json::from_str(&super::wasm_check_setup(source.clone())).unwrap();
+        assert_eq!(checked["over_cap"].as_array().unwrap().len(), 2);
+        super::apply_setup_v2(id.into(), &source, "0000000000000001", true).unwrap();
+        super::wasm_apply_setup_v2(id.into(), source, "0000000000000001".into(), true).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&super::wasm_get_combat_state(id.into()).unwrap()).unwrap();
+        assert_eq!(state["house_rules"].as_array().unwrap().len(), 2);
+        crate::engine::remove_match(id);
+    }
 
     #[test]
     fn wasm_api_initializes_queries_and_processes_moves() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let match_id = format!("wasm_bridge_test_{}", std::process::id());
         let map_json = r#"{
             "hexMap": {"name": "wasm-test"},
@@ -170,12 +271,14 @@ mod tests {
 
     #[test]
     fn wasm_initializer_reports_invalid_map_data() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let error = initialize_match("invalid_map".to_string(), "not json").unwrap_err();
         assert!(error.contains("Invalid Hexoscape map JSON"));
     }
 
     #[test]
     fn wasm_mod_profile_loader_accepts_a_single_profile_object() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let mod_id = format!("com.example.wasm_{}", std::process::id());
         let profile_json = format!(
             r#"{{
@@ -218,6 +321,7 @@ mod tests {
 
     #[test]
     fn wasm_profile_deployment_updates_the_authoritative_match_snapshot() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let mod_id = format!("com.example.wasm_deploy_{}", std::process::id());
         let profile = format!(
             r#"[{{
@@ -278,6 +382,7 @@ mod tests {
 
     #[test]
     fn wasm_reset_replaces_existing_match_snapshot() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         let match_id = format!("wasm_reset_test_{}", std::process::id());
         let map_json = r#"{
             "hexMap": {},
@@ -300,5 +405,177 @@ mod tests {
         let state: serde_json::Value =
             serde_json::from_str(&wasm_get_current_state(match_id)).unwrap();
         assert_eq!(state["entities"]["UNIT_P1_2"]["spatial"], initial_position);
+    }
+
+    #[test]
+    fn wasm_exported_local_sandbox_restores_through_the_core() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let mod_id = format!("com.example.wasm_saved_{}", std::process::id());
+        let profile = format!(
+            r#"{{
+                "schema_version": 1,
+                "mod_id": "{mod_id}",
+                "display_name": "Saved Goliath",
+                "visual_primitive": "CUBE",
+                "components": {{
+                    "destructible": {{"current_life": 12, "max_life": 12}},
+                    "tags": ["Unit", "Heavy"]
+                }}
+            }}"#
+        );
+        assert_eq!(wasm_load_mod_profiles(profile).unwrap(), 1);
+        let match_id = format!("wasm_saved_match_{}", std::process::id());
+        let map_json = r#"{
+            "hexMap": {},
+            "boardPieces": [{
+                "uid": "g7",
+                "inventoryID": "g7",
+                "altitude": 0,
+                "rotation": 0,
+                "pieceCoords": {"q": 0, "r": 0, "s": 0}
+            }]
+        }"#;
+        wasm_initialize_match(match_id.clone(), map_json.to_string()).unwrap();
+        wasm_deploy_profile_unit(match_id.clone(), "HERO_P2".into(), mod_id.clone(), "P2".into(), 12)
+            .unwrap();
+        wasm_deploy_profile_unit(match_id.clone(), "UNIT_P1_1".into(), mod_id.clone(), "P1".into(), 12)
+            .unwrap();
+        for token in ["M:UNIT_P1_2:Q0R2Z0", "A:UNIT_P1_1:HERO_P2"] {
+            assert!(wasm_process_token_for_match(match_id.clone(), "P1".into(), token.into())
+                .starts_with("VALID_STEP:"));
+        }
+        let before: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
+        let record = wasm_export_local_sandbox(match_id.clone()).unwrap();
+        crate::engine::remove_match(&match_id);
+
+        let fresh_page_registry = crate::mod_registry::ModRegistry::default();
+        crate::local_sandbox::restore_local_sandbox(&match_id, &record, &fresh_page_registry)
+            .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            after["entities"]["HERO_P2"]["components"]["destructible"]["data"]["current_life"],
+            11
+        );
+        assert!(fresh_page_registry.get_template(&mod_id).is_ok());
+        assert!(wasm_process_token_for_match(match_id.clone(), "P2".into(), "E".into())
+            .starts_with("E:"));
+        assert_eq!(
+            wasm_process_token_for_match(match_id.clone(), "P1".into(), "E".into()),
+            "VALID_STEP:E"
+        );
+        crate::engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn wasm_setup_wrappers_replace_profiles_and_export_starting_health() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let match_id = format!("wasm_setup_{}", std::process::id());
+        wasm_initialize_match(
+            match_id.clone(),
+            r#"{"hexMap":{},"boardPieces":[{"uid":"g7","inventoryID":"g7",
+            "altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}}]}"#
+                .into(),
+        )
+        .unwrap();
+        let original: serde_json::Value =
+            serde_json::from_str(&wasm_export_setup(match_id.clone()).unwrap()).unwrap();
+        assert_eq!(original["setup_version"], 1);
+        assert_eq!(original["profiles"], serde_json::json!([]));
+        assert_eq!(original["roster"], serde_json::json!([]));
+
+        let mut setup = original;
+        setup["name"] = "WASM setup".into();
+        setup["profiles"] = serde_json::json!([{
+            "schema_version": 1,
+            "mod_id": "com.example.wasm_setup",
+            "display_name": "Setup Goliath",
+            "visual_primitive": "CUBE",
+            "components": {
+                "destructible": {"current_life": 12, "max_life": 12},
+                "tags": ["Unit"]
+            }
+        }]);
+        setup["roster"] = serde_json::json!([
+            {"slot": "UNIT_P1_1", "seat": "P1", "profile": "com.example.wasm_setup", "starting_health": 12},
+            {"slot": "HERO_P2", "seat": "P2", "profile": "com.example.wasm_setup", "starting_health": 10}
+        ]);
+        wasm_apply_setup(match_id.clone(), setup.to_string()).unwrap();
+        for token in ["M:UNIT_P1_2:Q0R2Z0", "A:UNIT_P1_1:HERO_P2"] {
+            assert!(
+                wasm_process_token_for_match(match_id.clone(), "P1".into(), token.into())
+                    .starts_with("VALID_STEP:")
+            );
+        }
+        let state: serde_json::Value =
+            serde_json::from_str(&wasm_get_current_state(match_id.clone())).unwrap();
+        assert_eq!(
+            state["entities"]["HERO_P2"]["components"]["destructible"]["data"]["current_life"],
+            9
+        );
+        let exported: serde_json::Value =
+            serde_json::from_str(&wasm_export_setup(match_id.clone()).unwrap()).unwrap();
+        let hero = exported["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["slot"] == "HERO_P2")
+            .unwrap();
+        assert_eq!(hero["starting_health"], 10);
+        assert_eq!(exported["profiles"].as_array().unwrap().len(), 1);
+        let record = wasm_export_local_sandbox(match_id.clone()).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(saved["setup"]["name"], exported["name"]);
+        assert_eq!(saved["setup"]["map"], exported["map"]);
+        assert_eq!(saved["profiles"].as_array().unwrap().len(), 1);
+        let fresh_registry = crate::mod_registry::ModRegistry::default();
+        crate::local_sandbox::restore_local_sandbox(&match_id, &record, &fresh_registry).unwrap();
+        let restored_setup: serde_json::Value =
+            serde_json::from_str(&crate::setup::export_setup(&match_id, &fresh_registry).unwrap())
+                .unwrap();
+        assert_eq!(restored_setup, exported);
+
+        // JsValue errors cannot be constructed natively; exercise the identical core call.
+        let mut refused = setup.clone();
+        refused["rules"] = serde_json::json!({});
+        let error =
+            crate::setup::apply_setup(match_id.clone(), &refused.to_string(), &MOD_REGISTRY)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            "invalid setup: unknown field 'rules', expected one of 'setup_version', 'name', 'map', 'profiles', 'roster'"
+        );
+        let after_refusal: serde_json::Value =
+            serde_json::from_str(&wasm_export_local_sandbox(match_id.clone()).unwrap()).unwrap();
+        assert_eq!(after_refusal, saved);
+
+        setup["profiles"] = serde_json::json!([]);
+        setup["roster"] = serde_json::json!([]);
+        wasm_apply_setup(match_id.clone(), setup.to_string()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&wasm_export_local_sandbox(match_id.clone()).unwrap()).unwrap();
+        assert_eq!(saved["profiles"], serde_json::json!([]));
+        crate::engine::remove_match(&match_id);
+    }
+
+    #[test]
+    fn setup_export_core_error_is_preserved_without_native_jsvalue() {
+        let registry = crate::mod_registry::ModRegistry::default();
+        assert_eq!(
+            crate::setup::export_setup("wasm_setup_missing", &registry).unwrap_err(),
+            "Unknown match: wasm_setup_missing"
+        );
+        let match_id = format!("wasm_setup_no_record_{}", std::process::id());
+        crate::engine::store_match(
+            match_id.clone(),
+            crate::engine::generate_test_sandbox(match_id.clone()),
+        );
+        assert_eq!(
+            crate::setup::export_setup(&match_id, &registry).unwrap_err(),
+            "setup: this match has no setup record"
+        );
+        crate::engine::remove_match(&match_id);
     }
 }

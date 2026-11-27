@@ -16,7 +16,9 @@ export default defineConfig(() => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: true, // 🛠️ Add this line to force Vite to accept local network connections!
+    // Opt in to LAN access: VITE_DEV_NETWORK=1 npm --prefix client run dev
+    // Tauri's explicit development host takes precedence (including for HMR).
+    host: host || (process.env.VITE_DEV_NETWORK === "1" ? true : "127.0.0.1"),
     hmr: host
       ? {
         protocol: "ws",

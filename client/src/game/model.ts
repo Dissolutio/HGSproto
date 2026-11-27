@@ -2,6 +2,7 @@ import type {
   EngineComponent,
   EngineEntity,
   EngineState,
+  ModProfileSummary,
   PlayerSeat,
   Position,
   RenderEntity,
@@ -111,6 +112,24 @@ export function profileHealth(profile: Record<string, unknown>) {
     throw new Error("Each unit profile needs valid destructible current_life and max_life values");
   }
   return { currentHealth, maxHealth };
+}
+
+export function summarizeProfiles(profiles: unknown[]): ModProfileSummary[] {
+  return profiles.map((profile): ModProfileSummary => {
+    if (!isRecord(profile)) {
+      throw new Error("Each mod profile must be a JSON object");
+    }
+    return {
+      modId: typeof profile.mod_id === "string" ? profile.mod_id : "Unknown mod ID",
+      displayName:
+        typeof profile.display_name === "string" ? profile.display_name : "Unnamed profile",
+      visualPrimitive:
+        typeof profile.visual_primitive === "string"
+          ? profile.visual_primitive
+          : "Unknown primitive",
+      ...profileHealth(profile),
+    };
+  });
 }
 
 export function terrainFromEntities(entities: RenderEntity[]): TerrainData[] {

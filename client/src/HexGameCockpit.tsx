@@ -11,17 +11,21 @@ export default function HexGameCockpit() {
     state: {
       mode, gameState, selectedUnitId, actionPending, endTurnAfterSkip, inspectedEntity,
       connection, notice, socket, localNodeId, localMatchId, remoteNodeId,
+      sandboxRestoreNotice, setSandboxRestoreNotice,
       isPeerConnected, joinNodeId, setJoinNodeId, recoverySession, setRecoveryDismissed,
     },
     view: {
       terrain, units, deploymentSlots, deploymentSlot, selectedProfile, activeSeat,
       turnPhase, winner, playerSeat, isYourTurn, canAct, attackTargetIds,
       playerOneCount, playerTwoCount, ruleHint, showRecoveryBanner, healthLabelElements,
+      combatState,
     },
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
+      profileLoadFeedback, profileDeployFeedback,
+      setupFeedback, setupBusy, handleExportSetup, handleLoadSetup, pendingSetup, handleAllowSetup,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
-      setStartingHealth, loadModProfiles, handleDeployProfile,
+      setStartingHealth, loadModProfiles, handleDeployProfile, pendingDeploy, handleStartFreshSandbox,
     },
     actions: {
       chooseMode, clearSelection, submitAction, handleEndTurn, selectUnit, handleHexClick,
@@ -42,6 +46,9 @@ export default function HexGameCockpit() {
         onReconnect={handleGracefulReconnection}
         onDismissRecovery={() => setRecoveryDismissed(true)}
         notice={notice}
+        sandboxRestoreNotice={sandboxRestoreNotice}
+        onDismissSandboxRestore={() => setSandboxRestoreNotice(null)}
+        onStartFreshSandbox={handleStartFreshSandbox}
         terrainCount={terrain.length}
         unitCount={units.length}
         playerSeat={playerSeat}
@@ -54,6 +61,7 @@ export default function HexGameCockpit() {
         canAct={canAct}
         selectedUnitId={selectedUnitId}
         attackTargetCount={attackTargetIds.size}
+        diceGame={!!combatState}
         ruleHint={ruleHint}
         endTurnPending={!!endTurnAfterSkip}
         onClearSelection={clearSelection}
@@ -74,12 +82,13 @@ export default function HexGameCockpit() {
           clearSelection();
         }}
       >
-        <InspectorPanel entity={inspectedEntity}>
+        <InspectorPanel entity={inspectedEntity} combatState={combatState} terrain={terrain}>
           <ModProfilePanel
             profileText={modProfileText}
             onProfileTextChange={setModProfileText}
             enabled={mode === "wasm" && connection === "ready"}
             onLoadProfiles={loadModProfiles}
+            loadFeedback={profileLoadFeedback}
             loadedProfiles={loadedModProfiles}
             selectedProfile={selectedProfile ?? null}
             onSelectProfile={(modId) => {
@@ -97,9 +106,17 @@ export default function HexGameCockpit() {
             onDeploymentSlotChange={setDeploymentSlotId}
             startingHealth={startingHealth}
             onStartingHealthChange={setStartingHealth}
-            onDeployProfile={handleDeployProfile}
+            onDeployProfile={() => handleDeployProfile()}
+            onAllowDeploy={pendingDeploy ? () => handleDeployProfile(true) : undefined}
+            deployFeedback={profileDeployFeedback}
             setupLocked={!!gameState?.context?.setup_locked}
             matchFinished={!!gameState?.context?.winner}
+            onStartFresh={handleStartFreshSandbox}
+            onExportSetup={handleExportSetup}
+            onLoadSetup={handleLoadSetup}
+            setupFeedback={setupFeedback}
+            setupBusy={setupBusy}
+            onAllowSetup={pendingSetup ? handleAllowSetup : undefined}
           />
           <NetworkPortal
             mode={mode}

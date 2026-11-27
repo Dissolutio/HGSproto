@@ -12,6 +12,9 @@ type GameHudProps = {
   onReconnect: () => void;
   onDismissRecovery: () => void;
   notice: string;
+  sandboxRestoreNotice?: string | null;
+  onDismissSandboxRestore?: () => void;
+  onStartFreshSandbox?: () => void;
   terrainCount: number;
   unitCount: number;
   playerSeat: PlayerSeat | null;
@@ -24,6 +27,7 @@ type GameHudProps = {
   canAct: boolean;
   selectedUnitId: string | null;
   attackTargetCount: number;
+  diceGame?: boolean;
   ruleHint: string;
   endTurnPending: boolean;
   onClearSelection: () => void;
@@ -42,6 +46,9 @@ export function GameHud({
   onReconnect,
   onDismissRecovery,
   notice,
+  sandboxRestoreNotice,
+  onDismissSandboxRestore,
+  onStartFreshSandbox,
   terrainCount,
   unitCount,
   playerSeat,
@@ -54,6 +61,7 @@ export function GameHud({
   canAct,
   selectedUnitId,
   attackTargetCount,
+  diceGame,
   ruleHint,
   endTurnPending,
   onClearSelection,
@@ -152,6 +160,23 @@ export function GameHud({
         </aside>
       )}
 
+      {sandboxRestoreNotice && (
+        <aside role="alert" style={styles.recoveryBanner}>
+          <span style={styles.notice}>{sandboxRestoreNotice}</span>
+          <button type="button" onClick={onStartFreshSandbox} style={styles.reconnectButton}>
+            Start Fresh Sandbox
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss sandbox restore notification"
+            onClick={onDismissSandboxRestore}
+            style={styles.dismissButton}
+          >
+            ×
+          </button>
+        </aside>
+      )}
+
       <section style={styles.toolbar} aria-live="polite">
         <span style={styles.notice}>{notice}</span>
         <span style={styles.counts}>{terrainCount} hexes <i /> {unitCount} units</span>
@@ -218,7 +243,7 @@ export function GameHud({
         <span style={styles.ruleHint}>
           {turnPhase === "attack" && selectedUnitId
             ? attackTargetCount
-              ? `${attackTargetCount} valid target(s): click a red highlighted enemy to attack for 1 damage.`
+              ? `${attackTargetCount} valid target(s): click a red highlighted enemy to attack${diceGame ? " (dice roll)" : " for 1 damage"}.`
               : "No adjacent enemies on the same level. Select another friendly unit or skip attack."
             : ruleHint}
           {" "}Right-click the board or press Escape to cancel selection.
