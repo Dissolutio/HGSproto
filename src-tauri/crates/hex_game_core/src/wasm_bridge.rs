@@ -75,6 +75,14 @@ pub fn wasm_restore_local_sandbox(match_id: String, record_json: String) -> Resu
 }
 
 #[wasm_bindgen]
+pub fn wasm_restore_local_sandbox_report(match_id: String, record_json: String) -> Result<String, JsValue> {
+    let (profiles, setup_dropped) =
+        crate::local_sandbox::restore_local_sandbox_with_report(&match_id, &record_json, &MOD_REGISTRY)
+            .map_err(|error| JsValue::from_str(&error))?;
+    Ok(serde_json::json!({ "profiles": profiles, "setup_dropped": setup_dropped }).to_string())
+}
+
+#[wasm_bindgen]
 pub fn wasm_apply_setup(match_id: String, setup_json: String) -> Result<(), JsValue> {
     crate::setup::apply_setup(match_id, &setup_json, &MOD_REGISTRY)
         .map_err(|error| JsValue::from_str(&error))

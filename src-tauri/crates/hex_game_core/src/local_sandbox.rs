@@ -141,13 +141,22 @@ pub fn export_local_sandbox(match_id: &str, registry: &ModRegistry) -> Result<St
     .map_err(|error| format!("Local sandbox record serialization failed: {error}"))
 }
 
-/// Validates a saved record as a whole and, only if every check passes, commits its
-/// profiles, snapshot, flow, and setup record together.
+/// Restores a saved record, returning the number of profiles.
 pub fn restore_local_sandbox(
     match_id: &str,
     record_json: &str,
     registry: &ModRegistry,
 ) -> Result<u32, String> {
+    restore_local_sandbox_with_report(match_id, record_json, registry)
+        .map(|(profile_count, _)| profile_count)
+}
+
+/// Restores a saved record and reports any version 2 setup dropped during validation.
+pub fn restore_local_sandbox_with_report(
+    match_id: &str,
+    record_json: &str,
+    registry: &ModRegistry,
+) -> Result<(u32, Option<String>), String> {
     let value: Value = serde_json::from_str(record_json)
         .map_err(|error| format!("Saved sandbox record is not valid JSON: {error}"))?;
     let version = value
@@ -218,6 +227,7 @@ pub fn restore_local_sandbox(
     }
     MatchFlow::reference(&state.context)?;
     let mut combat_record = None;
+    let mut dropped_setup_reason = None;
     let setup_record = if record_version == 3 {
         let (record, ruleset) = setup::restore_v2_setup(embedded_setup.unwrap(), &profiles)?;
         let dice = dice.unwrap();
@@ -258,10 +268,16 @@ pub fn restore_local_sandbox(
         });
         Some(record)
     } else if record_version == 2 {
-        embedded_setup
-            .filter(|setup| !setup.is_null())
-            .map(|setup| restored_setup_record(setup, &profiles))
-            .transpose()?
+        match embedded_setup.filter(|setup| !setup.is_null()) {
+            Some(setup) => match restored_setup_record(setup, &profiles) {
+                Ok(record) => Some(record),
+                Err(reason) => {
+                    dropped_setup_reason = Some(reason);
+                    None
+                }
+            },
+            None => None,
+        }
     } else {
         None
     };
@@ -290,7 +306,7 @@ pub fn restore_local_sandbox(
             || templates.extend(staged_templates),
         )?;
     }
-    Ok(profile_count)
+    Ok((profile_count, dropped_setup_reason))
 }
 
 fn restored_setup_record(setup: Value, saved_profiles: &[Value]) -> Result<SetupRecord, String> {
@@ -337,7 +353,7 @@ fn restored_setup_record(setup: Value, saved_profiles: &[Value]) -> Result<Setup
 
 #[cfg(test)]
 mod tests {
-    use super::{export_local_sandbox, restore_local_sandbox};
+    use super::{export_local_sandbox, restore_local_sandbox, restore_local_sandbox_with_report};
     use crate::engine;
     use crate::flow::MatchFlow;
     use crate::mod_registry::ModRegistry;
@@ -578,6 +594,70 @@ mod tests {
     }
 
     #[test]
+    fn local_sandbox_v2_invalid_setup_restores_like_null_setup_and_reports_reason() {
+        let match_id = "local_sandbox_invalid_setup";
+        let record = damaged_custom_match_record(match_id);
+        let null_setup = edited_record(&record, |value| value["setup"] = Value::Null);
+        engine::remove_match(match_id);
+        let baseline_registry = ModRegistry::default();
+        assert_eq!(
+            restore_local_sandbox_with_report(match_id, &null_setup, &baseline_registry).unwrap(),
+            (1, None)
+        );
+        let expected_snapshot = snapshot(match_id);
+        let expected_flow = flow_snapshot(match_id);
+        let expected_record: Value =
+            serde_json::from_str(&export_local_sandbox(match_id, &baseline_registry).unwrap()).unwrap();
+
+        for (invalid, reason) in [
+            (edited_record(&record, |value| value["setup"]["name"] = Value::Bool(true)), "Invalid saved setup"),
+            (edited_record(&record, |value| value["setup"]["roster"][0]["profile"] = Value::from("com.example.missing")), "not in this setup's profiles"),
+            (edited_record(&record, |value| value["setup"] = Value::Bool(true)), "Invalid saved setup"),
+        ] {
+            engine::remove_match(match_id);
+            engine::try_initialize_from_hexoscape_with_registry(
+                match_id.to_string(), MAP_JSON, &ModRegistry::default(),
+            ).unwrap();
+            assert!(setup_record_snapshot(match_id).is_some());
+            let registry = ModRegistry::default();
+            let (profiles, dropped) =
+                restore_local_sandbox_with_report(match_id, &invalid, &registry).unwrap();
+            assert_eq!(profiles, 1);
+            assert!(dropped.unwrap().contains(reason));
+            assert_eq!(snapshot(match_id), expected_snapshot);
+            assert_eq!(flow_snapshot(match_id), expected_flow);
+            assert_eq!(setup_record_snapshot(match_id), None);
+            let restored: Value =
+                serde_json::from_str(&export_local_sandbox(match_id, &registry).unwrap()).unwrap();
+            assert_eq!(restored, expected_record);
+            assert_eq!(
+                export_setup(match_id, &registry).unwrap_err(),
+                "setup: this match has no setup record"
+            );
+        }
+        engine::remove_match(match_id);
+    }
+
+    #[test]
+    fn local_sandbox_valid_v1_and_v2_report_no_dropped_setup() {
+        let match_id = "local_sandbox_valid_reports";
+        let record = damaged_custom_match_record(match_id);
+        let v1 = edited_record(&record, |value| {
+            value["record_version"] = Value::from(1);
+            value.as_object_mut().unwrap().remove("setup");
+        });
+        for saved in [v1, record] {
+            engine::remove_match(match_id);
+            let registry = ModRegistry::default();
+            assert_eq!(
+                restore_local_sandbox_with_report(match_id, &saved, &registry).unwrap(),
+                (1, None)
+            );
+        }
+        engine::remove_match(match_id);
+    }
+
+    #[test]
     fn local_sandbox_restore_rejects_corrupt_record() {
         let match_id = "local_sandbox_corrupt";
         let record = damaged_custom_match_record(match_id);
@@ -757,26 +837,6 @@ mod tests {
         )
         .unwrap();
         let registry = ModRegistry::default();
-
-        let invalid_setup = edited_record(&record, |value| {
-            value["setup"]["name"] = Value::Bool(true);
-        });
-        assert_rejected_preserves_existing(
-            target_id,
-            &invalid_setup,
-            "Invalid saved setup",
-            &registry,
-        );
-
-        let missing_setup_profile = edited_record(&record, |value| {
-            value["setup"]["roster"][0]["profile"] = Value::from("com.example.missing");
-        });
-        assert_rejected_preserves_existing(
-            target_id,
-            &missing_setup_profile,
-            "not in this setup's profiles",
-            &registry,
-        );
 
         let missing_setup = edited_record(&record, |value| {
             value.as_object_mut().unwrap().remove("setup");

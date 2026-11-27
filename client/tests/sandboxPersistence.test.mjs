@@ -5,6 +5,7 @@ import {
   LOCAL_SANDBOX_STORAGE_KEY,
   openSandboxStorage,
   REJECTED_LOCAL_SANDBOX_STORAGE_KEY,
+  restoreNoticeWithSetupWarning,
   restoreSavedSandbox,
   saveSandbox,
 } from "../.test-build/game/sandboxPersistence.js";
@@ -31,6 +32,17 @@ class MemoryStorage {
 const throwingRestore = (message) => () => {
   throw message;
 };
+
+test("restore notice appends a dropped setup reason only when present", () => {
+  const notice = "Saved sandbox restored with 1 profile";
+  assert.equal(restoreNoticeWithSetupWarning(notice, null), notice);
+  assert.equal(
+    restoreNoticeWithSetupWarning(notice, "Invalid saved setup: bad map"),
+    `${notice}. Saved setup could not be re-checked, so Export setup is unavailable for this match: Invalid saved setup: bad map`,
+  );
+  const profileError = "Saved sandbox restored, but its profile list could not be shown: error";
+  assert.ok(restoreNoticeWithSetupWarning(profileError, "reason").includes("match: reason"));
+});
 
 test("storage unavailable starts fresh without saving and without crashing", () => {
   const storage = openSandboxStorage(() => {

@@ -16,6 +16,12 @@ function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+export function restoreNoticeWithSetupWarning(notice: string, reason: string | null): string {
+  return reason === null
+    ? notice
+    : `${notice}. Saved setup could not be re-checked, so Export setup is unavailable for this match: ${reason}`;
+}
+
 /** Returns the storage only if it can be reached; blocked storage throws on access. */
 export function openSandboxStorage(getStorage: () => SandboxStorage): SandboxStorage | null {
   try {
