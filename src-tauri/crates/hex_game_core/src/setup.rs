@@ -954,14 +954,29 @@ pub(crate) fn serialize_v2_json(value: &Value) -> Result<String, serde_json::Err
         fn write_f64<W: ?Sized + std::io::Write>(
             &mut self, writer: &mut W, value: f64,
         ) -> std::io::Result<()> {
-            let normal = value.to_string();
+            let mut normal = value.to_string();
+            if !normal.contains(['.', 'e', 'E']) {
+                normal.push_str(".0");
+            }
             let scientific = format!("{value:e}");
-            let text = if scientific.len() < normal.len() || !normal.contains(['.', 'e', 'E']) {
-                &scientific
-            } else {
-                &normal
-            };
-            writer.write_all(text.as_bytes())
+            let (mantissa, exponent) = scientific.split_once('e').expect("scientific notation");
+            let exponent: i32 = exponent.parse().expect("scientific exponent");
+            let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
+            let digits = mantissa.replace('.', "");
+            let mut shortest = normal;
+            for position in 1..=digits.len() {
+                let mut candidate = format!("{sign}{}", &digits[..position]);
+                if position < digits.len() {
+                    candidate.push('.');
+                    candidate.push_str(&digits[position..]);
+                }
+                candidate.push('e');
+                candidate.push_str(&(exponent - position as i32 + 1).to_string());
+                if candidate.len() < shortest.len() {
+                    shortest = candidate;
+                }
+            }
+            writer.write_all(shortest.as_bytes())
         }
     }
     let mut bytes = Vec::new();
@@ -1222,8 +1237,10 @@ mod tests {
 
     #[test]
     fn b6_compact_float_serialization_round_trips() {
-        let value = json!([1.0, -0.0, 10000.0, 1.2345678901234567, 1e-100, 1e100]);
+        let value = json!([1.0, -0.0, 10000.0, 123456789012345.0, 1234567890123450.0, 1.2345678901234567, 1e-100, 1e100]);
         let encoded = serialize_v2_json(&value).unwrap();
+        assert!(encoded.contains("123456789012345.0"));
+        assert!(encoded.contains("123456789012345e1"));
         assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), value);
     }
 
