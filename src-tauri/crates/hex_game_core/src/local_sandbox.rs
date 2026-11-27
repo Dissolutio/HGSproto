@@ -158,7 +158,7 @@ pub fn restore_local_sandbox(
     let version_number = version.as_u64();
     if !matches!(version_number, Some(1 | 2 | 3)) {
         return Err(format!(
-            "Unsupported saved sandbox record_version {version}; expected 1 or 2 or 3"
+            "Unsupported saved sandbox record_version {version}; expected 1, 2 or 3"
         ));
     }
     let (record_version, profiles, snapshot, embedded_setup, dice) = match version_number.unwrap() {
@@ -800,7 +800,7 @@ mod tests {
             assert_rejected_preserves_existing(
                 target_id,
                 &unsupported_version,
-                "expected 1 or 2",
+                "expected 1, 2 or 3",
                 &registry,
             );
         }
