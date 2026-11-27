@@ -11,6 +11,10 @@ export type EngineComponent = {
     labels?: string[];
     current_life?: number;
     max_life?: number;
+    attack?: number;
+    defense?: number;
+    damage_per_strike?: number;
+    id?: string;
   };
   Terrain?: {
     inventory_id?: string;

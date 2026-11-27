@@ -26,6 +26,8 @@ type ModProfilePanelProps = {
   onLoadSetup: (file: File) => Promise<void>;
   setupFeedback?: ProfileFeedback | null;
   setupBusy?: boolean;
+  onAllowSetup?: () => void;
+  onAllowDeploy?: () => void;
 };
 
 export function ModProfilePanel({
@@ -53,6 +55,8 @@ export function ModProfilePanel({
   onLoadSetup,
   setupFeedback,
   setupBusy,
+  onAllowSetup,
+  onAllowDeploy,
 }: ModProfilePanelProps) {
   const setupFileInput = useRef<HTMLInputElement>(null);
   return (
@@ -98,6 +102,7 @@ export function ModProfilePanel({
       >
         {setupFeedback?.text}
       </p>
+      {onAllowSetup && <button type="button" onClick={onAllowSetup} disabled={!enabled || setupBusy} style={styles.button}>Allow as house rule</button>}
       <p id="setup-note" role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
         {enabled
           ? "Loading a setup replaces the local sandbox and all loaded profiles after confirmation."
@@ -221,6 +226,7 @@ export function ModProfilePanel({
           >
             {deployFeedback && `${deployFeedback.kind === "error" ? "Error: " : ""}${deployFeedback.text}`}
           </p>
+          {onAllowDeploy && <button type="button" onClick={onAllowDeploy} disabled={!enabled || setupLocked || matchFinished} style={styles.button}>Allow as house rule</button>}
           <p role="note" style={{ margin: "6px 0 0", fontSize: 12 }}>
             The Rust core replaces the selected unit in place and owns its health, tags, and visual. Deployment locks after the first referee action.
           </p>

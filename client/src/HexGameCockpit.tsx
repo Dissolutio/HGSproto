@@ -18,13 +18,14 @@ export default function HexGameCockpit() {
       terrain, units, deploymentSlots, deploymentSlot, selectedProfile, activeSeat,
       turnPhase, winner, playerSeat, isYourTurn, canAct, attackTargetIds,
       playerOneCount, playerTwoCount, ruleHint, showRecoveryBanner, healthLabelElements,
+      combatState,
     },
     profiles: {
       modProfileText, setModProfileText, loadedModProfiles, setSelectedModId,
       profileLoadFeedback, profileDeployFeedback,
-      setupFeedback, setupBusy, handleExportSetup, handleLoadSetup,
+      setupFeedback, setupBusy, handleExportSetup, handleLoadSetup, pendingSetup, handleAllowSetup,
       deploymentSeat, setDeploymentSeat, setDeploymentSlotId, startingHealth,
-      setStartingHealth, loadModProfiles, handleDeployProfile, handleStartFreshSandbox,
+      setStartingHealth, loadModProfiles, handleDeployProfile, pendingDeploy, handleStartFreshSandbox,
     },
     actions: {
       chooseMode, clearSelection, submitAction, handleEndTurn, selectUnit, handleHexClick,
@@ -60,6 +61,7 @@ export default function HexGameCockpit() {
         canAct={canAct}
         selectedUnitId={selectedUnitId}
         attackTargetCount={attackTargetIds.size}
+        diceGame={!!combatState}
         ruleHint={ruleHint}
         endTurnPending={!!endTurnAfterSkip}
         onClearSelection={clearSelection}
@@ -80,7 +82,7 @@ export default function HexGameCockpit() {
           clearSelection();
         }}
       >
-        <InspectorPanel entity={inspectedEntity}>
+        <InspectorPanel entity={inspectedEntity} combatState={combatState} terrain={terrain}>
           <ModProfilePanel
             profileText={modProfileText}
             onProfileTextChange={setModProfileText}
@@ -104,7 +106,8 @@ export default function HexGameCockpit() {
             onDeploymentSlotChange={setDeploymentSlotId}
             startingHealth={startingHealth}
             onStartingHealthChange={setStartingHealth}
-            onDeployProfile={handleDeployProfile}
+            onDeployProfile={() => handleDeployProfile()}
+            onAllowDeploy={pendingDeploy ? () => handleDeployProfile(true) : undefined}
             deployFeedback={profileDeployFeedback}
             setupLocked={!!gameState?.context?.setup_locked}
             matchFinished={!!gameState?.context?.winner}
@@ -113,6 +116,7 @@ export default function HexGameCockpit() {
             onLoadSetup={handleLoadSetup}
             setupFeedback={setupFeedback}
             setupBusy={setupBusy}
+            onAllowSetup={pendingSetup ? handleAllowSetup : undefined}
           />
           <NetworkPortal
             mode={mode}
