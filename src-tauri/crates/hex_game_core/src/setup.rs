@@ -83,7 +83,7 @@ pub(crate) const DEFAULT_SETUP_NAME: &str = "Default sandbox";
 #[derive(Debug, Clone)]
 pub(crate) struct SetupRecord {
     pub(crate) name: String,
-    // For v2 matches this holds the complete original setup until v2 export exists.
+    // For v2 matches this holds the complete original setup.
     pub(crate) map: Value,
     pub(crate) roster: Vec<RosterEntry>,
 }
@@ -839,9 +839,6 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
     let combat = crate::engine::combat_records()
         .lock()
         .map_err(|_| "Match combat registry is unavailable".to_string())?;
-    if combat.contains_key(match_id) {
-        return Err("export of setup_version 2 is not supported yet".into());
-    }
     let records = crate::engine::setup_records()
         .lock()
         .map_err(|_| "Match setup registry is unavailable".to_string())?;
@@ -849,6 +846,11 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
         .get(match_id)
         .ok_or_else(|| "setup: this match has no setup record".to_string())?
         .clone();
+    if let Some(combat) = combat.get(match_id) {
+        let output = export_v2_setup(&record, &templates, &combat.ruleset)?;
+        return serialize_v2_json(&output)
+            .map_err(|error| format!("setup: export serialization failed: {error}"));
+    }
 
     let profile_ids: std::collections::BTreeSet<_> = record
         .roster
@@ -882,6 +884,106 @@ pub fn export_setup(match_id: &str, registry: &ModRegistry) -> Result<String, St
     Ok(json)
 }
 
+pub(crate) fn export_v2_setup(
+    record: &SetupRecord,
+    templates: &HashMap<String, UnitTemplate>,
+    ruleset: &crate::engine::CombatRuleset,
+) -> Result<Value, String> {
+    let mut output = record.map.clone();
+    let root = output.as_object_mut().ok_or_else(|| "setup: invalid recorded setup".to_string())?;
+    let mut roster = record.roster.clone();
+    roster.sort_by(|left, right| left.slot.cmp(&right.slot));
+    let ids: std::collections::BTreeSet<_> = roster.iter().map(|entry| entry.profile.as_str()).collect();
+    let profiles = ids.into_iter().map(|id| templates.get(id).cloned()
+        .ok_or_else(|| format!("setup: profile '{id}' is missing from the registry")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let faces: Vec<&str> = ruleset.die.faces().iter().map(|face| match face {
+        crate::dice::FaceKind::Strike => "strike",
+        crate::dice::FaceKind::Block => "block",
+        crate::dice::FaceKind::Blank => "blank",
+    }).collect();
+    root.insert("name".into(), Value::String(record.name.clone()));
+    root.insert("profiles".into(), serde_json::to_value(profiles).map_err(|e| e.to_string())?);
+    root.insert("roster".into(), serde_json::to_value(roster).map_err(|e| e.to_string())?);
+    root.insert("die".into(), serde_json::json!({"faces": faces}));
+    let house_rules = root.entry("house_rules").or_insert_with(|| serde_json::json!([]));
+    if let Some(rules) = house_rules.as_array_mut() {
+        rules.sort_by(|a, b| a["slot"].as_str().cmp(&b["slot"].as_str()));
+    }
+    let json = serialize_v2_json(&output)
+        .map_err(|error| format!("setup: export serialization failed: {error}"))?;
+    validate_setup_v2(&json)
+        .map_err(|error| format!("setup: recorded setup is not valid: {error}"))?;
+    Ok(output)
+}
+
+pub(crate) fn restore_v2_setup(
+    mut setup: Value,
+    saved_profiles: &[Value],
+) -> Result<(SetupRecord, crate::engine::CombatRuleset), String> {
+    let root = setup.as_object_mut().ok_or_else(|| "Invalid saved setup: expected an object".to_string())?;
+    if root.contains_key("profiles") {
+        return Err("Invalid saved setup: profiles must be stored separately".into());
+    }
+    let ids: std::collections::BTreeSet<_> = root.get("roster").and_then(Value::as_array)
+        .into_iter().flatten().filter_map(|entry| entry.get("profile").and_then(Value::as_str))
+        .collect();
+    let profiles: Vec<Value> = ids.into_iter().filter_map(|id| saved_profiles.iter()
+        .find(|profile| profile.get("mod_id").and_then(Value::as_str) == Some(id)).cloned()).collect();
+    root.insert("profiles".into(), Value::Array(profiles));
+    let json = serialize_v2_json(&setup)
+        .map_err(|error| format!("Invalid saved setup: {error}"))?;
+    let validated = validate_setup_v2(&json)
+        .map_err(|error| format!("Invalid saved setup: {error}"))?;
+    let record = SetupRecord {
+        name: validated.common.name,
+        map: validated.source,
+        roster: validated.common.roster,
+    };
+    let ruleset = crate::engine::CombatRuleset {
+        die: validated.die,
+        terrain_types: validated.terrain_types,
+        rules: validated.rules,
+    };
+    Ok((record, ruleset))
+}
+
+pub(crate) fn serialize_v2_json(value: &Value) -> Result<String, serde_json::Error> {
+    struct CompactNumbers;
+    impl serde_json::ser::Formatter for CompactNumbers {
+        fn write_f64<W: ?Sized + std::io::Write>(
+            &mut self, writer: &mut W, value: f64,
+        ) -> std::io::Result<()> {
+            let mut normal = value.to_string();
+            if !normal.contains(['.', 'e', 'E']) {
+                normal.push_str(".0");
+            }
+            let scientific = format!("{value:e}");
+            let (mantissa, exponent) = scientific.split_once('e').expect("scientific notation");
+            let exponent: i32 = exponent.parse().expect("scientific exponent");
+            let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
+            let digits = mantissa.replace('.', "");
+            let mut shortest = normal;
+            for position in 1..=digits.len() {
+                let mut candidate = format!("{sign}{}", &digits[..position]);
+                if position < digits.len() {
+                    candidate.push('.');
+                    candidate.push_str(&digits[position..]);
+                }
+                candidate.push('e');
+                candidate.push_str(&(exponent - position as i32 + 1).to_string());
+                if candidate.len() < shortest.len() {
+                    shortest = candidate;
+                }
+            }
+            writer.write_all(shortest.as_bytes())
+        }
+    }
+    let mut bytes = Vec::new();
+    value.serialize(&mut serde_json::Serializer::with_formatter(&mut bytes, CompactNumbers))?;
+    Ok(String::from_utf8(bytes).expect("JSON serialization produces UTF-8"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +1014,234 @@ mod tests {
             "rules":{"terrain_defense_bonus":[{"tag":"concealment","dice":1}],"health_cap":{"max_health":10}},
             "house_rules":[{"kind":"allow_over_health_cap","slot":"UNIT_P1_1","name":"Allow Goliath","starting_health":11,"max_health":12,"approval":{"mode":"local_sandbox"}}]
         })
+    }
+
+    fn b6_combat_setup() -> Value {
+        json!({
+            "setup_version": 2, "name": "Continuation",
+            "die": {"faces": ["strike"]},
+            "terrain_types": [{"id":"grass","name":"Grass"}],
+            "map": {"hexMap": {}, "boardPieces": [
+                {"uid":"a","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":0,"r":0,"s":0}},
+                {"uid":"b","inventoryID":"g1","terrain":"grass","altitude":0,"rotation":0,"pieceCoords":{"q":1,"r":0,"s":-1}}
+            ], "starterUnits": [
+                {"id":"UNIT_P1_1","seat":"P1","components":{"tags":["Unit","P1"],"destructible":{"current_life":10,"max_life":10},"combat":{"attack":1,"defense":1}}},
+                {"id":"UNIT_P2_1","seat":"P2","components":{"tags":["Unit","P2"],"destructible":{"current_life":10,"max_life":10},"combat":{"attack":1,"defense":1}}}
+            ]},
+            "profiles": [], "roster": [], "rules": {}
+        })
+    }
+
+    #[test]
+    fn b6_saved_combat_continues_without_reroll_or_healing() {
+        let uninterrupted = "b6_continuous";
+        let saved_match = "b6_saved";
+        let restored = "b6_restored_fresh";
+        let source = b6_combat_setup().to_string();
+        let registry = ModRegistry::default();
+        for id in [uninterrupted, saved_match] {
+            apply_setup_with_seed(id.into(), &source, &registry, 42, Approval::LocalSandbox).unwrap();
+            engine::process_action(id, "P1", "S").unwrap();
+            engine::process_action(id, "P1", "A:UNIT_P1_1:UNIT_P2_1").unwrap();
+        }
+        let mut before = match_value(saved_match);
+        before["context"]["match_id"] = restored.into();
+        assert_eq!(component(&before, "UNIT_P2_1", "destructible")["current_life"], 9);
+        let dice_before = engine::get_combat_record(saved_match).unwrap().unwrap();
+        let public_before = engine::combat_state(saved_match).unwrap();
+        let saved = export_local_sandbox(saved_match, &registry).unwrap();
+        let value: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(value["record_version"], 3);
+        assert_eq!(value["dice"]["seed"], "000000000000002a");
+        assert!(value["setup"].get("profiles").is_none());
+        let restored_registry = ModRegistry::default();
+        restore_local_sandbox(restored, &saved, &restored_registry).unwrap();
+        assert_eq!(match_value(restored), before);
+        assert_eq!(engine::get_combat_record(restored).unwrap().unwrap(), dice_before);
+        assert_eq!(engine::combat_state(restored).unwrap(), public_before);
+        for id in [uninterrupted, restored] {
+            for (seat, token) in [("P1","E"), ("P2","S"), ("P2","A:UNIT_P2_1:UNIT_P1_1")] {
+                engine::process_action(id, seat, token).unwrap();
+            }
+        }
+        let mut a = match_value(uninterrupted);
+        a["context"]["match_id"] = restored.into();
+        assert_eq!(a, match_value(restored));
+        let a = engine::get_combat_record(uninterrupted).unwrap().unwrap();
+        let b = engine::get_combat_record(restored).unwrap().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b.dice.attacks_resolved, 2);
+        assert!(b.dice.last_attack.is_some());
+        for id in [uninterrupted, saved_match, restored] { engine::remove_match(id); }
+    }
+
+    #[test]
+    fn b6_v3_invalid_records_leave_fresh_sandbox_unchanged() {
+        let id = "b6_invalid_records";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &b6_combat_setup().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        let saved: Value = serde_json::from_str(&export_local_sandbox(id, &registry).unwrap()).unwrap();
+        engine::remove_match(id);
+        let mut cases = Vec::new();
+        for field in ["dice", "seed", "draws_used", "attacks_resolved", "last_attack"] {
+            let mut value = saved.clone();
+            if field == "dice" { value.as_object_mut().unwrap().remove(field); }
+            else { value["dice"].as_object_mut().unwrap().remove(field); }
+            cases.push(value);
+        }
+        for seed in ["123456789012345", "12345678901234567", "123456789012345g", "0123456789ABCDEF"] {
+            let mut value = saved.clone(); value["dice"]["seed"] = seed.into(); cases.push(value);
+        }
+        for field in ["draws_used", "attacks_resolved"] {
+            let mut value = saved.clone(); value["dice"][field] = json!(9007199254740992_u64); cases.push(value);
+        }
+        let mut value = saved.clone(); value["setup"] = Value::Null; cases.push(value);
+        let mut value = saved.clone(); value["setup"]["setup_version"] = 1.into(); cases.push(value);
+        let mut value = saved.clone(); value["setup"]["rules"]["health_cap"] = json!({"max_health": 1}); cases.push(value);
+        let mut value = saved.clone(); value["snapshot"]["entities"]["UNIT_P1_1"]["components"].as_object_mut().unwrap().remove("combat"); cases.push(value);
+        let mut value = saved.clone(); value["snapshot"]["entities"]["TILE_a_0"]["components"].as_object_mut().unwrap().remove("terrain_kind"); cases.push(value);
+        let mut value = saved.clone(); value["snapshot"]["entities"]["TILE_a_0"]["components"]["terrain_kind"]["data"]["id"] = "missing".into(); cases.push(value);
+        for value in cases {
+            let target = ModRegistry::default();
+            apply_setup(id.into(), VALID, &ModRegistry::default()).unwrap();
+            let before = match_value(id);
+            let flow = engine::get_match_flow(id).unwrap();
+            let setup_before = engine::setup_records().lock().unwrap()[id].map.clone();
+            let error = restore_local_sandbox(id, &value.to_string(), &target);
+            assert!(error.is_err(), "unexpectedly accepted {value}");
+            assert_eq!(match_value(id), before);
+            assert_eq!(engine::get_match_flow(id).unwrap(), flow);
+            assert_eq!(engine::setup_records().lock().unwrap()[id].map, setup_before);
+            assert!(engine::get_combat_record(id).unwrap().is_none());
+            assert!(target.templates.read().unwrap().is_empty());
+            engine::remove_match(id);
+        }
+    }
+
+    #[test]
+    fn b6_legacy_snapshot_paths_refuse_combat_components_atomically() {
+        let source = "b6_legacy_source";
+        let target = "b6_legacy_target";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(source.into(), &b6_combat_setup().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        apply_setup(target.into(), VALID, &ModRegistry::default()).unwrap();
+        let original = match_value(source);
+        for kind in ["Combat", "TerrainKind"] {
+            let mut snapshot = original.clone();
+            for entity in snapshot["entities"].as_object_mut().unwrap().values_mut() {
+                entity["components"].as_object_mut().unwrap().retain(|_, value|
+                    value["type"] != if kind == "Combat" { "TerrainKind" } else { "Combat" });
+            }
+            let before = match_value(target);
+            let flow = engine::get_match_flow(target).unwrap();
+            let record = engine::setup_records().lock().unwrap()[target].map.clone();
+            assert!(engine::restore_match_snapshot_as(target, source, &snapshot.to_string()).unwrap_err().contains("combat or terrain"));
+            snapshot["context"]["match_id"] = target.into();
+            assert!(engine::restore_match_snapshot(target, &snapshot.to_string()).unwrap_err().contains("combat or terrain"));
+            assert_eq!(match_value(target), before);
+            assert_eq!(engine::get_match_flow(target).unwrap(), flow);
+            assert_eq!(engine::setup_records().lock().unwrap()[target].map, record);
+            assert!(engine::get_combat_record(target).unwrap().is_none());
+        }
+        engine::remove_match(source); engine::remove_match(target);
+    }
+
+    #[test]
+    fn b6_v2_export_is_canonical_and_house_rules_survive_save() {
+        let first = "b6_export_first";
+        let second = "b6_export_second";
+        let mut source = seeded_example();
+        source["roster"].as_array_mut().unwrap().push(json!({"slot":"UNIT_P2_1","seat":"P2","profile":"com.community.goliath","starting_health":11}));
+        let mut rule = source["house_rules"][0].clone();
+        rule["slot"] = "UNIT_P2_1".into();
+        source["house_rules"].as_array_mut().unwrap().insert(0, rule);
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(first.into(), &source.to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        let public = engine::combat_state(first).unwrap();
+        let exported = export_setup(first, &registry).unwrap();
+        let value: Value = serde_json::from_str(&exported).unwrap();
+        assert!(value.get("seed").is_none() && value.get("dice").is_none());
+        assert_eq!(value["house_rules"][0]["slot"], "UNIT_P1_1");
+        assert_eq!(value["house_rules"][1]["slot"], "UNIT_P2_1");
+        assert_eq!(value["die"]["faces"].as_array().unwrap().len(), 6);
+        apply_setup_with_seed(second.into(), &exported, &ModRegistry::default(), 99, Approval::LocalSandbox).unwrap();
+        assert_eq!(export_setup(second, &registry).unwrap(), exported);
+        let saved = export_local_sandbox(first, &registry).unwrap();
+        engine::remove_match(first);
+        restore_local_sandbox(first, &saved, &ModRegistry::default()).unwrap();
+        assert_eq!(engine::combat_state(first).unwrap(), public);
+        engine::remove_match(first); engine::remove_match(second);
+    }
+
+    #[test]
+    fn b6_deployment_invalidating_v2_setup_refuses_export_and_save() {
+        let id = "b6_invalid_deployment";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &seeded_example().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        engine::deploy_profile_unit(id, "UNIT_P2_1", "com.community.goliath", "P2", 11, &registry).unwrap();
+        let before = match_value(id);
+        let combat = engine::get_combat_record(id).unwrap();
+        let setup_before = engine::setup_records().lock().unwrap()[id].map.clone();
+        assert!(export_setup(id, &registry).unwrap_err().contains("health"));
+        assert!(export_local_sandbox(id, &registry).unwrap_err().contains("health"));
+        assert_eq!(match_value(id), before);
+        assert_eq!(engine::get_combat_record(id).unwrap(), combat);
+        assert_eq!(engine::setup_records().lock().unwrap()[id].map, setup_before);
+        engine::remove_match(id);
+    }
+
+    #[test]
+    fn b6_save_refuses_profiles_that_cannot_be_restored() {
+        let id = "b6_oversized_saved_profile";
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &b6_combat_setup().to_string(), &registry, 42, Approval::LocalSandbox).unwrap();
+        let mut profile = json!({
+            "schema_version": 1, "mod_id": "com.example.large",
+            "display_name": "Large", "visual_primitive": "CUBE",
+            "components": {"tags": ["Unit", ""], "destructible": {"current_life": 1, "max_life": 1}}
+        });
+        let size = profile.to_string().len();
+        profile["components"]["tags"][1] = "x".repeat(65536 - size).into();
+        assert_eq!(profile.to_string().len(), 65536);
+        registry.load_batch(&json!([profile]).to_string()).unwrap();
+        let before = match_value(id);
+        let combat = engine::get_combat_record(id).unwrap();
+        assert!(export_local_sandbox(id, &registry).unwrap_err().contains("64 KiB"));
+        assert_eq!(match_value(id), before);
+        assert_eq!(engine::get_combat_record(id).unwrap(), combat);
+        engine::remove_match(id);
+    }
+
+    #[test]
+    fn b6_large_numeric_metadata_exports_and_restores() {
+        let id = "b6_large_numeric_metadata";
+        let raw = b6_combat_setup().to_string().replace(
+            r#""hexMap":{}"#,
+            &format!(r#""hexMap":{{"numbers":[{}]}}"#, vec!["1e4"; 140_000].join(",")),
+        );
+        assert!(raw.len() < 1_048_576);
+        assert!(serde_json::from_str::<Value>(&raw).unwrap().to_string().len() > 1_048_576);
+        let registry = ModRegistry::default();
+        apply_setup_with_seed(id.into(), &raw, &registry, 42, Approval::LocalSandbox).unwrap();
+        let exported = export_setup(id, &registry).unwrap();
+        validate_setup_v2(&exported).unwrap();
+        let saved = export_local_sandbox(id, &registry).unwrap();
+        let before = match_value(id);
+        engine::remove_match(id);
+        let restored = ModRegistry::default();
+        restore_local_sandbox(id, &saved, &restored).unwrap();
+        assert_eq!(match_value(id), before);
+        assert_eq!(export_setup(id, &restored).unwrap(), exported);
+        engine::remove_match(id);
+    }
+
+    #[test]
+    fn b6_compact_float_serialization_round_trips() {
+        let value = json!([1.0, -0.0, 10000.0, 123456789012345.0, 1234567890123450.0, 1.2345678901234567, 1e-100, 1e100]);
+        let encoded = serialize_v2_json(&value).unwrap();
+        assert!(encoded.contains("123456789012345.0"));
+        assert!(encoded.contains("123456789012345e1"));
+        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), value);
     }
 
     #[test]
@@ -971,8 +1301,8 @@ mod tests {
             assert_eq!(engine::get_combat_record(&id).unwrap(), combat);
             assert_eq!(engine::setup_records().lock().unwrap()[&id].map, recorded_source);
         }
-        assert_eq!(export_setup(&id, &registry).unwrap_err(), "export of setup_version 2 is not supported yet");
-        assert_eq!(export_local_sandbox(&id, &registry).unwrap_err(), "saving setup_version 2 matches is not supported yet");
+        export_setup(&id, &registry).unwrap();
+        export_local_sandbox(&id, &registry).unwrap();
         assert_eq!(apply_preservation(&id, &registry), before);
         assert_eq!(engine::get_combat_record(&id).unwrap(), combat);
         assert_eq!(engine::setup_records().lock().unwrap()[&id].map, recorded_source);
