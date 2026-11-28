@@ -37,7 +37,7 @@ pub struct CombatRuleset {
     pub rules: crate::setup::ScenarioRules,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiceRecord {
     pub seed: u64,
     pub draws_used: u64,
@@ -598,6 +598,17 @@ fn commit_staged_match(
     Ok(())
 }
 
+pub(crate) fn restore_staged_canonical_match(
+    match_id: String,
+    state: GameState,
+    flow: MatchFlow,
+    combat: Option<CombatRecord>,
+    setup: crate::setup::SetupRecord,
+    commit_with_locks: impl FnOnce(),
+) -> Result<(), String> {
+    commit_staged_match(match_id, state, flow, combat, Some(setup), false, commit_with_locks)
+}
+
 pub(crate) fn restore_staged_match_snapshot(
     match_id: String,
     mut state: GameState,
@@ -1056,7 +1067,7 @@ pub fn restore_match_snapshot_as(
     try_store_match(match_id.to_string(), state)
 }
 
-fn reject_combat_snapshot(state: &GameState) -> Result<(), String> {
+pub(crate) fn reject_combat_snapshot(state: &GameState) -> Result<(), String> {
     if state.entities.values().any(|entity| entity.components.values().any(
         |component| matches!(component, Component::Combat { .. } | Component::TerrainKind { .. })
     )) {

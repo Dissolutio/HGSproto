@@ -112,7 +112,7 @@ pub(crate) fn reject_metadata_flow(properties: &serde_json::Map<String, serde_js
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowCursor {
     pub seat_index: usize,
     pub step_index: usize,

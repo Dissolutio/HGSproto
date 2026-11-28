@@ -62,7 +62,32 @@ struct DiceIn {
     last_attack: Value,
 }
 
-const MAX_SAFE_COUNTER: u64 = (1_u64 << 53) - 1;
+pub(crate) const MAX_SAFE_COUNTER: u64 = (1_u64 << 53) - 1;
+
+pub(crate) fn validate_combat_components(
+    state: &GameState,
+    ruleset: &engine::CombatRuleset,
+) -> Result<(), String> {
+    for entity in state.entities.values() {
+        let unit = entity.components.values().any(|component|
+            matches!(component, Component::Tags { labels } if labels.iter().any(|label| label == "Unit")));
+        let tile = entity.components.values().any(|component|
+            matches!(component, Component::Terrain { .. } | Component::TerrainType { .. }));
+        if unit && !entity.components.values().any(|component| matches!(component, Component::Combat { .. })) {
+            return Err(format!("Saved unit '{}' lacks Combat", entity.id));
+        }
+        if tile {
+            let kinds: Vec<_> = entity.components.values().filter_map(|component| match component {
+                Component::TerrainKind { id } => Some(id),
+                _ => None,
+            }).collect();
+            if kinds.is_empty() || kinds.iter().any(|id| !ruleset.terrain_types.iter().any(|terrain| terrain.id == **id)) {
+                return Err(format!("Saved tile '{}' lacks a declared TerrainKind", entity.id));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,24 +264,7 @@ pub fn restore_local_sandbox_with_report(
         }
         let last_attack = serde_json::from_value(dice.last_attack)
             .map_err(|error| format!("Invalid saved last attack: {error}"))?;
-        for entity in state.entities.values() {
-            let unit = entity.components.values().any(|component|
-                matches!(component, Component::Tags { labels } if labels.iter().any(|label| label == "Unit")));
-            let tile = entity.components.values().any(|component|
-                matches!(component, Component::Terrain { .. } | Component::TerrainType { .. }));
-            if unit && !entity.components.values().any(|component| matches!(component, Component::Combat { .. })) {
-                return Err(format!("Saved unit '{}' lacks Combat", entity.id));
-            }
-            if tile {
-                let kinds: Vec<_> = entity.components.values().filter_map(|component| match component {
-                    Component::TerrainKind { id } => Some(id),
-                    _ => None,
-                }).collect();
-                if kinds.is_empty() || kinds.iter().any(|id| !ruleset.terrain_types.iter().any(|terrain| terrain.id == **id)) {
-                    return Err(format!("Saved tile '{}' lacks a declared TerrainKind", entity.id));
-                }
-            }
-        }
+        validate_combat_components(&state, &ruleset)?;
         combat_record = Some(engine::CombatRecord {
             ruleset,
             dice: engine::DiceRecord {
