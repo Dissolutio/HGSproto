@@ -14,7 +14,7 @@ pub struct ValidatedSetupV2 {
     pub(super) piece_terrain: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerrainDefinition {
     pub id: String,
     pub name: String,
@@ -22,7 +22,7 @@ pub struct TerrainDefinition {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerrainBonus {
     pub tag: Option<String>,
     pub terrain: Option<String>,
@@ -35,7 +35,7 @@ pub struct HealthCap {
     pub max_health: Option<i32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioRules {
     #[serde(default)]
     pub terrain_defense_bonus: Vec<TerrainBonus>,

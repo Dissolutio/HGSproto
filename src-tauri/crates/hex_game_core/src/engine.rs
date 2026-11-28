@@ -30,14 +30,14 @@ pub(crate) fn match_flows() -> &'static Mutex<HashMap<String, MatchFlow>> {
     &MATCH_FLOWS
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CombatRuleset {
     pub die: crate::dice::Die,
     pub terrain_types: Vec<crate::setup::TerrainDefinition>,
     pub rules: crate::setup::ScenarioRules,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiceRecord {
     pub seed: u64,
     pub draws_used: u64,
@@ -96,7 +96,7 @@ pub struct AttackReport {
     pub draws: DrawRange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CombatRecord {
     pub ruleset: CombatRuleset,
     pub dice: DiceRecord,
