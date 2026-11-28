@@ -1,5 +1,6 @@
 pub mod ffi;
 pub mod handshake;
+pub mod integrity;
 pub mod protocol;
 
 #[cfg(feature = "connection-diagnostics")]

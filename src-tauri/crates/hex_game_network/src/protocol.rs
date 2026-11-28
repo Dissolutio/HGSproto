@@ -158,8 +158,18 @@ pub struct Snapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setup {
+    pub v: Version,
+    pub setup: String,
+    pub fp: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum Message {
+    #[serde(rename = "SETUP")]
+    Setup(Setup),
     #[serde(rename = "CMD")]
     Cmd(Command),
     #[serde(rename = "REVEAL")]

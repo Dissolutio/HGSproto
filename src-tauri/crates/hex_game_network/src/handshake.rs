@@ -139,9 +139,15 @@ impl MatchNeeds {
                         .source
                         .get("house_rules")
                         .and_then(serde_json::Value::as_array)
-                        .filter(|rules| !rules.is_empty())
-                        .map(|_| BTreeSet::from(["local_sandbox".to_string()]))
-                        .unwrap_or_default();
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|rule| {
+                            rule.get("approval")
+                                .and_then(|approval| approval.get("mode"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .collect();
                     Ok(Self {
                         setup_version: 2,
                         profile_schemas: profiles
@@ -249,7 +255,7 @@ pub fn decide(host: &Hello, guest: &Hello, needs: &MatchNeeds) -> Result<Agreed,
     })
 }
 
-fn format_versions(versions: &[u32]) -> String {
+pub(crate) fn format_versions(versions: &[u32]) -> String {
     let versions: BTreeSet<_> = versions.iter().copied().collect();
     let Some(first) = versions.first() else {
         return "no versions".into();
@@ -640,6 +646,30 @@ mod tests {
                 approval_modes: BTreeSet::new(),
                 dice_scheme: None,
             }
+        );
+    }
+
+    #[test]
+    fn match_needs_collects_approval_modes_from_house_rules() {
+        let demo = include_str!("../../../../docs/examples/m3-dice-demo.setup.json");
+        let mut setup: serde_json::Value = serde_json::from_str(demo).unwrap();
+        setup["map"]["starterUnits"][0]["components"]["destructible"]["current_life"] =
+            serde_json::json!(11);
+        setup["map"]["starterUnits"][0]["components"]["destructible"]["max_life"] =
+            serde_json::json!(11);
+        setup["house_rules"] = serde_json::json!([{
+            "kind":"allow_over_health_cap",
+            "slot":"UNIT_P1_1",
+            "name":"Approved local rule",
+            "starting_health":11,
+            "max_health":11,
+            "approval":{"mode":"local_sandbox"}
+        }]);
+        assert_eq!(
+            MatchNeeds::from_setup(&setup.to_string())
+                .unwrap()
+                .approval_modes,
+            BTreeSet::from(["local_sandbox".to_string()])
         );
     }
 
