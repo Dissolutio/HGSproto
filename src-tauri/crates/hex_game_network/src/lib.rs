@@ -1,4 +1,5 @@
 pub mod ffi;
+pub mod protocol;
 
 #[cfg(feature = "connection-diagnostics")]
 mod connection_diagnostics;
