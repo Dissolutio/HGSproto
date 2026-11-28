@@ -393,22 +393,34 @@ pub struct GuestApplier {
     chain: String,
     outbound: Vec<Outbound>,
     buffer: BTreeMap<u64, ResultMessage>,
+    max_buffered_gaps: usize,
+    resume_through: Option<u64>,
+    paused: bool,
+    pending: Option<PendingRoll>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GuestError<E> {
     Forged,
     ConflictingResult,
+    ConflictingPending,
     Verification(E),
+    OutOfOrder,
+    BufferFull,
+    Paused,
 }
 
 impl GuestApplier {
-    pub fn new(applied_seq: u64, chain: String) -> Self {
+    pub fn new(applied_seq: u64, chain: String, max_buffered_gaps: usize) -> Self {
         Self {
             applied_seq,
             chain,
             outbound: Vec::new(),
             buffer: BTreeMap::new(),
+            max_buffered_gaps,
+            resume_through: None,
+            paused: false,
+            pending: None,
         }
     }
     pub fn applied_seq(&self) -> u64 {
@@ -418,7 +430,10 @@ impl GuestApplier {
         &self.chain
     }
     pub fn resume_needed(&self) -> bool {
-        !self.buffer.is_empty()
+        !self.buffer.is_empty() || self.resume_through.is_some()
+    }
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
     pub fn record_outbound(&mut self, command: Command) {
         let used = self
@@ -435,40 +450,95 @@ impl GuestApplier {
                 && seq.checked_sub(1) == Some(entry.command.base_seq)
         })
     }
-    pub fn check_pending(&self, pending: &PendingRoll) -> bool {
-        pending.seat != Seat::P2
-            || self.matches_outbound(pending.seq, &pending.cmd_id, &pending.token)
+    pub fn check_pending<E>(
+        &mut self,
+        pending: &PendingRoll,
+        verify: impl FnOnce(&PendingRoll) -> Result<(), E>,
+    ) -> Result<(), GuestError<E>> {
+        if self.paused {
+            return Err(GuestError::Paused);
+        }
+        if pending.seq.checked_sub(1) != Some(self.applied_seq) {
+            return Err(GuestError::OutOfOrder);
+        }
+        if let Some(existing) = &self.pending {
+            if existing == pending {
+                return Ok(());
+            }
+            self.paused = true;
+            return Err(GuestError::ConflictingPending);
+        }
+        if pending.seat == Seat::P2
+            && !self.matches_outbound(pending.seq, &pending.cmd_id, &pending.token)
+        {
+            self.paused = true;
+            return Err(GuestError::Forged);
+        }
+        if let Err(error) = verify(pending) {
+            self.paused = true;
+            return Err(GuestError::Verification(error));
+        }
+        self.pending = Some(pending.clone());
+        Ok(())
     }
     pub fn receive<E>(
         &mut self,
         result: ResultMessage,
         mut verify_apply: impl FnMut(&ResultMessage) -> Result<(), E>,
     ) -> Result<(), GuestError<E>> {
+        if self.paused {
+            return Err(GuestError::Paused);
+        }
         if result.seq <= self.applied_seq {
             return Ok(());
         }
         if result.seat == Seat::P2
             && !self.matches_outbound(result.seq, &result.cmd_id, &result.token)
         {
+            self.paused = true;
             return Err(GuestError::Forged);
         }
         if let Some(existing) = self.buffer.get(&result.seq) {
             if existing != &result {
+                self.paused = true;
                 return Err(GuestError::ConflictingResult);
             }
         } else {
+            if result.seq.checked_sub(1) != Some(self.applied_seq)
+                && self.buffer.len() >= self.max_buffered_gaps
+            {
+                self.resume_through = Some(
+                    self.resume_through
+                        .map_or(result.seq, |seq| seq.max(result.seq)),
+                );
+                return Err(GuestError::BufferFull);
+            }
             self.buffer.insert(result.seq, result);
         }
         while let Some(next) = self.applied_seq.checked_add(1) {
             let Some(result) = self.buffer.get(&next) else {
                 break;
             };
+            if let Some(pending) = &self.pending
+                && (result.seq != pending.seq
+                    || result.cmd_id != pending.cmd_id
+                    || result.seat != pending.seat
+                    || result.token != pending.token
+                    || result.roll.as_ref().map(|roll| roll.k) != Some(pending.k))
+            {
+                self.paused = true;
+                return Err(GuestError::ConflictingResult);
+            }
             if result.seat == Seat::P2
                 && !self.matches_outbound(result.seq, &result.cmd_id, &result.token)
             {
+                self.paused = true;
                 return Err(GuestError::Forged);
             }
-            verify_apply(result).map_err(GuestError::Verification)?;
+            if let Err(error) = verify_apply(result) {
+                self.paused = true;
+                return Err(GuestError::Verification(error));
+            }
             let result = self.buffer.remove(&next).expect("buffered result");
             if result.seat == Seat::P2 {
                 for entry in &mut self.outbound {
@@ -479,6 +549,10 @@ impl GuestApplier {
             }
             self.applied_seq = next;
             self.chain = result.chain;
+            self.pending = None;
+            if self.resume_through.is_some_and(|seq| seq <= next) {
+                self.resume_through = None;
+            }
         }
         Ok(())
     }

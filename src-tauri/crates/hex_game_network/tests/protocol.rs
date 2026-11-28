@@ -154,7 +154,7 @@ fn referee_refusals_are_cached() {
 
 #[test]
 fn shuffled_results_are_applied_once_in_sequence() {
-    let mut guest = GuestApplier::new(0, "initial".into());
+    let mut guest = GuestApplier::new(0, "initial".into(), 16);
     let mut applied = Vec::new();
     for seq in [3, 1, 3, 2, 1, 4, 2] {
         guest
@@ -174,12 +174,14 @@ fn shuffled_results_are_applied_once_in_sequence() {
 
 #[test]
 fn p2_requires_unused_matching_outbound_command() {
-    let mut guest = GuestApplier::new(0, "initial".into());
+    let mut guest = GuestApplier::new(0, "initial".into(), 16);
     let apply = |_: &ResultMessage| Ok::<_, ()>(());
     assert_eq!(
         guest.receive(result(1, Seat::P2, "guest"), apply),
         Err(GuestError::Forged)
     );
+    assert!(guest.is_paused());
+    let mut guest = GuestApplier::new(0, "initial".into(), 16);
     guest.record_outbound(cmd("guest", 0));
     let pending = PendingRoll {
         v: Version,
@@ -189,16 +191,23 @@ fn p2_requires_unused_matching_outbound_command() {
         seat: Seat::P2,
         token: "token-guest".into(),
     };
-    assert!(guest.check_pending(&pending));
+    assert_eq!(guest.check_pending(&pending, |_| Ok::<_, ()>(())), Ok(()));
     let mut forged = result(1, Seat::P2, "guest");
     forged.token = "different".into();
     assert_eq!(guest.receive(forged, apply), Err(GuestError::Forged));
+    let mut guest = GuestApplier::new(0, "initial".into(), 16);
+    guest.record_outbound(cmd("guest", 0));
     assert_eq!(
         guest.receive(result(2, Seat::P2, "guest"), apply),
         Err(GuestError::Forged)
     );
+    let mut guest = GuestApplier::new(0, "initial".into(), 16);
+    guest.record_outbound(cmd("guest", 0));
     guest.receive(result(1, Seat::P2, "guest"), apply).unwrap();
-    assert!(!guest.check_pending(&pending));
+    assert_eq!(
+        guest.check_pending(&pending, |_| Ok::<_, ()>(())),
+        Err(GuestError::OutOfOrder)
+    );
     guest.record_outbound(cmd("guest", 1));
     assert_eq!(
         guest.receive(result(2, Seat::P2, "guest"), apply),
@@ -207,14 +216,101 @@ fn p2_requires_unused_matching_outbound_command() {
 }
 
 #[test]
+fn pending_roll_is_fixed_until_matching_result() {
+    let mut guest = GuestApplier::new(0, "initial".into(), 1);
+    let pending = PendingRoll {
+        v: Version,
+        seq: 1,
+        k: 7,
+        cmd_id: "host".into(),
+        seat: Seat::P1,
+        token: "token-host".into(),
+    };
+    guest.check_pending(&pending, |_| Ok::<_, ()>(())).unwrap();
+    let mut guest: GuestApplier =
+        serde_json::from_str(&serde_json::to_string(&guest).unwrap()).unwrap();
+    guest
+        .check_pending(&pending, |_| -> Result<(), ()> { panic!("duplicate") })
+        .unwrap();
+    let mut changed = pending.clone();
+    changed.token = "another attack".into();
+    let mut other = guest.clone();
+    assert_eq!(
+        other.check_pending(&changed, |_| Ok::<_, ()>(())),
+        Err(GuestError::ConflictingPending)
+    );
+    assert!(other.is_paused());
+    let bad = result(1, Seat::P1, "other");
+    assert_eq!(
+        other.receive(bad, |_| Ok::<_, ()>(())),
+        Err(GuestError::Paused)
+    );
+    let mut accepted = result(1, Seat::P1, "host");
+    accepted.roll = Some(Roll {
+        k: 7,
+        r_host: "h".into(),
+        r_guest: "g".into(),
+        roll_seed: "seed".into(),
+    });
+    guest.receive(accepted, |_| Ok::<_, ()>(())).unwrap();
+    assert_eq!(guest.applied_seq(), 1);
+}
+
+#[test]
 fn verification_failure_does_not_advance_guest() {
-    let mut guest = GuestApplier::new(0, "initial".into());
+    let mut guest = GuestApplier::new(0, "initial".into(), 16);
     assert_eq!(
         guest.receive(result(1, Seat::P1, "x"), |_| Err("mismatch")),
         Err(GuestError::Verification("mismatch"))
     );
     assert_eq!(guest.applied_seq(), 0);
     assert_eq!(guest.chain(), "initial");
+    assert!(guest.is_paused());
+    assert_eq!(
+        guest.receive(result(1, Seat::P1, "x"), |_| Ok::<_, ()>(())),
+        Err(GuestError::Paused)
+    );
+}
+
+#[test]
+fn pending_roll_requires_next_sequence_and_referee_check() {
+    let mut guest = GuestApplier::new(0, "initial".into(), 1);
+    let mut pending = PendingRoll {
+        v: Version,
+        seq: 2,
+        k: 1,
+        cmd_id: "host".into(),
+        seat: Seat::P1,
+        token: "attack".into(),
+    };
+    assert_eq!(
+        guest.check_pending(&pending, |_| -> Result<(), ()> { panic!("out of order") }),
+        Err(GuestError::OutOfOrder)
+    );
+    pending.seq = 1;
+    assert_eq!(
+        guest.check_pending(&pending, |_| Err("illegal")),
+        Err(GuestError::Verification("illegal"))
+    );
+    assert!(guest.is_paused());
+}
+
+#[test]
+fn gap_buffer_limit_is_caller_supplied() {
+    let mut guest = GuestApplier::new(0, "initial".into(), 1);
+    let apply = |_: &ResultMessage| Ok::<_, ()>(());
+    guest.receive(result(3, Seat::P1, "third"), apply).unwrap();
+    assert_eq!(
+        guest.receive(result(4, Seat::P1, "fourth"), apply),
+        Err(GuestError::BufferFull)
+    );
+    assert!(guest.resume_needed());
+    guest.receive(result(1, Seat::P1, "first"), apply).unwrap();
+    guest.receive(result(2, Seat::P1, "second"), apply).unwrap();
+    assert_eq!(guest.applied_seq(), 3);
+    assert!(guest.resume_needed());
+    guest.receive(result(4, Seat::P1, "fourth"), apply).unwrap();
+    assert!(!guest.resume_needed());
 }
 
 #[test]
@@ -279,6 +375,27 @@ fn framing_checks_both_caps_and_round_trips() {
         read_frame::<Message>(&mut Cursor::new(bytes)).unwrap(),
         snapshot
     );
+    let catch_up = Message::CatchUp(CatchUp {
+        v: Version,
+        from_seq: 0,
+        results: vec![ResultFrame::Result(ResultMessage {
+            token: "x".repeat(DEFAULT_FRAME_CAP),
+            ..result(1, Seat::P1, "x")
+        })],
+    });
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &catch_up).unwrap();
+    assert_eq!(
+        read_frame::<Message>(&mut Cursor::new(bytes)).unwrap(),
+        catch_up
+    );
+    let setup = serde_json::json!({"v": 1, "type": "SETUP", "data": "x".repeat(DEFAULT_FRAME_CAP)});
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &setup).unwrap();
+    assert_eq!(
+        read_frame::<serde_json::Value>(&mut Cursor::new(bytes)).unwrap(),
+        setup
+    );
     assert_eq!(FrameError::TooLarge.to_string(), "E:FRAME_TOO_LARGE");
 }
 
@@ -309,7 +426,7 @@ fn seeded_shuffle_and_duplicate_cases() {
         }
         assert_eq!(calls, 1);
         assert_eq!(host.entries().len(), 2);
-        let mut guest = GuestApplier::new(0, "initial".into());
+        let mut guest = GuestApplier::new(0, "initial".into(), 16);
         guest.record_outbound(future);
         let mut deliveries = vec![result(1, Seat::P1, "first"), result(2, Seat::P2, "future")];
         deliveries.extend(deliveries.clone());
