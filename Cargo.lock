@@ -1917,6 +1917,7 @@ dependencies = [
 name = "hex_game_network"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "hex_game_core",
  "iroh",
  "js-sys",

@@ -373,6 +373,17 @@ pub fn validate_setup(json: &str) -> Result<ValidatedSetup, String> {
     validate_v1(&value)
 }
 
+pub fn canonical_setup_json(json: &str) -> Result<String, String> {
+    let value = v2::parse_setup(json)?;
+    let value = if value.get("setup_version").and_then(Value::as_u64) == Some(2) {
+        validate_setup_v2(json)?.source
+    } else {
+        validate_setup(json)?;
+        value
+    };
+    serialize_v2_json(&value).map_err(|error| error.to_string())
+}
+
 fn validate_v1(value: &Value) -> Result<ValidatedSetup, String> {
     let envelope_fields = ["setup_version", "name", "map", "profiles", "roster"];
     let root = fields(value, "invalid setup", &envelope_fields, &envelope_fields)?;

@@ -258,6 +258,8 @@ The host sends the scenario. The guest never uses a local copy, so the two sides
    fp = blake3::derive_key("hexgamesim m4 setup v1", canonical_setup_bytes ‖ house_rule_approvals ‖ rules_revision ‖ dice_scheme)
    ```
 
+   Each part is encoded as a 4-byte big-endian byte length followed by its bytes; integers use 4-byte big-endian bytes, and hex values are decoded before encoding. An absent value has length zero.
+
    It is shown to both players as 4 groups of 4 characters (for example `3F9A-71C0-BB12-0E4D`), so they can compare it by voice if they want.
 3. **The guest checks:**
    - It re-canonicalizes the bytes it received. If they differ from the sent bytes, it refuses: *"Can't join: the host sent a scenario file that is not in standard form."*

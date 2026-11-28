@@ -12,3 +12,4 @@ pub mod templates;
 pub mod wasm_bridge;
 
 pub use canonical::{canonical_state_json, restore_canonical_match, RULES_REVISION};
+pub use setup::canonical_setup_json;
