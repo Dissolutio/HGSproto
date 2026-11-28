@@ -9,11 +9,14 @@ failed attempt.
 **NOT VERIFIED on Linux or Windows 11:** The commands and referenced setup
 commands, UI steps and cross-network scenarios have not been run by the agent.
 
-For a join attempt, start timing when the guest clicks **Join Match** and stop
-at the success message or visible error. If it remains on **Connecting to Iroh
-host…** at 120 seconds, record `still pending at 120s` as an observation cutoff,
-not as a product-enforced timeout. Keep the pending log and do not retry that
-attempt. Record route/stage from each local log without inferring a cause.
+For each fresh join, record both machines' network types and whether each side
+used a relay, as shown in its local log. Start timing when the guest clicks
+**Join Match** and stop at **Joined and synchronized with the host** or a
+visible error. Record the elapsed seconds. If it remains on **Connecting to
+Iroh host…** at 120 seconds, record `still pending at 120s` as an observation
+cutoff, not as a product-enforced timeout. Keep the pending log and do not retry
+that attempt. For any stalled join or reconnect, record the phase and how long
+it stalled. Record route/stage from each local log without inferring a cause.
 
 ## Stop rules
 
@@ -33,8 +36,8 @@ attempt. Record route/stage from each local log without inferring a cause.
   actually available.
 
 At the start of each session, repeat the **Before the first attempt**
-checklist. Record the local time of day and the commit (`git rev-parse HEAD`)
-on both machines.
+checklist. Record the local time of day, build commit (`git rev-parse HEAD`),
+and Iroh version on both machines. The commits must match.
 
 ## Before the first attempt
 
@@ -74,9 +77,10 @@ on both machines.
    **Join Match**. Never put the ticket in the worksheet, a screenshot, or a
    shared log.
 6. Record the join result, elapsed time, both log filenames, route/stage
-   evidence, and the state shown on both screens. If an attempt fails or is
-   still pending at 120 seconds, preserve it as a result; do not retry that
-   ticket.
+   evidence, each side's network type and relay use, and the state shown on
+   both screens. Record the phase and duration of any stall. If an attempt
+   fails or is still pending at 120 seconds, preserve it as a result; do not
+   retry that ticket.
 7. Reset both clients as in step 2 before starting the next fresh match.
 
 ## B. Play a short match
@@ -91,8 +95,10 @@ on both machines.
    continuing.
 3. Have P1 move one friendly unit by clicking the unit and a legal adjacent
    empty hex, then attack one highlighted adjacent enemy by clicking it.
-   Confirm after each accepted action that both pages show the same position,
-   health, active seat, and phase.
+   For one move, start the stopwatch when the acting player sends the move and
+   stop when it appears on the other player's screen; record the elapsed time
+   as the observed move round trip. Confirm after each accepted action that
+   both pages show the same position, health, active seat, and phase.
 4. Repeat a legal move and attack for P2, then again for P1 and P2. Use actual
    3D board clicks for each move and attack. Record attacker/target HP before
    and after.
@@ -103,6 +109,11 @@ on both machines.
 6. After every phase transition and turn handover, compare both pages. Record
    any disagreement, rejected action, delay, or visible error and attach the
    corresponding log names.
+7. With the match joined, have the guest use **Leave Match & Reset Gateway**
+   while the host watches. Start the stopwatch at the guest's click and stop
+   when the host's Peer Status shows `(Disconnected)`. Record the elapsed time
+   and what the host displayed; do not stop the guest process for this
+   graceful-leave measurement.
 
 ## C1. Browser reload recovery — at least 5 attempts
 
@@ -142,21 +153,23 @@ Complete at least 20 attempts: at least 10 while the host is idle and at least
    accept one legal action, confirm that the resulting state is visible on
    both screens, and then immediately proceed.
 3. On the guest laptop, press **Ctrl+C** in the gateway terminal while leaving
-   the host gateway running. This stops the guest process and drops the peer
-   connection; it does not guarantee a graceful endpoint close. Detection by
-   the host may be delayed: the Iroh upgrade report observed about 35 seconds
-   for abrupt loss, not for this exact step. Do not substitute a browser reload
-   or a short network interruption. Record when the host reports the peer
-   disconnected and the pre-drop match state.
+   the host gateway running. Start the stopwatch at the key press. This stops
+   the guest process and drops the peer connection; it does not guarantee a
+   graceful endpoint close. Stop timing when the host's Peer Status shows
+   `(Disconnected)` and record the elapsed time and pre-drop match state.
+   Detection may be delayed: the Iroh upgrade report observed about 35 seconds
+   for abrupt loss, not for this exact step. Do not substitute a browser reload.
 4. Restart the guest gateway with the diagnostic command from the setup guide.
    Wait for it to print `P2P gateway ready` and for the guest browser to show
-   its local gateway connected. If the old in-memory session is reported
+   its local gateway connected. Start a new timer when the guest gateway is
+   ready (the network is restored). If the old in-memory session is reported
    expired, wait for the page to reconnect to a fresh local session.
 5. On the guest, paste the same still-current host ticket into **Host
    connection ticket** and click **Join Match**. This uses the normal join
    flow to create a new peer connection; it is not the graceful-reconnection
-   button. Stop timing at success, visible failure, or the 120-second
-   observation cutoff. Do not retry a failed or pending attempt.
+   button. Stop the restore timer at success, visible failure, or the
+   120-second observation cutoff. Record the elapsed time and any stalled
+   phase/duration. Do not retry a failed or pending attempt.
 6. On success, confirm the guest is P2/Red and compare the host snapshot,
    positions, health, seat, and accepted-action state with the pre-drop state.
    Record both log filenames and observations on both screens.
@@ -173,7 +186,10 @@ Complete at least 20 attempts: at least 10 while the host is idle and at least
    restart the router, or interrupt other household equipment. If safely
    disconnecting is not possible, mark this scenario not exercised.
 3. Restore the same network. Record what each screen showed during the outage
-   and after connectivity returned, plus the logs and elapsed times. Do not
+   and after connectivity returned, plus the logs and elapsed times. For any
+   abrupt loss, time from the interruption until the peer disconnect is
+   detected; after restoring the network, time until the peers are reconnected.
+   Record the phase and duration of any stalled join or reconnect. Do not
    infer recovery or route from the UI alone.
 
 ## E. Additional network pairings — at least 10 joins per pairing

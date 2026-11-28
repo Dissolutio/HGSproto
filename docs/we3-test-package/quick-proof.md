@@ -36,24 +36,36 @@ sheet, logs, screenshots, or repository.
 Complete at least **5** fresh joins; do up to 10 if time allows. Alternate
 which laptop hosts. For each attempt, end the previous match and reset both
 clients using the exact Scenario A procedure in [test-script.md](./test-script.md),
-then start a fresh match. Record every attempt on the recording sheet; do not
-retry a failed or pending attempt. If the first 3 joins fail in the same way,
-stop and report to the PM.
+then start a fresh match. Record each machine's network type and relay use,
+time from **Join Match** to the joined message, and any stalled phase and
+duration on the recording sheet. Record the build commit and Iroh version for
+both machines in Batch setup. Do not retry a failed or pending attempt. If the
+first 3 joins fail in the same way, stop and report to the PM.
 
 ## Part 2 — one short turn
 
 Use each player's own page for that laptop's actions. Click the 3D board to
 make one legal move and one legal attack, then end the turn using the available
-turn control. After each accepted action, confirm both screens agree on health,
-positions, and active seat. Record whether the 3D board could be clicked before
-the health labels appeared.
+turn control. Time one move from when it is sent until it appears on the other
+screen, and record the elapsed time. After each accepted action, confirm both
+screens agree on health, positions, and active seat. Record whether the 3D
+board could be clicked before the health labels appeared.
 
 ## Part 3 — one peer replacement
 
 Follow Scenario C2 in [test-script.md](./test-script.md): stop the guest
 gateway with **Ctrl+C**, restart it, and rejoin with the same current host
-ticket. Compare health, positions, and active seat before and after. This has
-not been run before; a failure is an important finding, not a mistake.
+ticket. Time how long the host takes to detect the abrupt loss, then time from
+the guest gateway being ready again to the joined message. Record any stalled
+phase and duration. Compare health, positions, and active seat before and
+after. This has not been run before; a failure is an important finding, not a
+mistake.
+
+## Part 4 — graceful leave
+
+With a joined match, have the guest click **Leave Match & Reset Gateway** while
+the host watches. Time from the click until the host's Peer Status shows
+`(Disconnected)`. Record the elapsed time and what the host displayed.
 
 ## Finish and report confusion
 
