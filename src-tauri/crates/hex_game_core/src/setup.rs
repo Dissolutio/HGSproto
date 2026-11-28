@@ -990,6 +990,34 @@ pub(crate) fn restore_v2_setup(
     Ok((record, ruleset))
 }
 
+pub(crate) fn canonical_restore_setup(
+    json: &str,
+) -> Result<(SetupRecord, Vec<UnitTemplate>, Option<crate::engine::CombatRuleset>), String> {
+    let value = v2::parse_setup(json)?;
+    if value.get("setup_version").and_then(Value::as_u64) == Some(2) {
+        let setup = validate_setup_v2(json)?;
+        let record = SetupRecord {
+            name: setup.common.name,
+            map: setup.source,
+            roster: setup.common.roster,
+        };
+        let ruleset = crate::engine::CombatRuleset {
+            die: setup.die,
+            terrain_types: setup.terrain_types,
+            rules: setup.rules,
+        };
+        Ok((record, setup.profiles, Some(ruleset)))
+    } else {
+        let setup = validate_setup(json)?;
+        let record = SetupRecord {
+            name: setup.name,
+            map: serde_json::to_value(setup.map).map_err(|error| error.to_string())?,
+            roster: setup.roster,
+        };
+        Ok((record, setup.profiles, None))
+    }
+}
+
 pub(crate) fn serialize_v2_json(value: &Value) -> Result<String, serde_json::Error> {
     struct CompactNumbers;
     impl serde_json::ser::Formatter for CompactNumbers {
